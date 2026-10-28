@@ -31,3 +31,8 @@ eye4_protocol_analysis.md
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime artifacts
+*.log
+snapshot_*.jpg
+recordings/
