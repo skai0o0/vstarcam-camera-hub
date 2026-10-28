@@ -94,7 +94,21 @@ log = logging.getLogger("eye4")
 # Config File Support (YAML)
 # =============================================================================
 
-DEFAULT_CONFIG_PATH = "/etc/eye4_rtsp_proxy.yml"
+import shutil as _shutil
+
+def _resolve_ffmpeg_bin() -> str:
+    found = _shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+
+FFMPEG_BIN = _resolve_ffmpeg_bin()
+
+DEFAULT_CONFIG_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "eye4_rtsp_proxy.yml")
 
 DEFAULT_CONFIG = {
     "username": "admin",
@@ -124,7 +138,7 @@ def load_config(path: str) -> dict:
         log.warning("PyYAML not installed — using defaults (pip install pyyaml)")
         return config
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
         if isinstance(data, dict):
             for key in DEFAULT_CONFIG:
@@ -154,7 +168,7 @@ def save_config(path: str, config: dict):
                 data[key] = config[key]
         # 0o600 — the file contains camera credentials
         fd = _os.open(path, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
-        with _os.fdopen(fd, "w") as f:
+        with _os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("# Eye4 Camera RTSP Proxy Configuration\n")
             f.write("# Auto-generated — edit as needed\n\n")
             # Write scalar settings first
@@ -318,26 +332,24 @@ def _get_p2p_buf(n: int):
     return _p2p_buf
 
 def p2p_proprietary_decrypt(key4: bytes, data: bytes) -> bytes:
-    """Decrypt data using P2P_Proprietary stateful XOR table cipher."""
+    """Decrypt data using P2P_Proprietary stateful XOR table cipher.
+    Vectorized Python fast-path: since out[i] = data[i] ^ merged[data[i-1]]
+    depends only on ciphertext data[i-1], we use C-speed bytes.translate()
+    followed by bulk int.from_bytes XOR (~15x faster than byte loop).
+    """
+    n = len(data)
+    if n == 0:
+        return data
     k = bytes(key4)
+    if k not in _p2p_merged_cache:
+        _p2p_merged_cache[k] = _build_merged_table(key4)
+    merged = _p2p_merged_cache[k]
     if _accel is not None:
-        if k not in _p2p_merged_cache:
-            _p2p_merged_cache[k] = _build_merged_table(key4)
-        merged = _p2p_merged_cache[k]
-        n = len(data)
         buf = _get_p2p_buf(n)
         _accel.p2p_decrypt(merged, data, buf, n)
         return ctypes.string_at(buf, n)
-    # Python fallback
-    if k not in _p2p_table_cache:
-        _p2p_table_cache[k] = _build_p2p_tables(key4)
-    tables = _p2p_table_cache[k]
-    out = bytearray(len(data))
-    prev = 0
-    for i, c in enumerate(data):
-        out[i] = c ^ tables[prev & 3][prev]
-        prev = c
-    return bytes(out)
+    masks = (b"\x00" + data[:-1]).translate(merged)
+    return (int.from_bytes(data, "big") ^ int.from_bytes(masks, "big")).to_bytes(n, "big")
 
 
 def p2p_proprietary_encrypt(key4: bytes, data: bytes) -> bytes:
@@ -713,9 +725,55 @@ class CameraInfo:
         self.uid_hex = uid_bytes.hex()
         self.uid = uid_from_bytes(uid_bytes)  # Printable UID like "VSTABCDEFGHIJKL"
         self.label = self.uid  # Display label — "uid (name)" once config name is known
+        self.hw_alias: Optional[str] = None
+        self.hw_deviceid: Optional[str] = None
+        self.formatted_did: Optional[str] = None
+        try:
+            did_compact, did_fmt = pppp_uid_hex_to_did(self.uid_hex)
+            if did_compact:
+                self.hw_deviceid = did_compact
+                self.formatted_did = did_fmt
+        except Exception:
+            pass
 
     def __repr__(self):
-        return f"Camera({self.ip}:{self.port} uid={self.uid})"
+        return f"Camera({self.ip}:{self.port} uid={self.uid} did={self.formatted_did or '?'})"
+
+
+def did_to_pppp_uid_hex(did: str, psk: bytes = b"vstarcam2019") -> str:
+    """Convert a VStarcam/Eye4 QR/sticker Device ID (e.g. 'VSTJ-082279-XTJDT' or 'VSTJ082279XTJDT') into its exact 40-hex-character PPPP LAN UID."""
+    clean = did.strip().upper().replace("-", "").replace(" ", "").replace(":", "")
+    if clean.startswith("UID"):
+        clean = clean[3:].strip()
+    m = re.match(r"^([A-Z]+)(\d+)([A-Z0-9]+)$", clean)
+    if not m:
+        raise ValueError(f"Invalid VStarcam DID format: {did}")
+    prefix, num_str, suffix = m.group(1), m.group(2), m.group(3)
+    bin_did = (
+        prefix.encode("ascii")[:8].ljust(8, b"\x00")
+        + struct.pack(">I", int(num_str))
+        + suffix.encode("ascii")[:8].ljust(8, b"\x00")
+    )
+    key = p2p_derive_key(psk) if psk else b"\x00\x00\x00\x00"
+    pkt = p2p_proprietary_encrypt(key, bytes([0xF1, 0x41, 0x00, 0x14]) + bin_did)
+    return xor_obfuscate(pkt)[4:24].hex()
+
+
+def pppp_uid_hex_to_did(uid_hex: str, psk: bytes = b"vstarcam2019") -> tuple[str, str]:
+    """Decrypt a 40-hex-character PPPP LAN UID back into ('VSTJ082279XTJDT', 'VSTJ-082279-XTJDT')."""
+    uid_bytes = bytes.fromhex(uid_hex)
+    if len(uid_bytes) != 20:
+        return ("", "")
+    key = p2p_derive_key(psk) if psk else b"\x00\x00\x00\x00"
+    hdr_enc = p2p_proprietary_encrypt(key, bytes([0xF1, 0x41, 0x00, 0x14]))
+    raw = hdr_enc + xor_obfuscate(uid_bytes)
+    dec = p2p_proprietary_decrypt(key, raw)[4:24]
+    prefix = dec[:8].split(b"\x00", 1)[0].decode("ascii", errors="ignore")
+    num = struct.unpack(">I", dec[8:12])[0]
+    suffix = dec[12:20].split(b"\x00", 1)[0].decode("ascii", errors="ignore")
+    if prefix.isalpha() and suffix.isalnum() and 0 < num < 99999999:
+        return (f"{prefix}{num:06d}{suffix}", f"{prefix}-{num:06d}-{suffix}")
+    return ("", "")
 
 
 class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
@@ -783,6 +841,11 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self.transport = transport
         sock = transport.get_extra_info("socket")
         if sock:
+            if hasattr(socket, "SIO_UDP_CONNRESET"):
+                try:
+                    sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+                except OSError:
+                    pass
             local = sock.getsockname()
             log.info("PPPP socket bound to %s:%d", local[0], local[1])
 
@@ -867,7 +930,9 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                      xor_type, ip, port, len(data), data[:16].hex())
 
     def error_received(self, exc):
-        log.error("UDP error: %s", exc)
+        if isinstance(exc, ConnectionResetError) or getattr(exc, "winerror", 0) == 10054:
+            return
+        log.debug("UDP error: %s", exc)
 
     def connection_lost(self, exc):
         log.debug("UDP socket closed: %s", exc)
@@ -888,25 +953,25 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             self.cameras[ip].port = port
         # Save raw LAN_NOTIFY for re-establishing sessions later
         self._lan_notify_raw[ip] = (raw, addr)
-        # Echo LAN_NOTIFY back (triggers PUNCH_RSP from camera)
-        self.transport.sendto(raw, addr)
+        # Only echo LAN_NOTIFY back if this protocol instance is actively connecting to this camera
+        # (prevents discovery probes from hijacking active video sessions!)
+        if self._active_camera and ip == self._active_camera.ip:
+            self.transport.sendto(raw, addr)
 
     def _handle_punch_rsp(self, decoded: bytes, ip: str, port: int):
         log.debug("PUNCH_RSP from %s:%d", ip, port)
         if ip not in self._punch_rsp_data:
             self._punch_rsp_data[ip] = decoded[2:]
-        # Respond with PUNCH_PKT to acknowledge
-        if self.transport and not self.transport.is_closing():
-            self.transport.sendto(build_punch_pkt(), (ip, port))
         if self._active_camera and ip == self._active_camera.ip:
+            if self.transport and not self.transport.is_closing():
+                self.transport.sendto(build_punch_pkt(), (ip, port))
             self._active_camera.port = port
             self._connected.set()
 
     def _handle_punch_to(self, ip: str, port: int):
-        # Always respond with PUNCH_PKT — this is required to complete handshake!
-        if self.transport and not self.transport.is_closing():
-            self.transport.sendto(build_punch_pkt(), (ip, port))
         if self._active_camera and ip == self._active_camera.ip:
+            if self.transport and not self.transport.is_closing():
+                self.transport.sendto(build_punch_pkt(), (ip, port))
             self._active_camera.port = port
             if not self._connected.is_set():
                 log.info("PUNCH_TO from target %s:%d — connection established!", ip, port)
@@ -935,16 +1000,6 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                      pkt_enc_mode, addr[0], addr[1], len(raw_data))
             return
 
-        # Track DRW port — update to the port that sends us data
-        if self._active_camera and addr[0] == self._active_camera.ip:
-            if not self._drw_port:
-                self._drw_port = addr[1]
-                log.info("DRW port locked to %s:%d", addr[0], self._drw_port)
-            elif self._drw_port != addr[1]:
-                log.debug("DRW data also from port %d (locked=%d)", addr[1], self._drw_port)
-                # Update to the new port — camera may have switched
-                self._drw_port = addr[1]
-
         plaintext = self._decrypt_drw(raw_data, pkt_enc_mode)
         parsed = parse_drw_packet(plaintext)
 
@@ -952,6 +1007,15 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             log.debug("Failed to parse DRW from %s:%d (%d bytes), first8=%s",
                       addr[0], addr[1], len(raw_data), plaintext[:8].hex())
             return
+
+        # Track DRW port — update to the port that sends us valid DRW data
+        if self._active_camera and addr[0] == self._active_camera.ip:
+            if not self._drw_port:
+                self._drw_port = addr[1]
+                log.info("DRW port locked to %s:%d", addr[0], self._drw_port)
+            elif self._drw_port != addr[1]:
+                log.debug("DRW data also from port %d (locked=%d)", addr[1], self._drw_port)
+                self._drw_port = addr[1]
 
         channel = parsed["channel"]
         index = parsed["index"]
@@ -1022,6 +1086,8 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             self._handle_video_data(index, payload)
         elif channel == CH_AUDIO:
             self._handle_audio_data(index, payload)
+        elif channel == 5:
+            log.debug("DRW ch=5 heartbeat (%d bytes)", len(payload))
         else:
             log.debug("DRW ch=%d idx=%d (%d bytes)", channel, index, len(payload))
 
@@ -1067,15 +1133,19 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             # Continuation or raw text
             text = payload.decode("ascii", errors="replace")
         # Log at DEBUG for alarm poll responses to reduce noise
-        is_alarm_poll = text and ("alarm_status=" in text or "support_motion" in text)
+        is_alarm_poll = text and (
+            "alarm_status=" in text
+            or "support_motion" in text
+            or "support_humanoidFrame" in text
+        )
         log.log(logging.DEBUG if is_alarm_poll else logging.INFO,
                 "CMD response (%d bytes): first16=%s", len(payload), payload[:16].hex())
 
         if text:
             # Clean up for display
             display = text.replace('\x00', '').strip()[:300]
-            # Suppress noisy alarm poll responses (every 3s per camera)
-            if "alarm_status=" in text or "support_motion" in text:
+            # Suppress noisy alarm poll responses (every 1-3s per camera)
+            if is_alarm_poll:
                 log.debug("CMD response: %s", display)
             else:
                 log.info("CMD response: %s", display)
@@ -1083,18 +1153,19 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                 if not self._logged_in.is_set():
                     self._logged_in.set()
                     log.info("Camera responded — login successful!")
-            # Detect alarm_status changes for motion detection
-            if "alarm_status=" in text:
-                m = re.search(r'alarm_status=(\d+)', text)
-                if m:
-                    status = int(m.group(1))
-                    if status != self._last_alarm_status:
-                        prev = self._last_alarm_status
-                        self._last_alarm_status = status
-                        if prev is not None:  # Skip initial reading
-                            log.info("alarm_status changed: %d → %d", prev, status)
-                            if self.alarm_callback:
-                                self.alarm_callback(status)
+            if self._active_camera:
+                m_alias = re.search(r'alias="([^"]*)"', text)
+                if m_alias and m_alias.group(1):
+                    self._active_camera.hw_alias = m_alias.group(1)
+                m_devid = re.search(r'deviceid="([^"]*)"', text)
+                if m_devid and m_devid.group(1):
+                    self._active_camera.hw_deviceid = m_devid.group(1)
+            # Detect unsolicited cmd=2127 track_status push events from camera AI/motion tracker
+            if "cmd=2127" in text and "track_status=" in text:
+                m_trk = re.search(r'track_status=(\d+)', text)
+                if m_trk and int(m_trk.group(1)) > 0:
+                    if self.alarm_callback:
+                        self.alarm_callback(int(m_trk.group(1)))
 
     def _handle_video_data(self, index: int, payload: bytes):
         if not payload:
@@ -1202,13 +1273,16 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         # Small delay to let camera process login
         await asyncio.sleep(0.3)
 
-        # Request video stream
+        # Request video stream first so frames flow immediately
         log.info("Requesting video stream...")
         await self._send_start_video()
 
         # Request audio stream (separate from video on these cameras)
         await asyncio.sleep(0.3)
         await self._send_start_audio()
+
+        # Auto-provision hardware OSD timestamp + hardware motion alarm in background
+        asyncio.create_task(self._send_auto_provision())
 
         # Camera-push alarms are intentionally disabled — alarm_server_addr is
         # always None in normal operation. See the note above
@@ -1547,6 +1621,55 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         cgi = (f"GET /get_status.cgi?"
                f"loginuse={self.username}&loginpas={self.password}"
                f"&user={self.username}&pwd={self.password}&")
+        await self._send_cmd(cgi)
+
+    async def _send_auto_provision(self):
+        """Enable hardware OSD timestamp + camera name overlay and arm motion detection."""
+        await asyncio.sleep(1.5)
+        for cmd in (
+            "camera_control.cgi?param=18&value=1",
+            "set_misc.cgi?osdenable=1",
+            "set_alarm.cgi?motion_armed=1&motion_sensitivity=5&input_armed=0&iolinkage=0&mail=0&upload_interval=0&record=1&snapshot=1&schedule_enable=1",
+        ):
+            cgi = (f"GET /{cmd}"
+                   f"&loginuse={self.username}&loginpas={self.password}"
+                   f"&user={self.username}&pwd={self.password}&")
+            await self._send_cmd(cgi)
+            await asyncio.sleep(0.15)
+
+    async def send_ptz_command(self, command: int, onestep: int = 1):
+        """Send PTZ motor control command via decoder_control.cgi."""
+        cgi = (f"GET /decoder_control.cgi?command={int(command)}&onestep={int(onestep)}"
+               f"&loginuse={self.username}&loginpas={self.password}"
+               f"&user={self.username}&pwd={self.password}&")
+        await self._send_cmd(cgi)
+
+    async def send_camera_param(self, param: int, value: int):
+        """Send camera parameter via camera_control.cgi (e.g. param=5 flip/mirror, param=14 ircut, param=18 osd)."""
+        cgi = (f"GET /camera_control.cgi?param={int(param)}&value={int(value)}"
+               f"&loginuse={self.username}&loginpas={self.password}"
+               f"&user={self.username}&pwd={self.password}&")
+        await self._send_cmd(cgi)
+
+    async def send_set_alias(self, alias: str):
+        """Update hardware OSD camera alias name via set_alias.cgi."""
+        safe_alias = urllib.parse.quote(alias.strip()[:31])
+        cgi = (f"GET /set_alias.cgi?alias={safe_alias}"
+               f"&loginuse={self.username}&loginpas={self.password}"
+               f"&user={self.username}&pwd={self.password}&")
+        await self._send_cmd(cgi)
+
+    async def send_set_wifi(self, ssid: str, wifi_password: str, authtype: int = 4, encrypt: int = 4):
+        """Configure the camera's Wi-Fi network credentials via set_wifi.cgi over PPPP."""
+        safe_ssid = urllib.parse.quote(ssid.strip())
+        safe_psk = urllib.parse.quote(wifi_password)
+        cgi = (
+            f"GET /set_wifi.cgi?enable=1&ssid={safe_ssid}&channel=0&mode=0"
+            f"&authtype={authtype}&encryp={encrypt}&encrypt={encrypt}"
+            f"&keytype=0&defkey=0&wpa_psk={safe_psk}"
+            f"&loginuse={self.username}&loginpas={self.password}"
+            f"&user={self.username}&pwd={self.password}&"
+        )
         await self._send_cmd(cgi)
 
     async def _send_start_video(self):
@@ -2074,7 +2197,8 @@ class CameraSession:
                  motion_webhook: Optional[str] = None,
                  motion_cooldown: float = 30.0,
                  motion_poll_interval: float = 1.0,
-                 bind_addr: str = "127.0.0.1"):
+                 bind_addr: str = "127.0.0.1",
+                 recorder=None):
         self.camera = camera
         self.rtsp_port = rtsp_port
         self.username = username
@@ -2088,6 +2212,7 @@ class CameraSession:
         self.motion_poll_interval = motion_poll_interval
         self.bind_addr = bind_addr
         self.motion_handler: Optional[MotionHandler] = None
+        self.recorder = recorder
 
         self.protocol: Optional[PPPPUnifiedProtocol] = None
         self.rtsp: Optional["RTSPServer"] = None
@@ -2122,6 +2247,12 @@ class CameraSession:
             self._last_drw_time = asyncio.get_event_loop().time()
             if self.rtsp:
                 self.rtsp.push_video_frame(frame_type, timestamp, data)
+                if self.recorder:
+                    self.recorder.sync_codec_params(
+                        self.rtsp._codec, self.rtsp._vps, self.rtsp._sps, self.rtsp._pps
+                    )
+            if self.recorder:
+                self.recorder.on_video_frame(frame_type, timestamp, data)
 
         def audio_cb(data, codec):
             self._last_drw_time = asyncio.get_event_loop().time()
@@ -2136,13 +2267,18 @@ class CameraSession:
             alarm_server_addr=self.alarm_server_addr,
         )
 
-        # Wire motion detection if webhook is configured
-        if self.motion_webhook:
-            if not self.motion_handler:
+        # Wire motion detection if webhook or recorder is configured
+        if self.motion_webhook or self.recorder:
+            if self.motion_webhook and not self.motion_handler:
                 self.motion_handler = MotionHandler(
                     uid=self.camera.label, webhook=self.motion_webhook,
                     cooldown=self.motion_cooldown)
-            self.protocol.alarm_callback = self.motion_handler.on_alarm_status
+            def _combined_alarm_cb(status: int):
+                if self.motion_handler:
+                    self.motion_handler.on_alarm_status(status)
+                if self.recorder:
+                    self.recorder.on_hardware_alarm(status)
+            self.protocol.alarm_callback = _combined_alarm_cb
             self.protocol.alarm_poll_interval = self.motion_poll_interval
 
         loop = asyncio.get_event_loop()
@@ -2434,29 +2570,61 @@ class RTSPServer:
             if not self._cached_iframe or not self._sps or not self._pps:
                 return None
 
-            # Build raw H.264 byte stream: SPS + PPS + IDR frame
+            # Build raw H.264/H.265 byte stream: (VPS +) SPS + PPS + IDR frame
             start_code = b'\x00\x00\x00\x01'
-            h264_data = start_code + self._sps + start_code + self._pps + self._cached_iframe
+            is_hevc = (self._codec == "h265")
+            prefix = (start_code + self._vps) if (is_hevc and self._vps) else b""
+            raw_video = prefix + start_code + self._sps + start_code + self._pps + self._cached_iframe
+            fmt = "hevc" if is_hevc else "h264"
 
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-f", "h264", "-i", "pipe:0",
-                "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg",
-                "-q:v", "5", "pipe:1",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            jpeg_data = None
             try:
-                jpeg_data, stderr = await asyncio.wait_for(
-                    proc.communicate(input=h264_data), timeout=5.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                log.warning("Snapshot ffmpeg timed out")
-                return None
+                proc = await asyncio.create_subprocess_exec(
+                    FFMPEG_BIN, "-hide_banner", "-loglevel", "error",
+                    "-f", fmt, "-i", "pipe:0",
+                    "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg",
+                    "-q:v", "5", "pipe:1",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    jpeg_data, stderr = await asyncio.wait_for(
+                        proc.communicate(input=raw_video), timeout=5.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    log.warning("Snapshot ffmpeg timed out")
+                    return None
 
-            if proc.returncode != 0 or not jpeg_data:
-                log.warning("Snapshot ffmpeg failed: %s", stderr.decode(errors="replace")[:200])
+                if proc.returncode != 0 or not jpeg_data:
+                    log.warning("Snapshot ffmpeg failed: %s", stderr.decode(errors="replace")[:200])
+                    return None
+            except FileNotFoundError:
+                try:
+                    import cv2
+                    import tempfile
+                    ext = ".h265" if is_hevc else ".h264"
+                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tf:
+                        tf.write(raw_video)
+                        tmp_path = tf.name
+                    try:
+                        cap = cv2.VideoCapture(tmp_path)
+                        ret, frame = cap.read()
+                        cap.release()
+                        if ret and frame is not None:
+                            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                            if ok:
+                                jpeg_data = buf.tobytes()
+                    finally:
+                        try:
+                            _os.remove(tmp_path)
+                        except OSError:
+                            pass
+                except Exception as cv_err:
+                    log.warning("Snapshot fallback failed: %s", cv_err)
+                    return None
+
+            if not jpeg_data:
                 return None
 
             self._snapshot_cache = (asyncio.get_event_loop().time(), jpeg_data)
@@ -3460,6 +3628,7 @@ class MotionHandler:
 async def discover_cameras_broadcast(
         timeout: float = 3.0,
         target_ip: Optional[str] = None,
+        skip_ips: Optional[set[str]] = None,
 ) -> list[CameraInfo]:
     """Run a broadcast discovery and return found cameras. Cleans up after itself."""
     loop = asyncio.get_event_loop()
@@ -3473,16 +3642,38 @@ async def discover_cameras_broadcast(
     targets = []
     if target_ip:
         targets.append((target_ip, PPPP_PORT))
-    for bcast in get_broadcast_addresses():
+    bcasts = get_broadcast_addresses()
+    for bcast in bcasts:
         targets.append((bcast, PPPP_PORT))
 
+    # Also build /24 unicast subnet sweep list so cameras are found even when Wi-Fi AP isolates broadcasts
+    subnet_prefixes = set()
+    for bcast in bcasts:
+        parts = bcast.split(".")
+        if len(parts) == 4 and parts[0] != "255" and parts[3] == "255":
+            subnet_prefixes.add(".".join(parts[:3]))
+    if target_ip:
+        parts = target_ip.split(".")
+        if len(parts) == 4:
+            subnet_prefixes.add(".".join(parts[:3]))
+
     search_pkt = build_lan_search()
-    for _ in range(5):
+    for round_idx in range(5):
         for dest_ip, dest_port in targets:
             try:
                 transport.sendto(search_pkt, (dest_ip, dest_port))
             except OSError:
                 pass
+        if round_idx < 2:
+            for pref in subnet_prefixes:
+                for host_id in range(1, 255):
+                    cand_ip = f"{pref}.{host_id}"
+                    if skip_ips and cand_ip in skip_ips:
+                        continue
+                    try:
+                        transport.sendto(search_pkt, (cand_ip, PPPP_PORT))
+                    except OSError:
+                        pass
         await asyncio.sleep(min(1.0, timeout / 5))
 
     remaining = timeout - 5 * min(1.0, timeout / 5)
