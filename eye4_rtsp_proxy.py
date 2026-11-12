@@ -869,6 +869,11 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self._wan_punch_task: Optional[asyncio.Task] = None
         self._wan_punch_targets: set[tuple[str, int]] = set()
         self._wan_relay_targets: dict[tuple[str, int], bytes] = {}
+        # Relay servers we may ask for a session port: server-recommended ones first,
+        # the generic list (which includes other users' "super devices") as a fallback.
+        self._wan_relay_candidates: set[tuple[str, int]] = set()
+        self._wan_relay_fallbacks: set[tuple[str, int]] = set()
+        self._wan_relay_session: Optional[tuple[tuple[str, int], bytes]] = None  # ((ip, port), magic)
         self._used_wan_p2p: bool = False
         self._punch_rsp_data: dict[str, bytes] = {}
         self._raw_drw_buffer: list[bytes] = []  # Buffer raw DRW for PSK detection
@@ -993,12 +998,20 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                     log.info("WAN RLY_TO from %s:%d -> relay %s:%d magic=%s",
                              ip, port, relay_addr[0], relay_addr[1], magic_word.hex())
                     if relay_addr[0] != "0.0.0.0" and relay_addr[1] > 0:
-                        self._wan_relay_targets[relay_addr] = magic_word
-                        self._used_wan_p2p = True
-                        if self._active_camera and self._active_camera.bin_did and self.transport and not self.transport.is_closing():
-                            rly_pkt = wan_p2p.build_wan_rly_pkt(magic_word, self._active_camera.bin_did, key)
-                            for _ in range(3):
-                                self.transport.sendto(rly_pkt, relay_addr)
+                        if self._wan_relay_session and self._wan_relay_session[1] == magic_word:
+                            # Echo of our own RLY_REQ: the camera has been told to join this session.
+                            self._wan_relay_targets[relay_addr] = magic_word
+                        elif not self._wan_relay_session and not self.connected:
+                            # A relay the server recommends. Its magic is not usable by us:
+                            # we must ask that relay for a session port ourselves (RLY_PORT).
+                            self._wan_relay_candidates.add(relay_addr)
+                            self._send_relay_port_requests([relay_addr])
+                elif mtype == 0x69:
+                    if not self._wan_relay_session and not self.connected:
+                        for relay_addr in wan_p2p.parse_wan_list_req_ack(dec):
+                            self._wan_relay_fallbacks.add(relay_addr)
+                elif mtype == 0x81 and len(dec) >= 5:
+                    log.info("WAN RLY_REQ_ACK from %s:%d — result=0x%02X", ip, port, dec[4])
             return
 
         # Step 1: Fast type check — only XOR first 2 bytes instead of full packet
@@ -1061,6 +1074,13 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                 self._connected.set()
             elif xor_type == MSG_PUNCH_RSP:
                 self._handle_punch_rsp(xor_decoded, ip, port)
+        elif xor_type == 0xA3 and (addr in self._wan_relay_candidates or addr in self._wan_relay_fallbacks):
+            # 0xA3 = WAN RLY_PORT_ACK (0x73 in P2P) from a relay server
+            self._handle_relay_port_ack(data, addr)
+        elif xor_type in (0xA1, 0xA3, 0x53) and (
+                addr in self._wan_relay_candidates or addr in self._wan_relay_fallbacks
+                or addr in self._wan_relay_targets):
+            pass  # RLY_HELLO_ACK / late RLY_PORT_ACK / the camera's own RLY_PKT echoed by the relay
         elif xor_type == MSG_PUNCH_TO:
             self._handle_punch_to(ip, port)
         elif xor_type == MSG_PUNCH_PKT:
@@ -1089,6 +1109,64 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         else:
             log.info("Unknown msg xor_type=0x%02X from %s:%d (%d bytes): %s",
                      xor_type, ip, port, len(data), data[:16].hex())
+
+    # --- WAN Cloud Relay (used when direct UDP hole punching cannot get through NAT) ---
+    #
+    # Sequence, verified against the live VStarcam servers:
+    #   1. LIST_REQ (0x67) to the P2P servers -> they recommend relays (RLY_TO / LIST_REQ_ACK).
+    #   2. RLY_PORT (0x72) to a relay         -> RLY_PORT_ACK (0x73): magic word + session port.
+    #   3. RLY_REQ (0x80) to the P2P servers with (relay ip, session port, magic)
+    #                                         -> the server tells the camera to join.
+    #   4. RLY_PKT (0x83) to relay:session port -> RLY_RDY (0x84); from then on the relay
+    #      forwards DRW traffic both ways as if it were the camera.
+
+    def _send_relay_port_requests(self, relays):
+        if not self.transport or self.transport.is_closing():
+            return
+        key = self._get_wan_p2p_key()
+        hello = wan_p2p.build_wan_rly_hello(key)
+        port_req = wan_p2p.build_wan_rly_port(key)
+        for relay_addr in relays:
+            try:
+                self.transport.sendto(hello, relay_addr)
+                self.transport.sendto(port_req, relay_addr)
+            except OSError as e:
+                log.debug("WAN relay sendto %s failed: %s", relay_addr, e)
+
+    def _send_relay_request(self):
+        """(Re)send RLY_REQ to the P2P servers and RLY_PKT to the relay session port."""
+        cam = self._active_camera
+        if not self._wan_relay_session or not cam or not cam.bin_did:
+            return
+        if not self.transport or self.transport.is_closing():
+            return
+        relay_addr, magic = self._wan_relay_session
+        key = self._get_wan_p2p_key()
+        req = wan_p2p.build_wan_rly_req(cam.bin_did, relay_addr[0], relay_addr[1], magic, key)
+        for srv in cam.wan_servers:
+            try:
+                self.transport.sendto(req, srv)
+            except OSError:
+                pass
+        self.transport.sendto(wan_p2p.build_wan_rly_pkt(magic, cam.bin_did, key), relay_addr)
+
+    def _handle_relay_port_ack(self, data: bytes, addr: tuple):
+        if self._wan_relay_session or self.connected:
+            return
+        # Prefer server-recommended relays; only fall back to the generic list if there are none.
+        if addr not in self._wan_relay_candidates and self._wan_relay_candidates:
+            return
+        parsed = wan_p2p.parse_wan_rly_port_ack(p2p_proprietary_decrypt(self._get_wan_p2p_key(), data))
+        if not parsed:
+            return
+        magic, session_port = parsed
+        relay_addr = (addr[0], session_port)
+        self._wan_relay_session = (relay_addr, magic)
+        self._wan_relay_targets[relay_addr] = magic
+        self._used_wan_p2p = True
+        log.info("WAN relay %s:%d allocated session port %d (magic=%s) — sending RLY_REQ",
+                 addr[0], addr[1], session_port, magic.hex())
+        self._send_relay_request()
 
     def error_received(self, exc):
         if isinstance(exc, ConnectionResetError) or getattr(exc, "winerror", 0) == 10054:
@@ -1395,12 +1473,13 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
     async def _wan_punch_loop(self, camera: CameraInfo, local_ip: str, local_port: int, key: bytes):
         """Background loop during WAN handshake: sends periodic PUNCH_PKT to discovered
         camera endpoints, re-sends P2P_REQ (every 1.5s up to 12s during onboarding),
-        and requests Cloud Relay at 2.8s."""
+        and requests Cloud Relay at 2.0s."""
         loop = asyncio.get_event_loop()
         start_t = loop.time()
         last_req_t = start_t
         resent_req = False
         requested_relay = False
+        last_relay_req_t = 0.0
         try:
             while not self.punch_received.is_set() and self.transport and not self.transport.is_closing():
                 await asyncio.sleep(0.25)
@@ -1415,10 +1494,18 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                         punch_pkt = wan_p2p.build_wan_punch_pkt(camera.bin_did, key)
                         for tgt in list(self._wan_punch_targets):
                             self.transport.sendto(punch_pkt, tgt)
-                    if self._wan_relay_targets:
-                        for rly_addr, magic in list(self._wan_relay_targets.items()):
-                            rly_pkt = wan_p2p.build_wan_rly_pkt(magic, camera.bin_did, key)
-                            self.transport.sendto(rly_pkt, rly_addr)
+                    if self._wan_relay_session:
+                        # Keep knocking on the relay session port; repeat RLY_REQ once a second
+                        # in case the server's RLY_TO to the camera was lost.
+                        relay_addr, magic = self._wan_relay_session
+                        self.transport.sendto(wan_p2p.build_wan_rly_pkt(magic, camera.bin_did, key), relay_addr)
+                        if (now_loop - last_relay_req_t) >= 1.0:
+                            last_relay_req_t = now_loop
+                            self._send_relay_request()
+                    elif requested_relay:
+                        # No relay has answered yet: keep asking for a session port.
+                        self._send_relay_port_requests(
+                            list(self._wan_relay_candidates or self._wan_relay_fallbacks))
                     if is_onboarding:
                         if (now_loop - last_req_t) >= 1.5 and elapsed <= 12.0 and camera.wan_servers:
                             last_req_t = now_loop
@@ -1434,7 +1521,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                             req_pkt = wan_p2p.build_wan_p2p_req(camera.bin_did, local_ip, local_port, key)
                             for srv in camera.wan_servers:
                                 self.transport.sendto(req_pkt, srv)
-                    if elapsed >= 2.8 and not requested_relay and camera.wan_servers:
+                    if elapsed >= 2.0 and not requested_relay and camera.wan_servers:
                         if not is_onboarding or self._wan_punch_targets or getattr(cam_ref, "wan_cloud_status", "IDLE") == "ONLINE_PUNCHING":
                             requested_relay = True
                             log.info("WAN P2P direct punch not yet complete at %.1fs — requesting Cloud Relay (0x67)...", elapsed)
@@ -1476,6 +1563,10 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self.connected = False
         self._connected.clear()
         self._used_wan_p2p = False
+        self._wan_relay_targets.clear()
+        self._wan_relay_candidates.clear()
+        self._wan_relay_fallbacks.clear()
+        self._wan_relay_session = None
         self._session_start = asyncio.get_event_loop().time()
 
         sockname = self.transport.get_extra_info("sockname")

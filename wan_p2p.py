@@ -224,6 +224,54 @@ def build_wan_list_req(bin_did: bytes, p2p_key: bytes) -> bytes:
     )
 
 
+def build_wan_rly_hello(p2p_key: bytes) -> bytes:
+    """Build 0xF1 0x70 0x00 0x00 (MSG_RLY_HELLO), sent to a relay server."""
+    return p2p_proprietary_encrypt(p2p_key, b"\xf1\x70\x00\x00")
+
+
+def build_wan_rly_port(p2p_key: bytes) -> bytes:
+    """Build 0xF1 0x72 0x00 0x00 (MSG_RLY_PORT): ask a relay server to allocate a session port.
+    The relay answers with MSG_RLY_PORT_ACK (0x73): magic_word(4B) + port(2B big-endian) + 2B pad."""
+    return p2p_proprietary_encrypt(p2p_key, b"\xf1\x72\x00\x00")
+
+
+def parse_wan_rly_port_ack(dec: bytes) -> Optional[tuple[bytes, int]]:
+    """Parse a decrypted MSG_RLY_PORT_ACK into (magic_word, session_port)."""
+    if len(dec) < 10 or dec[0] != 0xF1 or dec[1] != 0x73:
+        return None
+    port = struct.unpack(">H", dec[8:10])[0]
+    if port == 0:
+        return None
+    return dec[4:8], port
+
+
+def build_wan_rly_req(bin_did: bytes, relay_ip: str, relay_port: int, magic_word: bytes, p2p_key: bytes) -> bytes:
+    """Build 0xF1 0x80 0x00 0x28 (MSG_RLY_REQ) for the P2P server:
+    bin_did(20B) + relay sockaddr_in_le(16B) + magic_word(4B).
+    The server then tells the camera (MSG_RLY_TO) to join that relay session."""
+    payload = (
+        bin_did[:20].ljust(20, b"\x00")
+        + pack_sockaddr_in_le(relay_ip, relay_port)
+        + magic_word[:4].ljust(4, b"\x00")
+    )
+    return p2p_proprietary_encrypt(p2p_key, b"\xf1\x80\x00\x28" + payload)
+
+
+def parse_wan_list_req_ack(dec: bytes) -> list[tuple[str, int]]:
+    """Parse a decrypted MSG_LIST_REQ_ACK (0x69) into a list of relay (ip, port)."""
+    out = []
+    if len(dec) < 8 or dec[0] != 0xF1 or dec[1] != 0x69:
+        return out
+    for i in range(dec[4]):
+        chunk = dec[8 + 16 * i:24 + 16 * i]
+        if len(chunk) < 16:
+            break
+        ip, port = unpack_sockaddr_in_le(chunk)
+        if ip != "0.0.0.0" and port > 0:
+            out.append((ip, port))
+    return out
+
+
 def build_wan_rly_pkt(magic_word: bytes, bin_did: bytes, p2p_key: bytes) -> bytes:
     """Build 0xF1 0x83 0x00 0x1C + magic_word(4B) + bin_did(20B) + 4B zero padding encrypted."""
     payload = (
