@@ -274,7 +274,13 @@ def _vs_encode_data(src: bytes, dst: bytearray, dst_offset: int) -> int:
 
 
 def vstarcam_encode_mac_wifi(mac_bytes: bytes, pwd: str) -> str:
-    """Bit-exact port of `DataEncoder.encodeMacWiFi(byte[] mac, String pwd)`."""
+    """`DataEncoder.encodeMacWiFi(byte[] mac, String pwd)`.
+
+    Layout: one nibble (len(mac) - 1), the MAC bytes as plain hex, then the password as a
+    typed data field. Verified against a recording of the real Eye4 app, whose payload for
+    BSSID suffix 00:1e decoded as "1" + "001e" + typed password with a valid CRC.
+    (The generic voiceRecog device decoder uses a different two-nibble layout; VStarcam does not.)
+    """
     try:
         b = pwd.encode("gbk")
     except Exception:
@@ -316,11 +322,15 @@ def vstarcam_crc16(int_arr) -> int:
 
 
 def vstarcam_text_to_codes(hex_str: str) -> list:
-    """Bit-exact port of `VoicePlayer.convertTextToCodes(String text)`."""
+    """Hex payload -> tone indexes, framed exactly as the Eye4 app plays it.
+
+    Frame measured from a recording of the Eye4 app: 18, 9, 0, <data + CRC16>, 18.
+    Each nibble n is tone n+1; tone 17 means "same nibble as the previous one".
+    """
     data = [VSTARCAM_HEX_CHARS.index(c) for c in hex_str.lower()]
     crc = vstarcam_crc16(data)
     full = data + [(crc >> 12) & 0xF, (crc >> 8) & 0xF, (crc >> 4) & 0xF, crc & 0xF]
-    codes = [9, 0]
+    codes = [18, 9, 0]
     prev = -1
     for val in full:
         if val != prev:
@@ -330,7 +340,6 @@ def vstarcam_text_to_codes(hex_str: str) -> list:
             codes.append(17)
             prev = 17
     codes.append(18)
-    codes.append(9)
     return codes
 
 
@@ -388,7 +397,7 @@ def generate_vstarcam_sonic_wav(ssid: str, password: str, bssid: str = "", mode:
 
     sample_rate = 44100
     tone_ms = 65
-    pause_ms = 850
+    pause_ms = 600  # Eye4 leaves ~600 ms of silence between repeats
     total_samples = (tone_ms * sample_rate) // 1000
     ramp_samples = int(total_samples * 0.2)
     max_amp = 32767
@@ -417,7 +426,8 @@ def generate_vstarcam_sonic_wav(ssid: str, password: str, bssid: str = "", mode:
         if b_idx < len(burst_list) - 1:
             pcm_parts.append(pause_silence)
         else:
-            pcm_parts.append(lead_silence)
+            # The <audio loop> restart adds the 250 ms lead-in, so the seam is also one full pause.
+            pcm_parts.append(np.zeros(((pause_ms - 250) * sample_rate) // 1000, dtype=np.int16).tobytes())
 
     full_pcm = b"".join(pcm_parts)
     wav_io = io.BytesIO()
@@ -1731,7 +1741,7 @@ class CameraHubApp:
             qr_data_url = ""
             qr_text = ""
             duration_sec = 0.0
-            requested_mode = str(data.get("sonic_mode") or data.get("mode") or ("combo" if wifi_bssid else "ssid")).strip()
+            requested_mode = str(data.get("sonic_mode") or data.get("mode") or ("mac" if wifi_bssid else "ssid")).strip()
             if wifi_ssid:
                 sonic_res = await asyncio.get_event_loop().run_in_executor(
                     None, generate_vstarcam_sonic_wav, wifi_ssid, wifi_password, wifi_bssid, requested_mode
@@ -3880,7 +3890,7 @@ async function startOneClickOnboarding(isUnbox = null) {
         wifi_ssid: isUnbox ? ssid : '',
         wifi_password: isUnbox ? wifiPwd : '',
         wifi_bssid: isUnbox ? wifiBssid : '',
-        sonic_mode: isUnbox ? (wifiBssid ? 'combo' : 'ssid') : 'ssid'
+        sonic_mode: isUnbox ? (wifiBssid ? 'mac' : 'ssid') : 'ssid'
       })
     });
     const data = await res.json();
