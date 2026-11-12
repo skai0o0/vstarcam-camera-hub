@@ -1,0 +1,23 @@
+# VStarcam Camera Hub - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core WebUI, WebSockets & Async HTTP Server
+aiohttp>=3.9.0
+
+# VStarcam PPPP / Eye4 WAN P2P Cryptography (AES & Key Derivation)
+pycryptodome>=3.20.0
+
+# Configuration Management (eye4_rtsp_proxy.yml)
+pyyaml>=6.0.1
+
+# Network Discovery & LAN Subnet Broadcasting
+netifaces>=0.11.0
+
+# Image Processing & QR Code Decoding (Headless for servers/headless Linux)
+opencv-python-headless>=4.8.0
+
+# Optical Wi-Fi QR Code Generation
+qrcode>=7.4.2
+
+# FSK Audio Synthesis (Sonic Wave 6.5–10.1 kHz) & Array Operations
+numpy>=1.26.0
