@@ -1731,10 +1731,10 @@ class CameraHubApp:
             qr_data_url = ""
             qr_text = ""
             duration_sec = 0.0
-            sonic_mode = "ssid"
+            requested_mode = str(data.get("sonic_mode") or data.get("mode") or ("combo" if wifi_bssid else "ssid")).strip()
             if wifi_ssid:
                 sonic_res = await asyncio.get_event_loop().run_in_executor(
-                    None, generate_vstarcam_sonic_wav, wifi_ssid, wifi_password, wifi_bssid, "ssid"
+                    None, generate_vstarcam_sonic_wav, wifi_ssid, wifi_password, wifi_bssid, requested_mode
                 )
                 wav_b64 = base64.b64encode(sonic_res["wav_bytes"]).decode("ascii")
                 wav_data_url = f"data:audio/wav;base64,{wav_b64}"
@@ -2030,12 +2030,20 @@ class CameraHubApp:
       <label>Mật khẩu Wi-Fi (*):</label>
       <input id="m-pwd" value="{password}" placeholder="Nhập mật khẩu Wi-Fi..." oninput="updateWavUrl()">
 
-      <label>Chế độ Sóng âm:</label>
-      <select id="m-mode" onchange="updateWavUrl()">
-        <option value="ssid" {"selected" if mode=="ssid" else ""}>Chuẩn Full SSID (Mọi mạng)</option>
-        <option value="combo" {"selected" if mode=="combo" else ""}>Kết hợp BSSID + SSID</option>
-      </select>
-      <input type="hidden" id="m-bssid" value="{bssid}">
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+        <div>
+          <label>Chế độ Sóng âm:</label>
+          <select id="m-mode" onchange="updateWavUrl()">
+            <option value="combo" {"selected" if mode=="combo" else ""}>Siêu nhạy: Kết hợp MAC + SSID</option>
+            <option value="mac" {"selected" if mode=="mac" else ""}>Siêu tốc: MAC Router (Như Eye4)</option>
+            <option value="ssid" {"selected" if mode=="ssid" else ""}>Chuẩn: Full SSID (Mọi mạng)</option>
+          </select>
+        </div>
+        <div>
+          <label>MAC Router / BSSID (Khuyên dùng):</label>
+          <input id="m-bssid" value="{bssid}" placeholder="VD: 001e hoặc xem đáy router" oninput="updateWavUrl()">
+        </div>
+      </div>
 
       <div style="display:flex; gap:8px; margin-top:8px;">
         <button class="stop-btn" onclick="stopPlay()" style="flex:1;">⏹ Dừng phát âm thanh</button>
@@ -2180,8 +2188,9 @@ function updateWavUrl() {{
   const s = document.getElementById('m-ssid').value.trim();
   const p = document.getElementById('m-pwd').value;
   const m = document.getElementById('m-mode').value;
+  const b = (document.getElementById('m-bssid') || {{}}).value.trim();
   if (!s) return;
-  const u = `/api/wifi/sonic.wav?ssid=${{encodeURIComponent(s)}}&password=${{encodeURIComponent(p)}}&mode=${{encodeURIComponent(m)}}`;
+  const u = `/api/wifi/sonic.wav?ssid=${{encodeURIComponent(s)}}&password=${{encodeURIComponent(p)}}&bssid=${{encodeURIComponent(b)}}&mode=${{encodeURIComponent(m)}}`;
   const a = document.getElementById('m-audio');
   if (a.paused) a.src = u;
 }}
@@ -2278,6 +2287,8 @@ async function startOneClickMobile() {{
   s3.innerHTML = '<b>Bước 3:</b> 🔗 Server đục lỗ UDP &amp; xác thực (<code>CONNECTED</code>)...';
 
   try {{
+    const bssid = (document.getElementById('m-bssid') || {{}}).value.trim();
+    const mode = (document.getElementById('m-mode') || {{}}).value || 'combo';
     const res = await fetch('/api/camera/onboard', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
@@ -2286,7 +2297,9 @@ async function startOneClickMobile() {{
         room_name: room,
         cam_password: camPwd,
         wifi_ssid: ssid,
-        wifi_password: pwd
+        wifi_password: pwd,
+        wifi_bssid: bssid,
+        sonic_mode: mode
       }})
     }});
     const d = await res.json();
@@ -3866,7 +3879,8 @@ async function startOneClickOnboarding(isUnbox = null) {
         cam_password: camPwd,
         wifi_ssid: isUnbox ? ssid : '',
         wifi_password: isUnbox ? wifiPwd : '',
-        wifi_bssid: (isUnbox && hostCurrentSsid && ssid === hostCurrentSsid) ? wifiBssid : ''
+        wifi_bssid: isUnbox ? wifiBssid : '',
+        sonic_mode: isUnbox ? (wifiBssid ? 'combo' : 'ssid') : 'ssid'
       })
     });
     const data = await res.json();
