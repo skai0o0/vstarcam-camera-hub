@@ -27,6 +27,9 @@ import urllib.request
 import urllib.parse
 from typing import Optional
 
+import wan_p2p
+discover_camera_wan = wan_p2p.discover_camera_wan
+
 try:
     import yaml
     HAS_YAML = True
@@ -193,7 +196,7 @@ def save_config(path: str, config: dict):
         log.warning("Error saving config to %s: %s", path, e)
 
 
-_CRED_PARAM_RE = re.compile(r'(loginpas|pwd)=[^&\s]*')
+_CRED_PARAM_RE = re.compile(r'(loginpas|pwd[123]?)=[^&\s]*')
 
 
 def redact_credentials(text: str) -> str:
@@ -728,16 +731,49 @@ class CameraInfo:
         self.hw_alias: Optional[str] = None
         self.hw_deviceid: Optional[str] = None
         self.formatted_did: Optional[str] = None
+        self.connection_mode: str = "LAN"
+        self.wan_cloud_status: str = "IDLE"
+        self.onboarding_until: float = 0.0
+        self.bin_did: Optional[bytes] = None
+        self.wan_servers: list[tuple[str, int]] = []
         try:
             did_compact, did_fmt = pppp_uid_hex_to_did(self.uid_hex)
+            if not did_compact:
+                # Also try vstarcam2018 PSK for VSTG/VSTH prefixes
+                did_compact, did_fmt = pppp_uid_hex_to_did(self.uid_hex, psk=b"vstarcam2018")
             if did_compact:
                 self.hw_deviceid = did_compact
                 self.formatted_did = did_fmt
+                self.bin_did = wan_p2p.did_to_binary(self.hw_deviceid)
+                self.wan_servers, _ = wan_p2p.get_p2p_servers_for_did(self.hw_deviceid)
         except Exception:
             pass
 
+    @classmethod
+    def from_did(cls, did_or_uid_hex: str, ip: str = "0.0.0.0", port: int = 32108) -> "CameraInfo":
+        """Create a CameraInfo from either a VStarcam DID string (e.g. 'VSTJ082299RLSXK' or
+        'VSTJ-082299-RLSXK') or a 40-char hex UID string."""
+        clean = (did_or_uid_hex or "").strip()
+        if len(clean) == 40 and all(c in "0123456789abcdefABCDEF" for c in clean):
+            uid_hex = clean.lower()
+            cam = cls(ip=ip, port=port, uid_bytes=bytes.fromhex(uid_hex))
+        else:
+            _, psk_bytes = wan_p2p.get_p2p_servers_for_did(clean)
+            uid_hex = did_to_pppp_uid_hex(clean, psk=psk_bytes or b"vstarcam2019")
+            cam = cls(ip=ip, port=port, uid_bytes=bytes.fromhex(uid_hex))
+            if not cam.bin_did:
+                try:
+                    cam.bin_did = wan_p2p.did_to_binary(clean)
+                    cam.hw_deviceid, cam.formatted_did = wan_p2p.binary_to_did(cam.bin_did)
+                    cam.wan_servers, _ = wan_p2p.get_p2p_servers_for_did(clean)
+                except Exception:
+                    pass
+        if ip == "0.0.0.0":
+            cam.connection_mode = "WAN_P2P"
+        return cam
+
     def __repr__(self):
-        return f"Camera({self.ip}:{self.port} uid={self.uid} did={self.formatted_did or '?'})"
+        return f"Camera({self.ip}:{self.port} [{self.connection_mode}] uid={self.uid} did={self.formatted_did or '?'})"
 
 
 def did_to_pppp_uid_hex(did: str, psk: bytes = b"vstarcam2019") -> str:
@@ -778,21 +814,22 @@ def pppp_uid_hex_to_did(uid_hex: str, psk: bytes = b"vstarcam2019") -> tuple[str
 
 class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
     """
-    Unified UDP protocol handler for the entire PPPP lifecycle.
+    Unified UDP protocol handler for the entire PPPP lifecycle (LAN + WAN P2P + Cloud Relay).
 
     CRITICAL PROTOCOL INSIGHT:
     - Control packets (LAN_SEARCH, LAN_NOTIFY, PUNCH_RSP, PUNCH_TO, PUNCH_PKT)
-      use simple 4-byte repeating XOR.
+      use simple 4-byte repeating XOR (or P2P_Proprietary for WAN P2P servers).
     - DRW data packets use P2P_Proprietary stream cipher and standard PPPP format:
       F1 D0 [size16BE] D1 [channel] [index16BE] [payload]
     """
 
-    def __init__(self, username: str, password: str,
+    def __init__(self, username: str = "admin", password: str = "888888",
                  video_callback=None, audio_callback=None,
                  p2p_key: bytes = None,
                  psk_list: Optional[list[str]] = None,
                  enc_mode: Optional[str] = None,
-                 alarm_server_addr: Optional[str] = None):
+                 alarm_server_addr: Optional[str] = None,
+                 camera: Optional[CameraInfo] = None):
         self.username = username
         self.password = password
         self.video_callback = video_callback
@@ -810,9 +847,13 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self.cameras: dict[str, CameraInfo] = {}
         self.discovery_done = asyncio.Event()
 
-        self._active_camera: Optional[CameraInfo] = None
+        self._active_camera: Optional[CameraInfo] = camera
         self._connected = asyncio.Event()
+        self.punch_received = self._connected
+        self.connected: bool = False
         self._logged_in = asyncio.Event()
+        self.auth_failed: bool = False
+        self.auth_error: Optional[str] = None
         self._got_any_drw = asyncio.Event()  # Set when ANY DRW/ACK received
         self._drw_port: Optional[int] = None  # Locked port for DRW communication
         self._seen_drw_indices: dict[int, set[int]] = {}  # channel -> set of seen indices
@@ -825,6 +866,10 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self._drw_packets_received = 0
         self._running = False
         self._alive_task: Optional[asyncio.Task] = None
+        self._wan_punch_task: Optional[asyncio.Task] = None
+        self._wan_punch_targets: set[tuple[str, int]] = set()
+        self._wan_relay_targets: dict[tuple[str, int], bytes] = {}
+        self._used_wan_p2p: bool = False
         self._punch_rsp_data: dict[str, bytes] = {}
         self._raw_drw_buffer: list[bytes] = []  # Buffer raw DRW for PSK detection
         self._raw_drw_enc_modes: list[str] = []  # Track which enc mode each buffered pkt uses
@@ -836,6 +881,36 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self._ack_flush_task: Optional[asyncio.Task] = None
 
         self.aes_key: Optional[bytes] = None
+
+    @property
+    def camera(self) -> Optional[CameraInfo]:
+        return self._active_camera
+
+    @camera.setter
+    def camera(self, value: Optional[CameraInfo]):
+        self._active_camera = value
+
+    @property
+    def wan_cloud_status(self) -> str:
+        if self._active_camera is not None:
+            return getattr(self._active_camera, "wan_cloud_status", "IDLE")
+        return getattr(self, "_wan_cloud_status", "IDLE")
+
+    @wan_cloud_status.setter
+    def wan_cloud_status(self, value: str):
+        self._wan_cloud_status = value
+        if self._active_camera is not None:
+            self._active_camera.wan_cloud_status = value
+
+    def _get_wan_p2p_key(self) -> bytes:
+        """Return 4-byte P2P key for WAN signaling packets."""
+        if self.p2p_key and self.p2p_key != b"\x00\x00\x00\x00":
+            return self.p2p_key
+        if self._active_camera and self._active_camera.hw_deviceid:
+            _, psk_bytes = wan_p2p.get_p2p_servers_for_did(self._active_camera.hw_deviceid)
+            if psk_bytes:
+                return p2p_derive_key(psk_bytes)
+        return p2p_derive_key(b"vstarcam2019")
 
     def connection_made(self, transport):
         self.transport = transport
@@ -871,6 +946,61 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
 
         ip, port = addr
 
+        # Step 0: Handle packets from WAN P2P Cloud Servers (port 32100)
+        if port == 32100 or (self._active_camera and addr in self._active_camera.wan_servers):
+            key = self._get_wan_p2p_key()
+            dec = p2p_proprietary_decrypt(key, data)
+            if len(dec) >= 4 and dec[0] == PPPP_MAGIC:
+                mtype = dec[1]
+                if mtype == 0x01 and len(dec) >= 20:
+                    wan_ip, wan_port = wan_p2p.unpack_sockaddr_in_le(dec[4:20])
+                    log.info("WAN HELLO_ACK from %s:%d — external endpoint %s:%d",
+                             ip, port, wan_ip, wan_port)
+                elif mtype == 0x21 and len(dec) >= 5:
+                    status_byte = dec[4]
+                    if status_byte == 0x00:
+                        if self.camera:
+                            self.camera.wan_cloud_status = "ONLINE_PUNCHING"
+                        log.info("WAN P2P_REQ_ACK from %s:%d — camera is ONLINE (0x00)", ip, port)
+                    elif status_byte == 0xFE:
+                        if self.camera and not self.connected:
+                            self.camera.wan_cloud_status = "WAITING_FOR_WIFI"
+                        log.warning("WAN P2P_REQ_ACK from %s:%d — camera is OFFLINE (0xFE)", ip, port)
+                    elif status_byte == 0xFF:
+                        if self.camera and not self.connected:
+                            self.camera.wan_cloud_status = "INVALID_UID"
+                        log.warning("WAN P2P_REQ_ACK from %s:%d — INVALID_UID (0xFF)", ip, port)
+                    else:
+                        log.info("WAN P2P_REQ_ACK from %s:%d — status=0x%02X", ip, port, status_byte)
+                elif mtype == 0x40 and len(dec) >= 20:
+                    if self.camera and not self.connected:
+                        self.camera.wan_cloud_status = "ONLINE_PUNCHING"
+                    tgt_ip, tgt_port = wan_p2p.unpack_sockaddr_in_le(dec[4:20])
+                    log.info("WAN PUNCH_TO from %s:%d -> target camera %s:%d",
+                             ip, port, tgt_ip, tgt_port)
+                    if tgt_ip != "0.0.0.0" and tgt_port > 0:
+                        self._wan_punch_targets.add((tgt_ip, tgt_port))
+                        self._used_wan_p2p = True
+                        if self._active_camera and self._active_camera.bin_did and self.transport and not self.transport.is_closing():
+                            punch_pkt = wan_p2p.build_wan_punch_pkt(self._active_camera.bin_did, key)
+                            for _ in range(5):
+                                self.transport.sendto(punch_pkt, (tgt_ip, tgt_port))
+                elif mtype == 0x82 and len(dec) >= 24:
+                    if self.camera and not self.connected:
+                        self.camera.wan_cloud_status = "ONLINE_PUNCHING"
+                    relay_addr = wan_p2p.unpack_sockaddr_in_le(dec[4:20])
+                    magic_word = dec[20:24]
+                    log.info("WAN RLY_TO from %s:%d -> relay %s:%d magic=%s",
+                             ip, port, relay_addr[0], relay_addr[1], magic_word.hex())
+                    if relay_addr[0] != "0.0.0.0" and relay_addr[1] > 0:
+                        self._wan_relay_targets[relay_addr] = magic_word
+                        self._used_wan_p2p = True
+                        if self._active_camera and self._active_camera.bin_did and self.transport and not self.transport.is_closing():
+                            rly_pkt = wan_p2p.build_wan_rly_pkt(magic_word, self._active_camera.bin_did, key)
+                            for _ in range(3):
+                                self.transport.sendto(rly_pkt, relay_addr)
+            return
+
         # Step 1: Fast type check — only XOR first 2 bytes instead of full packet
         xor_magic = data[0] ^ 0x15  # XOR_KEY[0]
         if xor_magic != PPPP_MAGIC:
@@ -894,12 +1024,43 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         elif xor_type == MSG_DRW_ACK:
             # XOR-only DRW_ACK (type 0xD1 after simple XOR = no P2P_Proprietary)
             self._handle_drw_ack_encrypted(data, addr, ENC_XOR_ONLY)
-        elif xor_type == MSG_LAN_NOTIFY:
+        elif xor_type in (MSG_LAN_NOTIFY, MSG_PUNCH_RSP, 0x54):
+            # 0x91 = LAN_NOTIFY / WAN PUNCH_PKT (0x41 in P2P)
+            # 0x92 = PUNCH_RSP / WAN P2P_RDY (0x42 in P2P)
+            # 0x54 = WAN RLY_RDY (0x84 in P2P)
             xor_decoded = xor_obfuscate(data)
-            self._handle_lan_notify(xor_decoded, data, addr)
-        elif xor_type == MSG_PUNCH_RSP:
-            xor_decoded = xor_obfuscate(data)
-            self._handle_punch_rsp(xor_decoded, ip, port)
+            if xor_type == MSG_LAN_NOTIFY:
+                self._handle_lan_notify(xor_decoded, data, addr)
+            if self._active_camera:
+                if xor_type in (MSG_LAN_NOTIFY, MSG_PUNCH_RSP) and len(xor_decoded) >= 24:
+                    if self._active_camera.uid_bytes and xor_decoded[4:24] != self._active_camera.uid_bytes:
+                        return
+                self._active_camera.ip = ip
+                self._active_camera.port = port
+                self._active_camera.discovery_port = port
+                if xor_type == 0x54 or addr in self._wan_relay_targets:
+                    self._active_camera.connection_mode = "WAN_RELAY"
+                elif addr in self._wan_punch_targets or self._used_wan_p2p:
+                    self._active_camera.connection_mode = "WAN_P2P"
+                else:
+                    self._active_camera.connection_mode = "LAN"
+                self._active_camera.wan_cloud_status = "CONNECTED"
+                if self.transport and not self.transport.is_closing():
+                    key = self._get_wan_p2p_key()
+                    if self._active_camera.bin_did:
+                        self.transport.sendto(
+                            wan_p2p.build_wan_p2p_rdy(self._active_camera.bin_did, key), addr
+                        )
+                    elif xor_type == MSG_LAN_NOTIFY:
+                        self.transport.sendto(data, addr)
+                    self.transport.sendto(build_punch_pkt(), addr)
+                if not self._connected.is_set():
+                    log.info("Handshake response (xor_type=0x%02X, mode=%s) from %s:%d — session ready!",
+                             xor_type, self._active_camera.connection_mode, ip, port)
+                self.connected = True
+                self._connected.set()
+            elif xor_type == MSG_PUNCH_RSP:
+                self._handle_punch_rsp(xor_decoded, ip, port)
         elif xor_type == MSG_PUNCH_TO:
             self._handle_punch_to(ip, port)
         elif xor_type == MSG_PUNCH_PKT:
@@ -966,6 +1127,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             if self.transport and not self.transport.is_closing():
                 self.transport.sendto(build_punch_pkt(), (ip, port))
             self._active_camera.port = port
+            self.connected = True
             self._connected.set()
 
     def _handle_punch_to(self, ip: str, port: int):
@@ -975,6 +1137,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             self._active_camera.port = port
             if not self._connected.is_set():
                 log.info("PUNCH_TO from target %s:%d — connection established!", ip, port)
+                self.connected = True
                 self._connected.set()
             else:
                 log.debug("PUNCH_TO from %s:%d (already connected)", ip, port)
@@ -985,6 +1148,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         log.info("PUNCH_PKT from %s:%d — session confirmed!", ip, port)
         if self._active_camera and ip == self._active_camera.ip:
             self._active_camera.port = port
+            self.connected = True
             self._connected.set()
 
     # --- DRW packet handlers (P2P_Proprietary encrypted) ---
@@ -1009,13 +1173,18 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             return
 
         # Track DRW port — update to the port that sends us valid DRW data
-        if self._active_camera and addr[0] == self._active_camera.ip:
-            if not self._drw_port:
-                self._drw_port = addr[1]
-                log.info("DRW port locked to %s:%d", addr[0], self._drw_port)
-            elif self._drw_port != addr[1]:
-                log.debug("DRW data also from port %d (locked=%d)", addr[1], self._drw_port)
-                self._drw_port = addr[1]
+        if self._active_camera:
+            if self._active_camera.ip in ("0.0.0.0", "Chờ Wi-Fi LAN", ""):
+                self._active_camera.ip = addr[0]
+                self._active_camera.port = addr[1]
+                self._active_camera.discovery_port = addr[1]
+            if addr[0] == self._active_camera.ip:
+                if not self._drw_port:
+                    self._drw_port = addr[1]
+                    log.info("DRW port locked to %s:%d", addr[0], self._drw_port)
+                elif self._drw_port != addr[1]:
+                    log.debug("DRW data also from port %d (locked=%d)", addr[1], self._drw_port)
+                    self._drw_port = addr[1]
 
         channel = parsed["channel"]
         index = parsed["index"]
@@ -1150,9 +1319,18 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             else:
                 log.info("CMD response: %s", display)
             if "result=" in text or "deviceid=" in text:
+                if "result=-1" in text or "result=-2" in text:
+                    self.auth_failed = True
+                    self.auth_error = display
+                    log.warning("Camera CGI returned %s — check camera password if credentials differ from %r",
+                                display, self.password)
+                else:
+                    self.auth_failed = False
+                    self.auth_error = None
                 if not self._logged_in.is_set():
                     self._logged_in.set()
-                    log.info("Camera responded — login successful!")
+                    if not self.auth_failed:
+                        log.info("Camera responded — login successful!")
             if self._active_camera:
                 m_alias = re.search(r'alias="([^"]*)"', text)
                 if m_alias and m_alias.group(1):
@@ -1214,41 +1392,188 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
 
     # --- Session management ---
 
-    async def connect_to_camera(self, camera: CameraInfo):
+    async def _wan_punch_loop(self, camera: CameraInfo, local_ip: str, local_port: int, key: bytes):
+        """Background loop during WAN handshake: sends periodic PUNCH_PKT to discovered
+        camera endpoints, re-sends P2P_REQ (every 1.5s up to 12s during onboarding),
+        and requests Cloud Relay at 2.8s."""
+        loop = asyncio.get_event_loop()
+        start_t = loop.time()
+        last_req_t = start_t
+        resent_req = False
+        requested_relay = False
+        try:
+            while not self.punch_received.is_set() and self.transport and not self.transport.is_closing():
+                await asyncio.sleep(0.25)
+                if self.punch_received.is_set() or not self.transport or self.transport.is_closing():
+                    break
+                now_loop = loop.time()
+                elapsed = now_loop - start_t
+                cam_ref = self.camera or camera
+                is_onboarding = time.monotonic() < getattr(cam_ref, "onboarding_until", 0.0)
+                if camera.bin_did:
+                    if self._wan_punch_targets:
+                        punch_pkt = wan_p2p.build_wan_punch_pkt(camera.bin_did, key)
+                        for tgt in list(self._wan_punch_targets):
+                            self.transport.sendto(punch_pkt, tgt)
+                    if self._wan_relay_targets:
+                        for rly_addr, magic in list(self._wan_relay_targets.items()):
+                            rly_pkt = wan_p2p.build_wan_rly_pkt(magic, camera.bin_did, key)
+                            self.transport.sendto(rly_pkt, rly_addr)
+                    if is_onboarding:
+                        if (now_loop - last_req_t) >= 1.5 and elapsed <= 12.0 and camera.wan_servers:
+                            last_req_t = now_loop
+                            hello_pkt = wan_p2p.build_wan_hello(key)
+                            req_pkt = wan_p2p.build_wan_p2p_req(camera.bin_did, local_ip, local_port, key)
+                            for srv in camera.wan_servers:
+                                self.transport.sendto(hello_pkt, srv)
+                                self.transport.sendto(req_pkt, srv)
+                    else:
+                        if elapsed >= 1.5 and not resent_req and camera.wan_servers:
+                            resent_req = True
+                            last_req_t = now_loop
+                            req_pkt = wan_p2p.build_wan_p2p_req(camera.bin_did, local_ip, local_port, key)
+                            for srv in camera.wan_servers:
+                                self.transport.sendto(req_pkt, srv)
+                    if elapsed >= 2.8 and not requested_relay and camera.wan_servers:
+                        if not is_onboarding or self._wan_punch_targets or getattr(cam_ref, "wan_cloud_status", "IDLE") == "ONLINE_PUNCHING":
+                            requested_relay = True
+                            log.info("WAN P2P direct punch not yet complete at %.1fs — requesting Cloud Relay (0x67)...", elapsed)
+                            list_req = wan_p2p.build_wan_list_req(camera.bin_did, key)
+                            for srv in camera.wan_servers:
+                                self.transport.sendto(list_req, srv)
+        except asyncio.CancelledError:
+            pass
+
+    async def start_handshake(self, camera: Optional[CameraInfo] = None, timeout: float = 4.5) -> bool:
+        """Perform hybrid LAN + WAN P2P handshake directly over self.transport."""
+        if camera is not None:
+            self._active_camera = camera
+        cam = self._active_camera
+        if cam is None:
+            return False
+
+        is_onboarding = time.monotonic() < getattr(cam, "onboarding_until", 0.0)
+        effective_timeout = max(timeout, 12.0) if (is_onboarding and timeout == 4.5) else timeout
+
+        if self.transport is None or self.transport.is_closing():
+            loop = asyncio.get_event_loop()
+            self.transport, _ = await loop.create_datagram_endpoint(
+                lambda: self,
+                local_addr=("0.0.0.0", 0),
+                allow_broadcast=True,
+            )
+            sock = self.transport.get_extra_info("socket")
+            if sock:
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                except OSError:
+                    pass
+
+        if self._wan_punch_task and not self._wan_punch_task.done():
+            self._wan_punch_task.cancel()
+            self._wan_punch_task = None
+
+        self.connected = False
+        self._connected.clear()
+        self._used_wan_p2p = False
+        self._session_start = asyncio.get_event_loop().time()
+
+        sockname = self.transport.get_extra_info("sockname")
+        local_port = sockname[1] if sockname else 0
+        local_ip = wan_p2p.get_local_ip_for_wan()
+        key = self._get_wan_p2p_key()
+
+        # 1. LAN handshake (if camera has a known non-zero IP)
+        if cam.ip and cam.ip not in ("0.0.0.0", "Chờ Wi-Fi LAN"):
+            if cam.ip in self._lan_notify_raw:
+                raw_lan_notify, orig_addr = self._lan_notify_raw[cam.ip]
+            elif cam.uid_bytes:
+                raw_lan_notify = xor_obfuscate(bytes([PPPP_MAGIC, MSG_LAN_NOTIFY, 0x00, 0x14]) + cam.uid_bytes)
+            else:
+                raw_lan_notify = None
+
+            if raw_lan_notify:
+                for p in set([cam.discovery_port, PPPP_PORT]):
+                    if p:
+                        try:
+                            self.transport.sendto(raw_lan_notify, (cam.ip, p))
+                        except OSError:
+                            pass
+            try:
+                self.transport.sendto(build_lan_search(), (cam.ip, PPPP_PORT))
+            except OSError:
+                pass
+
+        # 2. WAN P2P handshake (if camera has a binary DID and WAN P2P servers)
+        if cam.bin_did and cam.wan_servers:
+            hello_pkt = wan_p2p.build_wan_hello(key)
+            req_pkt = wan_p2p.build_wan_p2p_req(cam.bin_did, local_ip, local_port, key)
+            log.info("Sending WAN P2P HELLO + P2P_REQ for %s (local %s:%d) to %d servers...",
+                     cam.formatted_did or cam.uid, local_ip, local_port, len(cam.wan_servers))
+            for srv in cam.wan_servers:
+                try:
+                    self.transport.sendto(hello_pkt, srv)
+                    self.transport.sendto(req_pkt, srv)
+                except OSError as e:
+                    log.debug("WAN sendto %s failed: %s", srv, e)
+            self._wan_punch_task = asyncio.create_task(
+                self._wan_punch_loop(cam, local_ip, local_port, key)
+            )
+
+        try:
+            await asyncio.wait_for(self._connected.wait(), timeout=effective_timeout)
+            log.info("Session established with %s:%d (mode=%s)",
+                     cam.ip, cam.discovery_port, cam.connection_mode)
+        except asyncio.TimeoutError:
+            log.warning("Handshake timed out after %.1fs for %s, proceeding anyway...",
+                        effective_timeout, cam.formatted_did or cam.ip)
+        finally:
+            if self._wan_punch_task and not self._wan_punch_task.done():
+                self._wan_punch_task.cancel()
+                try:
+                    await self._wan_punch_task
+                except asyncio.CancelledError:
+                    pass
+            self._wan_punch_task = None
+
+        # Send PUNCH_PKT / WAN P2P_RDY to active camera ports to solidify session
+        if cam.ip and cam.ip not in ("0.0.0.0", "Chờ Wi-Fi LAN"):
+            for port in set([cam.discovery_port, cam.port]):
+                if not port:
+                    continue
+                for _ in range(3):
+                    if cam.bin_did and cam.connection_mode in ("WAN_P2P", "WAN_RELAY"):
+                        self.transport.sendto(wan_p2p.build_wan_p2p_rdy(cam.bin_did, key), (cam.ip, port))
+                    self.transport.sendto(build_punch_pkt(), (cam.ip, port))
+                    await asyncio.sleep(0.02)
+
+        return self.connected
+
+    async def connect_to_camera(self, camera: Optional[CameraInfo] = None):
         """Establish a PPPP session with the specified camera."""
-        self._active_camera = camera
+        if camera is not None:
+            self._active_camera = camera
+        camera = self._active_camera
+        if camera is None:
+            raise ValueError("No camera specified for connect_to_camera()")
         self._running = True
         self._video_reassembly = None
 
         log.info("Connecting to %s (discovery port %d)...", camera, camera.discovery_port)
 
-        # Re-establish session: echo LAN_NOTIFY again to get fresh PUNCH_TO
-        if camera.ip in self._lan_notify_raw:
-            raw, orig_addr = self._lan_notify_raw[camera.ip]
-            log.info("Re-sending LAN_NOTIFY echo to %s:%d", orig_addr[0], orig_addr[1])
-            self.transport.sendto(raw, orig_addr)
+        await self.start_handshake(camera)
+        if not self.connected and (not camera.ip or camera.ip in ("0.0.0.0", "Chờ Wi-Fi LAN")) and not self._wan_punch_targets and not self._wan_relay_targets:
+            log.info("WAN camera %s not yet reachable (wan_cloud_status=%s) — waiting for next probe",
+                     camera.formatted_did or camera.uid, getattr(camera, "wan_cloud_status", "IDLE"))
+            return
 
-        # Also send LAN_SEARCH directly to refresh
-        self.transport.sendto(build_lan_search(), (camera.ip, PPPP_PORT))
-        self._session_start = asyncio.get_event_loop().time()
-
-        # Wait for fresh PUNCH_TO to confirm session
-        self._connected.clear()
-        try:
-            await asyncio.wait_for(self._connected.wait(), timeout=3.0)
-            log.info("Session established with %s:%d",
-                     camera.ip, camera.discovery_port)
-        except asyncio.TimeoutError:
-            log.warning("No PUNCH_TO after re-handshake, proceeding anyway...")
+        if not self.connected:
+            self.connected = True
             self._connected.set()
 
-        # Send PUNCH_PKT to all known camera ports to keep them alive
-        for port in set([camera.discovery_port, camera.port]):
-            for _ in range(3):
-                self.transport.sendto(build_punch_pkt(), (camera.ip, port))
-                await asyncio.sleep(0.02)
-
         # Start keepalive
+        if self._alive_task and not self._alive_task.done():
+            self._alive_task.cancel()
         self._alive_task = asyncio.create_task(self._keepalive_loop())
 
         # Encryption auto-detection: if enc_mode not set, try each mode
@@ -1303,6 +1628,8 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         try:
             while self._running:
                 await asyncio.sleep(self.alarm_poll_interval)
+                if self.auth_failed:
+                    continue
                 if self.enc_mode and self.transport and not self.transport.is_closing():
                     cgi = (f"GET /get_status.cgi?"
                            f"loginuse={self.username}&loginpas={self.password}"
@@ -1311,16 +1638,26 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         except asyncio.CancelledError:
             pass
 
-    async def _auto_detect_psk(self, camera: CameraInfo):
+    async def detect_encryption(self, camera: Optional[CameraInfo] = None) -> bool:
+        """Alias for _auto_detect_psk that returns True if encryption mode was detected."""
+        await self._auto_detect_psk(camera or self._active_camera)
+        return self.enc_mode is not None
+
+    async def _auto_detect_psk(self, camera: Optional[CameraInfo] = None):
         """
         Try each known encryption mode by sending a login DRW and checking for response.
 
         Order of attempts:
-        1. XOR-only (no P2P_Proprietary) — most likely for VC0/VSTC/VSTB
-        2. P2P_Proprietary with vstarcam2019
-        3. P2P_Proprietary with vstarcam2018
-        4. P2P_Proprietary with empty PSK
+        1. P2P_Proprietary with vstarcam2019
+        2. P2P_Proprietary with vstarcam2018
+        3. P2P_Proprietary with empty PSK
+        4. XOR-only (no P2P_Proprietary)
         """
+        if camera is None:
+            camera = self._active_camera
+        if camera is None:
+            return
+
         cgi = (f"GET /get_status.cgi?"
                f"loginuse={self.username}&loginpas={self.password}"
                f"&user={self.username}&pwd={self.password}&")
@@ -1337,31 +1674,25 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             attempts.append((ENC_P2P, psk_str, key4))
         attempts.append((ENC_XOR_ONLY, "(none)", None))  # XOR-only last
 
-        for enc_mode, psk_label, trial_key in attempts:
-            # Use the discovery port (original LAN_NOTIFY port) for DRW
-            addr = (camera.ip, camera.discovery_port)
+        for i, (enc_mode, psk_label, trial_key) in enumerate(attempts):
+            # Do NOT reset self.connected or re-run start_handshake() on the first PSK trial (i == 0)
+            # if we are already connected from the initial start_handshake()!
+            if i > 0 or not self.connected:
+                await self.start_handshake(camera, timeout=3.0)
+
+            addr = (camera.ip, camera.discovery_port or camera.port)
             log.info("Trying enc=%s PSK=%r (key=%s) on %s:%d...",
                      enc_mode, psk_label,
                      trial_key.hex() if trial_key else "n/a",
                      addr[0], addr[1])
 
-            # Re-establish session: echo LAN_NOTIFY to get fresh session
-            if camera.ip in self._lan_notify_raw:
-                raw, orig_addr = self._lan_notify_raw[camera.ip]
-                self.transport.sendto(raw, orig_addr)
-            self.transport.sendto(build_lan_search(), (camera.ip, PPPP_PORT))
-
-            # Wait for camera to respond with PUNCH_TO
-            self._connected.clear()
-            end_t = asyncio.get_event_loop().time() + 1.5
-            while asyncio.get_event_loop().time() < end_t:
-                await asyncio.sleep(0.05)
-                if self._connected.is_set():
-                    break
-
-            # Send PUNCH_PKT to keep session alive
-            addr = (camera.ip, camera.discovery_port)  # Use fresh discovery port
+            # Send PUNCH_PKT / WAN P2P_RDY to keep session alive
             for _ in range(3):
+                if camera.bin_did and camera.connection_mode in ("WAN_P2P", "WAN_RELAY"):
+                    self.transport.sendto(
+                        wan_p2p.build_wan_p2p_rdy(camera.bin_did, trial_key or self._get_wan_p2p_key()),
+                        addr,
+                    )
                 self.transport.sendto(build_punch_pkt(), addr)
                 await asyncio.sleep(0.02)
 
@@ -1451,8 +1782,18 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             elif channel == CH_VIDEO:
                 self._handle_video_data(index, payload)
 
+    async def close(self):
+        """Alias for stop()."""
+        await self.stop()
+
     async def stop(self):
         self._running = False
+        if self._wan_punch_task:
+            self._wan_punch_task.cancel()
+            try:
+                await self._wan_punch_task
+            except asyncio.CancelledError:
+                pass
         if self._alive_task:
             self._alive_task.cancel()
             try:
@@ -1520,22 +1861,11 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         if old_transport and old_transport != self.transport:
             old_transport.close()
 
-        # Fresh discovery on this camera only
-        self.transport.sendto(build_lan_search(), (cam.ip, PPPP_PORT))
-
-        # Wait for LAN_NOTIFY + PUNCH
-        self._connected.clear()
-        try:
-            await asyncio.wait_for(self._connected.wait(), timeout=3.0)
-        except asyncio.TimeoutError:
+        # Hybrid LAN + WAN P2P handshake on the new socket
+        ok = await self.start_handshake(cam)
+        if not ok:
             log.warning("Reconnect: no response on new socket, retrying...")
             return
-
-        # Send PUNCH_PKT to complete handshake
-        for port in set([cam.discovery_port, cam.port]):
-            for _ in range(3):
-                self.transport.sendto(build_punch_pkt(), (cam.ip, port))
-                await asyncio.sleep(0.02)
 
         # Login and request video + audio
         log.info("Fresh session established! Sending login + video + audio request...")
@@ -1552,7 +1882,8 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                 continue
 
             cam = self._active_camera
-            now = asyncio.get_event_loop().time()
+            if not cam.ip or cam.ip in ("0.0.0.0", "Chờ Wi-Fi LAN"):
+                continue
 
             # Send keepalive to ALL known ports for this camera
             ports = set()
@@ -1609,7 +1940,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             # No video yet — re-request. The "video stale" branch above only
             # fires once last_video > 0, so without this an audio-only DRW
             # stream silently keeps the session "healthy" forever.
-            if last_video == 0 and hasattr(self, '_session_start'):
+            if last_video == 0 and hasattr(self, '_session_start') and not self.auth_failed:
                 if now - self._session_start > 5:
                     log.info("Video keepalive: no video yet, re-requesting...")
                     self._session_start = now  # Reset to avoid spam
@@ -1671,6 +2002,18 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             f"&user={self.username}&pwd={self.password}&"
         )
         await self._send_cmd(cgi)
+
+    async def send_set_password(self, new_password: str):
+        """Update camera password via set_user.cgi over PPPP and update self.password."""
+        cgi = (
+            f"GET /set_user.cgi?user1=admin&pwd1={self.password}"
+            f"&user2=admin&pwd2={self.password}"
+            f"&user3={self.username}&pwd3={new_password}"
+            f"&loginuse={self.username}&loginpas={self.password}"
+            f"&user={self.username}&pwd={self.password}&"
+        )
+        await self._send_cmd(cgi)
+        self.password = new_password
 
     async def _send_start_video(self):
         # Camera restarts video DRW indices from 0 on each fresh request, so
@@ -2220,8 +2563,57 @@ class CameraSession:
         self.state = STATE_STOPPED
         self._running = False
         self._reconnect_task: Optional[asyncio.Task] = None
+        self._connect_task: Optional[asyncio.Task] = None
+        self._connecting: bool = False
+        self._backoff: float = 1.0
         self._last_drw_time: float = 0
         self._last_audio_drw_time: float = 0
+
+    @property
+    def wan_cloud_status(self) -> str:
+        return getattr(self.camera, "wan_cloud_status", "IDLE")
+
+    def activate_onboarding(self, duration_sec: float = 180.0):
+        """Activate aggressive fast-polling WAN P2P onboarding mode for `duration_sec`."""
+        self.camera.onboarding_until = time.monotonic() + float(duration_sec)
+        self._backoff = 1.0
+        if self.state == STATE_CONNECTED and (
+            not self.protocol
+            or not self.protocol.enc_mode
+            or self.camera.ip in ("0.0.0.0", "Chờ Wi-Fi LAN", "")
+        ):
+            self.state = STATE_CONNECTING
+
+        # If protocol is active and not yet streaming, trigger an immediate WAN P2P probe
+        if self.protocol and (self.state != STATE_CONNECTED or not self.protocol.enc_mode):
+            if (
+                self.protocol.transport
+                and not self.protocol.transport.is_closing()
+                and self.camera.bin_did
+                and self.camera.wan_servers
+            ):
+                try:
+                    sockname = self.protocol.transport.get_extra_info("sockname")
+                    local_port = sockname[1] if sockname else 0
+                    local_ip = wan_p2p.get_local_ip_for_wan()
+                    key = self.protocol._get_wan_p2p_key()
+                    hello_pkt = wan_p2p.build_wan_hello(key)
+                    req_pkt = wan_p2p.build_wan_p2p_req(self.camera.bin_did, local_ip, local_port, key)
+                    for srv in self.camera.wan_servers:
+                        self.protocol.transport.sendto(hello_pkt, srv)
+                        self.protocol.transport.sendto(req_pkt, srv)
+                except Exception as e:
+                    log.debug("[%s] Onboarding immediate WAN probe error: %s", self.camera.label, e)
+
+        try:
+            loop = asyncio.get_running_loop()
+            if self._running and self.state != STATE_CONNECTED and not self._connecting:
+                self._connect_task = loop.create_task(self._connect())
+            fut = loop.create_future()
+            fut.set_result(True)
+            return fut
+        except RuntimeError:
+            return True
 
     async def start(self):
         """Create protocol, RTSP server, connect to camera."""
@@ -2234,112 +2626,152 @@ class CameraSession:
                                snapshot_host=self.bind_addr)
         await self.rtsp.start()
 
-        # Create protocol and connect
-        await self._create_and_connect()
-
         # Start reconnect monitor
         self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
-    async def _create_and_connect(self):
-        """Create a fresh protocol+transport and connect to camera."""
-        # Video callback that also tracks last DRW time
-        def video_cb(frame_type, timestamp, data):
-            self._last_drw_time = asyncio.get_event_loop().time()
-            if self.rtsp:
-                self.rtsp.push_video_frame(frame_type, timestamp, data)
-                if self.recorder:
-                    self.recorder.sync_codec_params(
-                        self.rtsp._codec, self.rtsp._vps, self.rtsp._sps, self.rtsp._pps
-                    )
-            if self.recorder:
-                self.recorder.on_video_frame(frame_type, timestamp, data)
-
-        def audio_cb(data, codec):
-            self._last_drw_time = asyncio.get_event_loop().time()
-            if self.rtsp:
-                self.rtsp.push_audio_frame(data, codec)
-
-        self.protocol = PPPPUnifiedProtocol(
-            username=self.username, password=self.password,
-            video_callback=video_cb, audio_callback=audio_cb,
-            p2p_key=self.p2p_key,
-            psk_list=self.psk_list, enc_mode=self.enc_mode,
-            alarm_server_addr=self.alarm_server_addr,
-        )
-
-        # Wire motion detection if webhook or recorder is configured
-        if self.motion_webhook or self.recorder:
-            if self.motion_webhook and not self.motion_handler:
-                self.motion_handler = MotionHandler(
-                    uid=self.camera.label, webhook=self.motion_webhook,
-                    cooldown=self.motion_cooldown)
-            def _combined_alarm_cb(status: int):
-                if self.motion_handler:
-                    self.motion_handler.on_alarm_status(status)
-                if self.recorder:
-                    self.recorder.on_hardware_alarm(status)
-            self.protocol.alarm_callback = _combined_alarm_cb
-            self.protocol.alarm_poll_interval = self.motion_poll_interval
-
-        loop = asyncio.get_event_loop()
-        self.transport, _ = await loop.create_datagram_endpoint(
-            lambda: self.protocol,
-            local_addr=("0.0.0.0", 0),
-            allow_broadcast=True,
-        )
-        sock = self.transport.get_extra_info("socket")
-        if sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-        # Run targeted discovery to this camera
-        search_pkt = build_lan_search()
-        self.transport.sendto(search_pkt, (self.camera.ip, PPPP_PORT))
-        # Also broadcast for good measure
-        for bcast in get_broadcast_addresses():
+        # Create protocol and connect (avoid blocking HTTP handlers for offline WAN cameras)
+        if self.camera.ip in ("0.0.0.0", "Chờ Wi-Fi LAN", ""):
+            self._connect_task = asyncio.create_task(self._connect())
             try:
-                self.transport.sendto(search_pkt, (bcast, PPPP_PORT))
-            except OSError:
+                await asyncio.wait_for(asyncio.shield(self._connect_task), timeout=0.8)
+            except (asyncio.TimeoutError, Exception):
                 pass
+        else:
+            await self._connect()
 
-        # Wait for camera to appear
-        end_t = asyncio.get_event_loop().time() + 3.0
-        while asyncio.get_event_loop().time() < end_t:
-            if self.protocol.cameras:
-                break
-            self.transport.sendto(search_pkt, (self.camera.ip, PPPP_PORT))
-            await asyncio.sleep(0.5)
+    async def _connect(self):
+        """Create a fresh protocol+transport and connect to camera."""
+        if self._connecting:
+            return
+        self._connecting = True
+        try:
+            if self.protocol:
+                await self._teardown_protocol()
 
-        # Update camera info if IP changed
-        for ip, cam in self.protocol.cameras.items():
-            if cam.uid == self.camera.uid:
-                self.camera.ip = ip
-                self.camera.port = cam.port
-                self.camera.discovery_port = cam.discovery_port
-                break
+            # Video callback that also tracks last DRW time
+            def video_cb(frame_type, timestamp, data):
+                self._last_drw_time = asyncio.get_event_loop().time()
+                if self.rtsp:
+                    self.rtsp.push_video_frame(frame_type, timestamp, data)
+                    if self.recorder:
+                        self.recorder.sync_codec_params(
+                            self.rtsp._codec, self.rtsp._vps, self.rtsp._sps, self.rtsp._pps
+                        )
+                if self.recorder:
+                    self.recorder.on_video_frame(frame_type, timestamp, data)
 
-        # Connect
-        await self.protocol.connect_to_camera(self.camera)
+            def audio_cb(data, codec):
+                self._last_drw_time = asyncio.get_event_loop().time()
+                if self.rtsp:
+                    self.rtsp.push_audio_frame(data, codec)
 
-        # Wire up RTSP play callback with debounce to avoid flooding
-        # the camera with audio requests when go2rtc opens multiple connections
-        self._last_audio_request = 0.0
-        async def on_rtsp_play():
-            if self.protocol and self.protocol.enc_mode:
-                now = asyncio.get_event_loop().time()
-                if now - self._last_audio_request > 2.0:
-                    self._last_audio_request = now
-                    await self.protocol._send_start_audio()
-        if self.rtsp:
-            self.rtsp.play_callback = on_rtsp_play
+            self.protocol = PPPPUnifiedProtocol(
+                username=self.username, password=self.password,
+                video_callback=video_cb, audio_callback=audio_cb,
+                p2p_key=self.p2p_key,
+                psk_list=self.psk_list, enc_mode=self.enc_mode,
+                alarm_server_addr=self.alarm_server_addr,
+                camera=self.camera,
+            )
 
-        self.state = STATE_CONNECTED
-        self._last_drw_time = asyncio.get_event_loop().time()
-        log.info("[%s] Connected — RTSP at rtsp://%s:%d/", self.camera.label, self.bind_addr, self.rtsp_port)
+            # Wire motion detection if webhook or recorder is configured
+            if self.motion_webhook or self.recorder:
+                if self.motion_webhook and not self.motion_handler:
+                    self.motion_handler = MotionHandler(
+                        uid=self.camera.label, webhook=self.motion_webhook,
+                        cooldown=self.motion_cooldown)
+                def _combined_alarm_cb(status: int):
+                    if self.motion_handler:
+                        self.motion_handler.on_alarm_status(status)
+                    if self.recorder:
+                        self.recorder.on_hardware_alarm(status)
+                self.protocol.alarm_callback = _combined_alarm_cb
+                self.protocol.alarm_poll_interval = self.motion_poll_interval
+
+            loop = asyncio.get_event_loop()
+            self.transport, _ = await loop.create_datagram_endpoint(
+                lambda: self.protocol,
+                local_addr=("0.0.0.0", 0),
+                allow_broadcast=True,
+            )
+            sock = self.transport.get_extra_info("socket")
+            if sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+            # Run targeted LAN discovery only if camera has a known LAN IP and is in LAN mode
+            if self.camera.ip and self.camera.ip not in ("0.0.0.0", "Chờ Wi-Fi LAN") and self.camera.connection_mode == "LAN":
+                search_pkt = build_lan_search()
+                try:
+                    self.transport.sendto(search_pkt, (self.camera.ip, PPPP_PORT))
+                except OSError:
+                    pass
+                # Also broadcast for good measure
+                for bcast in get_broadcast_addresses():
+                    try:
+                        self.transport.sendto(search_pkt, (bcast, PPPP_PORT))
+                    except OSError:
+                        pass
+
+                # Wait briefly for camera to appear on LAN
+                end_t = asyncio.get_event_loop().time() + 1.5
+                while asyncio.get_event_loop().time() < end_t:
+                    if any(c.uid == self.camera.uid for c in self.protocol.cameras.values()):
+                        break
+                    try:
+                        self.transport.sendto(search_pkt, (self.camera.ip, PPPP_PORT))
+                    except OSError:
+                        pass
+                    await asyncio.sleep(0.5)
+
+                # Update camera info if IP changed
+                for ip, cam in self.protocol.cameras.items():
+                    if cam.uid == self.camera.uid:
+                        self.camera.ip = ip
+                        self.camera.port = cam.port
+                        self.camera.discovery_port = cam.discovery_port
+                        break
+
+            # Connect (performs hybrid LAN + WAN P2P handshake)
+            await self.protocol.connect_to_camera(self.camera)
+
+            # Wire up RTSP play callback with debounce to avoid flooding
+            # the camera with audio requests when go2rtc opens multiple connections
+            self._last_audio_request = 0.0
+            async def on_rtsp_play():
+                if self.protocol and self.protocol.enc_mode:
+                    now = asyncio.get_event_loop().time()
+                    if now - self._last_audio_request > 2.0:
+                        self._last_audio_request = now
+                        await self.protocol._send_start_audio()
+            if self.rtsp:
+                self.rtsp.play_callback = on_rtsp_play
+
+            if self.protocol and self.protocol.enc_mode and self.camera.ip not in ("0.0.0.0", "Chờ Wi-Fi LAN", ""):
+                self.state = STATE_CONNECTED
+                self.camera.wan_cloud_status = "CONNECTED"
+                self._backoff = 1.0
+                self._last_drw_time = asyncio.get_event_loop().time()
+                log.info("[%s] Connected — RTSP at rtsp://%s:%d/", self.camera.label, self.bind_addr, self.rtsp_port)
+            else:
+                is_onboarding = time.monotonic() < getattr(self.camera, "onboarding_until", 0.0)
+                self.state = STATE_CONNECTING if is_onboarding else STATE_RECONNECTING
+                log.info("[%s] Camera not yet streaming (state=%s, wan_cloud_status=%s) — will retry",
+                         self.camera.label, self.state, getattr(self.camera, "wan_cloud_status", "IDLE"))
+        finally:
+            self._connecting = False
+
+    _create_and_connect = _connect
 
     async def stop(self):
         """Clean shutdown."""
         self._running = False
         self.state = STATE_STOPPED
+        if self._connect_task and not self._connect_task.done():
+            self._connect_task.cancel()
+            try:
+                await self._connect_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._reconnect_task:
             self._reconnect_task.cancel()
             try:
@@ -2365,6 +2797,20 @@ class CameraSession:
         """Monitor connection health, auto-reconnect when camera comes back."""
         stale_logged = False
         while self._running:
+            is_onboarding = time.monotonic() < getattr(self.camera, "onboarding_until", 0.0)
+            if is_onboarding and self.state != STATE_CONNECTED:
+                await asyncio.sleep(2.0)
+                if not self._running:
+                    break
+                if self.state != STATE_CONNECTED and not self._connecting:
+                    log.info("[%s] Onboarding fast-poll retry (wan_cloud_status=%s)...",
+                             self.camera.label, getattr(self.camera, "wan_cloud_status", "IDLE"))
+                    try:
+                        await self._connect()
+                    except Exception as e:
+                        log.warning("[%s] Onboarding connect retry error: %s", self.camera.label, e)
+                continue
+
             await asyncio.sleep(5)
             if not self._running:
                 break
@@ -2383,7 +2829,10 @@ class CameraSession:
             gap = now - self._last_drw_time if self._last_drw_time > 0 else 0
 
             if self.state == STATE_CONNECTED:
-                if gap > 30:
+                if self.protocol and getattr(self.protocol, "auth_failed", False):
+                    # Keep WAN P2P / LAN UDP session alive and in CONNECTED state while waiting for password update
+                    self._last_drw_time = now
+                elif gap > 30:
                     log.warning("[%s] No data for %.0fs — camera OFFLINE", self.camera.label, gap)
                     self.state = STATE_OFFLINE
                     stale_logged = False
@@ -2416,6 +2865,8 @@ class CameraSession:
                 if self.rtsp:
                     self.rtsp._cached_iframe = None
                 self.state = STATE_RECONNECTING
+                if time.monotonic() < getattr(self.camera, "onboarding_until", 0.0):
+                    continue
                 # Wait before first reconnect to let camera sessions expire
                 # and stagger reconnects across cameras
                 import random
@@ -2423,13 +2874,19 @@ class CameraSession:
                 log.info("[%s] Waiting %.0fs before reconnect attempt...", self.camera.label, jitter)
                 await asyncio.sleep(jitter)
 
-            elif self.state == STATE_RECONNECTING:
+            elif self.state in (STATE_RECONNECTING, STATE_CONNECTING):
+                if self._connecting:
+                    continue
                 log.info("[%s] Attempting reconnect to %s...", self.camera.label, self.camera.ip)
                 try:
                     await self._attempt_reconnect()
                 except Exception as e:
-                    log.warning("[%s] Reconnect failed: %s — retrying in 15s", self.camera.label, e)
-                    await asyncio.sleep(10)  # Extra backoff (total ~15s with loop sleep)
+                    log.warning("[%s] Reconnect failed: %s — retrying in %.0fs",
+                                self.camera.label, e, self._backoff)
+                if self.state != STATE_CONNECTED and time.monotonic() >= getattr(self.camera, "onboarding_until", 0.0):
+                    wait_sec = min(self._backoff, 30.0)
+                    self._backoff = min(self._backoff * 1.5, 30.0)
+                    await asyncio.sleep(wait_sec)
 
     async def _attempt_reconnect(self):
         """Try to reconnect to the camera using its last known address.
@@ -2437,7 +2894,7 @@ class CameraSession:
         log.info("[%s] Reconnecting directly to %s (no probe)...",
                  self.camera.label, self.camera.ip)
         try:
-            await self._create_and_connect()
+            await self._connect()
         except Exception as e:
             log.warning("[%s] Direct reconnect failed: %s", self.camera.label, e)
 

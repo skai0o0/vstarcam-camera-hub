@@ -338,20 +338,32 @@ def generate_vstarcam_sonic_wav(ssid: str, password: str, bssid: str = "", mode:
     """
     Synthesize 44.1 kHz 16-bit mono PCM WAV audio for VStarcam Sonic Wi-Fi Provisioning.
     Solves the Wi-Fi 7 MLD / 5GHz phone BSSID bug by explicitly encoding the 2.4GHz BSSID suffix
-    (`encodeMacWiFi`) as well as the full SSID string (`encodeSSIDWiFi`).
+    (`encodeMacWiFi`) when known, or universally encoding the full SSID string (`encodeSSIDWiFi`)
+    when provisioning a camera at a remote site over the Internet.
     """
     pwd_clean = password.strip()
     clean_bssid = re.sub(r"[^0-9a-fA-F]", "", bssid or "").lower()
 
-    # If BSSID wasn't passed or user selected an SSID from the scan list, resolve its 2.4GHz BSSID
-    if len(clean_bssid) < 4:
+    # Only use the Server's local Wi-Fi scan if `ssid` actually matches one of the Server's visible networks.
+    # When the Server is hosted remotely on the Internet, a remote phone's Wi-Fi SSID will not match the Server's
+    # local Wi-Fi card, so we leave `clean_bssid = ""` and encode full SSID + Password (`ssid_codes`), which works universally!
+    if mode != "ssid":
         info = scan_host_wifi_info()
+        matched_host_bssid = ""
         for net in info.get("networks", []):
             if net.get("ssid") == ssid:
-                clean_bssid = net.get("bssid_24") or net.get("bssid_any") or ""
+                matched_host_bssid = net.get("bssid_24") or net.get("bssid_any") or ""
                 break
-        if not clean_bssid and info.get("current_ssid") == ssid:
-            clean_bssid = info.get("current_bssid") or ""
+        if not matched_host_bssid and info.get("current_ssid") == ssid:
+            matched_host_bssid = info.get("current_bssid") or ""
+
+        if len(clean_bssid) < 4:
+            clean_bssid = matched_host_bssid
+        elif info.get("current_bssid") and clean_bssid == info.get("current_bssid").lower() and info.get("current_ssid") != ssid and not matched_host_bssid:
+            # Guard against stale server BSSID accidentally submitted with a remote site's SSID
+            clean_bssid = ""
+    elif len(clean_bssid) < 4:
+        clean_bssid = ""
 
     bssid_suffix_hex = clean_bssid[-4:] if len(clean_bssid) >= 4 else ""
     mac_hex_payload = ""
@@ -822,12 +834,31 @@ class CameraHubApp:
         idx = len(self.sessions) + 1
         return f"Phong_{100 + idx}"
 
+    def _make_wan_camera_info(self, uid_hex: str, cam_cfg: Optional[dict] = None) -> proxy.CameraInfo:
+        if not isinstance(cam_cfg, dict):
+            cam_cfg = {}
+        ip = str(cam_cfg.get("ip") or "0.0.0.0").strip() or "0.0.0.0"
+        wan_port = int(cam_cfg.get("wan_port", 32108))
+        if hasattr(proxy.CameraInfo, "from_did"):
+            cam = proxy.CameraInfo.from_did(uid_hex, ip=ip, port=wan_port)
+        else:
+            cam = proxy.CameraInfo(ip, wan_port, bytes.fromhex(uid_hex))
+            c_did, f_did = proxy.pppp_uid_hex_to_did(uid_hex)
+            cam.hw_deviceid = cam_cfg.get("hw_deviceid") or c_did
+            cam.formatted_did = cam_cfg.get("did") or cam_cfg.get("formatted_did") or f_did
+            cam.connection_mode = "LAN" if (ip and ip != "0.0.0.0") else "WAN_P2P"
+        if not getattr(cam, "formatted_did", None):
+            _, f_did = proxy.pppp_uid_hex_to_did(uid_hex)
+            cam.formatted_did = cam_cfg.get("did") or cam_cfg.get("formatted_did") or f_did
+        if not getattr(cam, "hw_deviceid", None):
+            c_did, _ = proxy.pppp_uid_hex_to_did(uid_hex)
+            cam.hw_deviceid = cam_cfg.get("hw_deviceid") or c_did
+        return cam
+
     async def start_camera_session(self, cam: proxy.CameraInfo):
         if cam.uid in self.sessions:
             return
 
-        username = self.config["username"]
-        password = self.config["password"]
         base_port = self.config["base_port"]
         psk_str = self.config.get("psk", "vstarcam2019")
         enc_mode_cfg = self.config.get("enc_mode", "auto")
@@ -856,6 +887,19 @@ class CameraHubApp:
             port_val = proxy.assign_port(self.config, cam.uid, base_port)
             if not cam_cfg.get("name"):
                 cam_cfg["name"] = self._get_room_name(cam)
+
+        c_did, f_did = proxy.pppp_uid_hex_to_did(cam.uid)
+        if not getattr(cam, "formatted_did", None):
+            cam.formatted_did = cam_cfg.get("did") or cam_cfg.get("formatted_did") or f_did
+        if not getattr(cam, "hw_deviceid", None):
+            cam.hw_deviceid = cam_cfg.get("hw_deviceid") or c_did
+        if cam.formatted_did and not cam_cfg.get("did"):
+            cam_cfg["did"] = cam.formatted_did
+        if cam.formatted_did and not cam_cfg.get("formatted_did"):
+            cam_cfg["formatted_did"] = cam.formatted_did
+
+        username = cam_cfg.get("username") or self.config["username"]
+        password = cam_cfg.get("password") or self.config["password"]
 
         room_name = cam_cfg["name"]
         cam.label = f"{cam.uid[:8]} ({room_name})"
@@ -937,6 +981,36 @@ class CameraHubApp:
         for sess in list(self.sessions.values()):
             await sess.stop()
 
+    async def _start_configured_wan_cameras(self):
+        for uid_hex, cam_cfg in list((self.config.get("cameras") or {}).items()):
+            if not isinstance(cam_cfg, dict):
+                cam_cfg = {"port": int(cam_cfg) if isinstance(cam_cfg, int) else 9555}
+            if uid_hex not in self.sessions:
+                try:
+                    if hasattr(proxy.CameraInfo, "from_did"):
+                        cam = proxy.CameraInfo.from_did(
+                            uid_hex,
+                            ip=cam_cfg.get("ip", "0.0.0.0"),
+                            port=int(cam_cfg.get("wan_port", 32108)),
+                        )
+                    else:
+                        cam = proxy.CameraInfo(
+                            cam_cfg.get("ip", "0.0.0.0"),
+                            int(cam_cfg.get("wan_port", 32108)),
+                            bytes.fromhex(uid_hex),
+                        )
+                    if not getattr(cam, "formatted_did", None):
+                        _, f_did = proxy.pppp_uid_hex_to_did(uid_hex)
+                        cam.formatted_did = cam_cfg.get("did") or cam_cfg.get("formatted_did") or f_did
+                    log.info(
+                        "Starting WAN P2P session for configured camera %s (%s)",
+                        uid_hex[:12],
+                        getattr(cam, "formatted_did", None) or cam_cfg.get("name"),
+                    )
+                    await self.start_camera_session(cam)
+                except Exception as e:
+                    log.error("Error starting WAN P2P session for %s: %s", uid_hex[:12], e)
+
     async def _discovery_loop(self):
         discovery_time = float(self.config.get("discovery_time", 3))
         log.info("=== Initial Camera Discovery ===")
@@ -948,7 +1022,11 @@ class CameraHubApp:
         except Exception as e:
             log.error("Initial discovery error: %s", e)
 
+        # Auto-start any configured cameras not found on LAN over WAN P2P (Internet)
+        await self._start_configured_wan_cameras()
+
         while self._running:
+            await self._start_configured_wan_cameras()
             configured_uids = set((self.config.get("cameras") or {}).keys())
             has_waiting = any(u not in self.sessions for u in configured_uids)
             await asyncio.sleep(10 if has_waiting else 35)
@@ -959,12 +1037,21 @@ class CameraHubApp:
             if not has_waiting and active >= len(self.sessions) and len(self.sessions) > 0:
                 continue
             try:
-                connected_ips = {s.camera.ip for s in self.sessions.values()}
+                connected_ips = {
+                    s.camera.ip for s in self.sessions.values()
+                    if s.camera.ip and s.camera.ip != "0.0.0.0"
+                }
                 cams = await proxy.discover_cameras_broadcast(timeout=2.5, target_ip=self.target_ip, skip_ips=connected_ips)
                 for cam in cams:
                     if cam.uid not in self.sessions:
                         log.info("Discovered new camera on LAN: %s", cam)
                         await self.start_camera_session(cam)
+                    else:
+                        sess = self.sessions[cam.uid]
+                        if sess.camera.ip in ("0.0.0.0", "") and cam.ip not in ("0.0.0.0", ""):
+                            sess.camera.ip = cam.ip
+                            sess.camera.port = cam.port
+                            sess.camera.connection_mode = "LAN"
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -993,23 +1080,39 @@ class CameraHubApp:
         for uid, sess in self.sessions.items():
             rec = self.recorders.get(uid)
             cam = sess.camera
+            cam_cfg = (self.config.get("cameras") or {}).get(uid)
+            if not isinstance(cam_cfg, dict):
+                cam_cfg = {}
             last_drw_age = round(now_loop - sess._last_drw_time, 1) if sess._last_drw_time > 0 else 999.0
             rem_post = 0.0
             if rec and rec.is_recording:
                 rem_post = max(0.0, round(rec.record_until_mono - time.monotonic(), 1))
 
             c_did, f_did = proxy.pppp_uid_hex_to_did(uid)
+            did_str = getattr(cam, "formatted_did", None) or cam_cfg.get("did") or cam_cfg.get("formatted_did") or f_did or ""
+            conn_mode = getattr(cam, "connection_mode", None) or ("WAN_P2P" if cam.ip in ("0.0.0.0", "") else "LAN")
+            auth_failed = bool(sess.protocol and getattr(sess.protocol, "auth_failed", False))
+            auth_error = getattr(sess.protocol, "auth_error", None) if sess.protocol else None
+            wan_cloud_status = getattr(cam, "wan_cloud_status", "IDLE")
+            onboarding_active = bool(getattr(cam, "onboarding_until", 0.0) > time.monotonic() and sess.state != "CONNECTED")
             cameras_list.append({
                 "uid": uid,
                 "short_uid": uid[:10],
                 "room_name": rec.room_name if rec else uid[:10],
                 "hw_alias": getattr(cam, "hw_alias", ""),
                 "hw_deviceid": getattr(cam, "hw_deviceid", "") or c_did,
-                "formatted_did": getattr(cam, "formatted_did", "") or f_did,
+                "did": did_str,
+                "formatted_did": did_str,
+                "connection_mode": conn_mode,
+                "wan_cloud_status": wan_cloud_status,
+                "onboarding_active": onboarding_active,
                 "ip": cam.ip,
+                "port": getattr(cam, "port", 32108),
                 "rtsp_port": sess.rtsp_port,
                 "rtsp_url": f"rtsp://{request.host.split(':')[0]}:{sess.rtsp_port}/",
                 "state": sess.state,
+                "auth_failed": auth_failed,
+                "auth_error": auth_error,
                 "last_packet_sec": last_drw_age,
                 "codec": sess.rtsp._codec if sess.rtsp else "h265",
                 "kbps": rec.current_kbps if rec else 0.0,
@@ -1024,7 +1127,7 @@ class CameraHubApp:
                 "live_decoder_active": (rec._live_proc is not None) if rec else False,
             })
 
-        # Also include pre-registered cameras added via QR / UID that are waiting for LAN connection
+        # Also include any pre-registered cameras not yet in self.sessions
         cfg_cams = self.config.get("cameras", {})
         if isinstance(cfg_cams, dict):
             for uid, c_cfg in cfg_cams.items():
@@ -1033,20 +1136,28 @@ class CameraHubApp:
                 if not isinstance(c_cfg, dict):
                     c_cfg = {"port": int(c_cfg) if isinstance(c_cfg, int) else 9555}
                 c_did, f_did = proxy.pppp_uid_hex_to_did(uid)
+                did_str = c_cfg.get("did") or c_cfg.get("formatted_did") or f_did or ""
                 r_port = c_cfg.get("port", 9555)
-                r_name = c_cfg.get("name") or f_did or uid[:10]
+                r_name = c_cfg.get("name") or did_str or uid[:10]
                 cameras_list.append({
                     "uid": uid,
                     "short_uid": uid[:10],
                     "room_name": r_name,
                     "hw_alias": "",
                     "hw_deviceid": c_cfg.get("hw_deviceid") or c_did,
-                    "formatted_did": c_cfg.get("formatted_did") or f_did,
+                    "did": did_str,
+                    "formatted_did": did_str,
+                    "connection_mode": c_cfg.get("connection_mode", "WAN_P2P"),
+                    "wan_cloud_status": "IDLE",
+                    "onboarding_active": False,
                     "model": c_cfg.get("model", "CS22S"),
-                    "ip": c_cfg.get("ip") or "Chờ Wi-Fi LAN",
+                    "ip": c_cfg.get("ip") or "0.0.0.0",
+                    "port": int(c_cfg.get("wan_port", 32108)),
                     "rtsp_port": r_port,
                     "rtsp_url": f"rtsp://{request.host.split(':')[0]}:{r_port}/",
                     "state": "WAITING_LAN",
+                    "auth_failed": False,
+                    "auth_error": None,
                     "last_packet_sec": 999.0,
                     "codec": "h265",
                     "kbps": 0.0,
@@ -1164,15 +1275,15 @@ class CameraHubApp:
             c_cfg = (self.config.get("cameras") or {}).get(uid, {})
             if isinstance(c_cfg, dict):
                 _, f_did = proxy.pppp_uid_hex_to_did(uid)
-                did_label = c_cfg.get("formatted_did") or f_did or uid[:12]
+                did_label = c_cfg.get("did") or c_cfg.get("formatted_did") or f_did or uid[:12]
                 r_name = c_cfg.get("name") or did_label
                 svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
                   <rect width="960" height="540" fill="#0b0f17"/>
-                  <circle cx="480" cy="210" r="46" fill="#161b22" stroke="#f59e0b" stroke-width="3" stroke-dasharray="8 6"/>
-                  <text x="480" y="222" text-anchor="middle" fill="#f59e0b" font-family="Segoe UI, sans-serif" font-size="34">📷</text>
-                  <text x="480" y="295" text-anchor="middle" fill="#e6edf3" font-family="Segoe UI, sans-serif" font-weight="bold" font-size="22">{r_name} — Đã đăng ký từ QR ({did_label})</text>
-                  <text x="480" y="335" text-anchor="middle" fill="#f59e0b" font-family="Segoe UI, sans-serif" font-size="17">⏳ Đang chờ camera kết nối vào mạng Wi-Fi LAN...</text>
-                  <text x="480" y="370" text-anchor="middle" fill="#7d8590" font-family="Segoe UI, sans-serif" font-size="14">Ngay khi camera vào chung Wi-Fi, Hub sẽ tự động bắt tay PPPP (Port :{c_cfg.get('port', 9555)}) và phát Live 25 FPS</text>
+                  <circle cx="480" cy="210" r="46" fill="#161b22" stroke="#2f81f7" stroke-width="3" stroke-dasharray="8 6"/>
+                  <text x="480" y="222" text-anchor="middle" fill="#2f81f7" font-family="Segoe UI, sans-serif" font-size="34">🌐</text>
+                  <text x="480" y="295" text-anchor="middle" fill="#e6edf3" font-family="Segoe UI, sans-serif" font-weight="bold" font-size="22">{r_name} — {did_label}</text>
+                  <text x="480" y="335" text-anchor="middle" fill="#58a6ff" font-family="Segoe UI, sans-serif" font-size="17">⏳ Đang kết nối Camera qua WAN P2P (Internet) &amp; LAN...</text>
+                  <text x="480" y="370" text-anchor="middle" fill="#7d8590" font-family="Segoe UI, sans-serif" font-size="14">Bắt tay UDP P2P / Cloud Relay (Port :{c_cfg.get('port', 9555)}) • Live 25 FPS</text>
                 </svg>"""
                 return web.Response(body=svg.encode("utf-8"), content_type="image/svg+xml", headers={"Cache-Control": "no-store"})
             return web.Response(status=404, text="Camera not found")
@@ -1183,6 +1294,30 @@ class CameraHubApp:
         if not jpeg and sess.rtsp:
             jpeg = await sess.rtsp._get_snapshot_jpeg()
         if not jpeg:
+            _, f_did = proxy.pppp_uid_hex_to_did(uid)
+            did_label = getattr(sess.camera, "formatted_did", None) or f_did or uid[:12]
+            r_name = rec.room_name if rec else did_label
+            mode_label = getattr(sess.camera, "connection_mode", "WAN_P2P")
+            if sess.protocol and getattr(sess.protocol, "auth_failed", False):
+                svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+                  <rect width="960" height="540" fill="#0b0f17"/>
+                  <circle cx="480" cy="200" r="46" fill="#161b22" stroke="#d29922" stroke-width="3"/>
+                  <text x="480" y="213" text-anchor="middle" fill="#d29922" font-family="Segoe UI, sans-serif" font-size="34">🔑</text>
+                  <text x="480" y="285" text-anchor="middle" fill="#e6edf3" font-family="Segoe UI, sans-serif" font-weight="bold" font-size="22">{r_name} ({did_label}) — Đã kết nối {mode_label} ({sess.camera.ip}:{getattr(sess.camera, 'port', 32108)})</text>
+                  <text x="480" y="325" text-anchor="middle" fill="#f0883e" font-family="Segoe UI, sans-serif" font-size="17">⚠️ Camera yêu cầu mật khẩu riêng (khác 888888)</text>
+                  <text x="480" y="362" text-anchor="middle" fill="#7d8590" font-family="Segoe UI, sans-serif" font-size="14">Bấm ➕ Thêm Camera bằng QR / UID và nhập Mật khẩu Camera để mở luồng hình</text>
+                </svg>"""
+                return web.Response(body=svg.encode("utf-8"), content_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+            if sess.state != "CONNECTED":
+                svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+                  <rect width="960" height="540" fill="#0b0f17"/>
+                  <circle cx="480" cy="210" r="46" fill="#161b22" stroke="#2f81f7" stroke-width="3" stroke-dasharray="8 6"/>
+                  <text x="480" y="222" text-anchor="middle" fill="#2f81f7" font-family="Segoe UI, sans-serif" font-size="34">🌐</text>
+                  <text x="480" y="295" text-anchor="middle" fill="#e6edf3" font-family="Segoe UI, sans-serif" font-weight="bold" font-size="22">{r_name} ({did_label})</text>
+                  <text x="480" y="335" text-anchor="middle" fill="#58a6ff" font-family="Segoe UI, sans-serif" font-size="17">⏳ Đang kết nối qua {mode_label} ({sess.camera.ip}:{getattr(sess.camera, 'port', 32108)})...</text>
+                  <text x="480" y="370" text-anchor="middle" fill="#7d8590" font-family="Segoe UI, sans-serif" font-size="14">RTSP Port :{sess.rtsp_port} • Tự động xuyên NAT (UDP Hole-Punching / Cloud Relay)</text>
+                </svg>"""
+                return web.Response(body=svg.encode("utf-8"), content_type="image/svg+xml", headers={"Cache-Control": "no-store"})
             return web.Response(status=503, text="No frame cached yet")
 
         return web.Response(
@@ -1377,12 +1512,21 @@ class CameraHubApp:
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=400)
 
-    async def handle_add_camera(self, request: web.Request) -> web.Response:
-        """Register a camera by QR / sticker UID (and optional static IP) into the Hub and trigger LAN scan."""
+    async def handle_add_camera_qr(self, request: web.Request) -> web.Response:
+        """Register a camera by QR / sticker UID (and optional name/password/IP) and start WAN P2P + LAN session."""
         try:
             data = await request.json()
-            did_input = str(data.get("device_id") or data.get("uid") or "").strip()
-            room_name = str(data.get("room_name") or "").strip()
+            did_input = str(
+                data.get("device_id")
+                or data.get("uid")
+                or data.get("did")
+                or data.get("qr_text")
+                or data.get("text")
+                or ""
+            ).strip()
+            room_name = str(data.get("room_name") or data.get("name") or "").strip()
+            cam_password = str(data.get("password") or "").strip()
+            cam_username = str(data.get("username") or "").strip()
             target_ip = str(data.get("ip") or "").strip()
             model = str(data.get("model") or "CS22S").strip()
 
@@ -1406,46 +1550,231 @@ class CameraHubApp:
                 cam_entry = {"port": port_val}
             cam_entry["port"] = port_val
             cam_entry["name"] = room_name
+            cam_entry["did"] = formatted_did
             cam_entry["hw_deviceid"] = compact_did
             cam_entry["formatted_did"] = formatted_did
             cam_entry["model"] = model or info.get("model", "CS22S")
             if target_ip:
                 cam_entry["ip"] = target_ip
+            if cam_username:
+                cam_entry["username"] = cam_username
+            if cam_password:
+                cam_entry["password"] = cam_password
             cameras_dict[uid_hex] = cam_entry
             self._save_hub_config()
 
-            # If already connected in sessions, update its room name immediately
+            # If already in sessions, update its room name and credentials immediately
             if uid_hex in self.sessions:
                 sess = self.sessions[uid_hex]
                 rec = self.recorders.get(uid_hex)
                 if rec:
                     rec.set_room_name(room_name)
                 sess.camera.label = f"{uid_hex[:8]} ({room_name})"
-                if sess.protocol:
+                if cam_password:
+                    sess.password = cam_password
+                    if sess.protocol:
+                        sess.protocol.password = cam_password
+                        sess.protocol.auth_failed = False
+                        sess.protocol.auth_error = None
+                        asyncio.create_task(sess.protocol._send_login())
+                        asyncio.create_task(sess.protocol._send_start_video())
+                        asyncio.create_task(sess.protocol._send_start_audio())
+                if sess.protocol and sess.state == "CONNECTED":
                     asyncio.create_task(sess.protocol.send_set_alias(room_name))
                 return web.json_response({
                     "ok": True,
                     "uid": uid_hex,
+                    "did": formatted_did,
                     "formatted_did": formatted_did,
                     "room_name": room_name,
+                    "name": room_name,
                     "rtsp_port": port_val,
-                    "connected": True,
-                    "message": f"Camera {formatted_did} đang ONLINE và đã được cập nhật tên thành {room_name}!",
+                    "connection_mode": getattr(sess.camera, "connection_mode", "WAN_P2P"),
+                    "connected": sess.state == "CONNECTED",
+                    "message": f"Camera {formatted_did} ({room_name}) đã được cập nhật và đang kết nối ({ getattr(sess.camera, 'connection_mode', 'WAN_P2P') })!",
                 })
 
-            # Trigger immediate background LAN + subnet scan to connect if camera is on Wi-Fi
+            # Immediately start hybrid WAN P2P + LAN session so camera connects over the Internet or LAN
+            if hasattr(proxy.CameraInfo, "from_did"):
+                cam = proxy.CameraInfo.from_did(
+                    uid_hex,
+                    ip=target_ip or cam_entry.get("ip", "0.0.0.0"),
+                    port=int(cam_entry.get("wan_port", 32108)),
+                )
+            else:
+                cam = proxy.CameraInfo(
+                    target_ip or cam_entry.get("ip", "0.0.0.0"),
+                    int(cam_entry.get("wan_port", 32108)),
+                    bytes.fromhex(uid_hex),
+                )
+                cam.hw_deviceid = compact_did
+                cam.formatted_did = formatted_did
+                cam.connection_mode = "LAN" if target_ip else "WAN_P2P"
+
+            log.info("Starting immediate WAN P2P + LAN session for added camera %s (%s)", formatted_did, room_name)
+            await self.start_camera_session(cam)
+
+            # Also trigger background LAN broadcast scan in case camera is on local subnet
             asyncio.create_task(self._scan_and_connect_now(target_ip or self.target_ip))
+
+            sess = self.sessions.get(uid_hex)
+            return web.json_response({
+                "ok": True,
+                "uid": uid_hex,
+                "did": formatted_did,
+                "formatted_did": formatted_did,
+                "room_name": room_name,
+                "name": room_name,
+                "rtsp_port": port_val,
+                "connection_mode": getattr(cam, "connection_mode", "WAN_P2P"),
+                "connected": bool(sess and sess.state == "CONNECTED"),
+                "message": (
+                    f"Đã thêm camera {formatted_did} ({room_name}, cổng RTSP :{port_val}) vào Hub! "
+                    f"Đang kết nối tự động qua WAN P2P (Internet) & LAN..."
+                ),
+            })
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
+    handle_add_camera = handle_add_camera_qr
+
+    async def handle_onboard_camera(self, request: web.Request) -> web.Response:
+        """
+        Unified 1-Click Onboarding Endpoint (`POST /api/camera/onboard`).
+        1. Parses UID / QR sticker string (`uid_hex`, `formatted_did`).
+        2. Registers the camera in `self.config["cameras"][uid_hex]` (defaulting `cam_password` to `"888888"`).
+        3. Starts or updates `self.sessions[uid_hex]`, sets `sess.camera.onboarding_until = time.monotonic() + 180.0`,
+           and calls `sess.activate_onboarding(180.0)` if available.
+        4. If `wifi_ssid` is provided, generates both the Sonic Wave WAV (`mode="ssid"`) and Optical QR Code (`"eye4"`).
+        """
+        try:
+            data = await request.json()
+            did_input = str(
+                data.get("uid")
+                or data.get("device_id")
+                or data.get("did")
+                or data.get("qr_text")
+                or data.get("text")
+                or ""
+            ).strip()
+            room_name = str(data.get("room_name") or data.get("name") or "").strip()
+            cam_password = str(data.get("cam_password") or data.get("password") or "888888").strip() or "888888"
+            cam_username = str(data.get("cam_username") or data.get("username") or "admin").strip() or "admin"
+            wifi_ssid = str(data.get("wifi_ssid") or data.get("ssid") or "").strip()
+            wifi_password = str(data.get("wifi_password") if "wifi_password" in data else (data.get("wifi_pwd") or ""))
+            wifi_bssid = str(data.get("wifi_bssid") or data.get("bssid") or "").strip()
+            model = str(data.get("model") or "CS22S").strip()
+
+            if not did_input:
+                return web.json_response({"ok": False, "error": "Vui lòng nhập mã UID hoặc tải ảnh tem QR trên camera"}, status=400)
+
+            info = parse_qr_or_did_text(did_input)
+            uid_hex = info["uid_hex"]
+            compact_did = info["device_id"]
+            formatted_did = info["formatted_did"]
+
+            cameras_dict = self.config.setdefault("cameras", {})
+            base_port = int(self.config.get("base_port", 9555))
+            port_val = proxy.assign_port(self.config, uid_hex, base_port)
+
+            if not room_name:
+                existing = cameras_dict.get(uid_hex)
+                if isinstance(existing, dict) and existing.get("name"):
+                    room_name = str(existing["name"])
+                else:
+                    room_name = f"Phong_{101 + len(cameras_dict)}"
+
+            cam_entry = cameras_dict.get(uid_hex)
+            if not isinstance(cam_entry, dict):
+                cam_entry = {"port": port_val}
+            cam_entry["port"] = port_val
+            cam_entry["name"] = room_name
+            cam_entry["did"] = formatted_did
+            cam_entry["hw_deviceid"] = compact_did
+            cam_entry["formatted_did"] = formatted_did
+            cam_entry["model"] = model or info.get("model", "CS22S")
+            cam_entry["username"] = cam_username
+            cam_entry["password"] = cam_password
+            cameras_dict[uid_hex] = cam_entry
+            self._save_hub_config()
+
+            if uid_hex in self.sessions:
+                sess = self.sessions[uid_hex]
+                rec = self.recorders.get(uid_hex)
+                if rec:
+                    rec.set_room_name(room_name)
+                sess.camera.label = f"{uid_hex[:8]} ({room_name})"
+                sess.username = cam_username
+                sess.password = cam_password
+                if sess.protocol:
+                    sess.protocol.username = cam_username
+                    sess.protocol.password = cam_password
+                    sess.protocol.auth_failed = False
+                    sess.protocol.auth_error = None
+            else:
+                cam = self._make_wan_camera_info(uid_hex, cam_entry)
+                log.info("Onboarding new camera %s (%s) over WAN P2P + LAN", formatted_did, room_name)
+                await self.start_camera_session(cam)
+
+            sess = self.sessions.get(uid_hex)
+            if sess:
+                sess.camera.onboarding_until = time.monotonic() + 180.0
+                if hasattr(sess, "activate_onboarding"):
+                    act_res = sess.activate_onboarding(180.0)
+                    if asyncio.iscoroutine(act_res):
+                        await act_res
+
+            # Also trigger a background LAN broadcast scan in case the Hub is on the same LAN
+            asyncio.create_task(self._scan_and_connect_now(self.target_ip))
+
+            wav_data_url = ""
+            qr_data_url = ""
+            qr_text = ""
+            duration_sec = 0.0
+            sonic_mode = "ssid"
+            if wifi_ssid:
+                sonic_res = await asyncio.get_event_loop().run_in_executor(
+                    None, generate_vstarcam_sonic_wav, wifi_ssid, wifi_password, wifi_bssid, "ssid"
+                )
+                wav_b64 = base64.b64encode(sonic_res["wav_bytes"]).decode("ascii")
+                wav_data_url = f"data:audio/wav;base64,{wav_b64}"
+                duration_sec = sonic_res["duration_sec"]
+                sonic_mode = sonic_res["mode"]
+                try:
+                    qr_res = await asyncio.get_event_loop().run_in_executor(
+                        None, generate_wifi_qr_png_data_url, wifi_ssid, wifi_password, wifi_bssid, "eye4"
+                    )
+                    qr_data_url = qr_res.get("data_url", "")
+                    qr_text = qr_res.get("qr_text", "")
+                except Exception as qr_err:
+                    log.debug("Could not generate optical Wi-Fi QR: %s", qr_err)
 
             return web.json_response({
                 "ok": True,
                 "uid": uid_hex,
+                "did": formatted_did,
                 "formatted_did": formatted_did,
+                "device_id": compact_did,
                 "room_name": room_name,
+                "name": room_name,
                 "rtsp_port": port_val,
-                "connected": False,
+                "connection_mode": getattr(sess.camera, "connection_mode", "WAN_P2P") if sess else "WAN_P2P",
+                "wan_cloud_status": getattr(sess.camera, "wan_cloud_status", "IDLE") if sess else "IDLE",
+                "onboarding_active": True,
+                "onboarding_duration_sec": 180.0,
+                "connected": bool(sess and sess.state == "CONNECTED"),
+                "wifi_ssid": wifi_ssid,
+                "wav_data_url": wav_data_url,
+                "qr_data_url": qr_data_url,
+                "qr_text": qr_text,
+                "duration_sec": duration_sec,
+                "mode": sonic_mode,
                 "message": (
-                    f"Đã thêm camera {formatted_did} ({room_name}, cổng RTSP :{port_val}) vào Hub! "
-                    f"Hub đang quét toàn mạng LAN để kết nối tự động."
+                    f"Đã kích hoạt chế độ Khui hộp & Nạp Wi-Fi cho camera {formatted_did} ({room_name})! "
+                    f"Server đang dò tìm liên tục trên P2P Cloud trong 180 giây..."
+                    if wifi_ssid else
+                    f"Đã liên kết camera {formatted_did} ({room_name}) lên Server! "
+                    f"Server đang dò tìm và bắt tay qua WAN P2P & LAN..."
                 ),
             })
         except Exception as e:
@@ -1454,13 +1783,23 @@ class CameraHubApp:
     async def _scan_and_connect_now(self, extra_ip: Optional[str] = None) -> int:
         found_new = 0
         try:
-            connected_ips = {s.camera.ip for s in self.sessions.values()}
+            connected_ips = {
+                s.camera.ip for s in self.sessions.values()
+                if s.camera.ip and s.camera.ip != "0.0.0.0"
+            }
             cams = await proxy.discover_cameras_broadcast(timeout=2.5, target_ip=extra_ip or self.target_ip, skip_ips=connected_ips)
             for cam in cams:
                 if cam.uid not in self.sessions:
                     log.info("Discovered camera during active scan: %s", cam)
                     await self.start_camera_session(cam)
                     found_new += 1
+                else:
+                    sess = self.sessions[cam.uid]
+                    if sess.camera.ip in ("0.0.0.0", "") and cam.ip not in ("0.0.0.0", ""):
+                        sess.camera.ip = cam.ip
+                        sess.camera.port = cam.port
+                        sess.camera.connection_mode = "LAN"
+                        found_new += 1
         except Exception as e:
             log.debug("Active scan error: %s", e)
         return found_new
@@ -1508,14 +1847,15 @@ class CameraHubApp:
                 None, generate_vstarcam_sonic_wav, ssid, password, bssid, mode
             )
             wav_b64 = base64.b64encode(res["wav_bytes"]).decode("ascii")
-            lan_ip = get_host_lan_ip(self.target_ip)
+            proto = request.headers.get("X-Forwarded-Proto", request.scheme)
+            host = request.headers.get("X-Forwarded-Host", request.host)
             qs = urllib.parse.urlencode({
                 "ssid": ssid,
                 "password": password,
                 "bssid": res["bssid_24"],
                 "mode": res["mode"],
             })
-            mobile_url = f"http://{lan_ip}:{self.web_port}/sonic?{qs}"
+            mobile_url = f"{proto}://{host}/sonic?{qs}"
 
             # Generate a QR code pointing to `mobile_url` so the user can scan with their phone
             # if their desktop PC doesn't have external speakers!
@@ -1598,13 +1938,15 @@ class CameraHubApp:
             return web.json_response({"ok": False, "error": str(e)}, status=400)
 
     async def handle_mobile_sonic_page(self, request: web.Request) -> web.Response:
-        """Standalone Mobile Page so user can play the 2.4GHz-corrected Sonic Wave from their Phone Speaker."""
+        """Standalone Mobile Onboarding & Provisioning Page (Branch 1: Link Existing vs Branch 2: Unbox & Wi-Fi)."""
         info = await asyncio.get_event_loop().run_in_executor(None, scan_host_wifi_info)
-        ssid = request.query.get("ssid") or info.get("current_ssid") or "AM10K"
-        password = request.query.get("password") or info.get("saved_password") or ""
-        bssid = request.query.get("bssid") or info.get("current_bssid") or ""
-        mode = request.query.get("mode") or "combo"
-        qs = urllib.parse.urlencode({"ssid": ssid, "password": password, "bssid": bssid, "mode": mode})
+        ssid = request.query.get("ssid") or info.get("current_ssid") or ""
+        password = request.query.get("password") or (info.get("saved_password") if ssid == info.get("current_ssid") else "") or ""
+        bssid = request.query.get("bssid") or (info.get("current_bssid") if ssid == info.get("current_ssid") else "") or ""
+        uid_q = request.query.get("uid") or request.query.get("did") or ""
+        room_q = request.query.get("room_name") or ""
+        mode = request.query.get("mode") or ("combo" if bssid else "ssid")
+        qs = urllib.parse.urlencode({"ssid": ssid or "WiFi", "password": password, "bssid": bssid, "mode": mode})
         wav_url = f"/api/wifi/sonic.wav?{qs}"
 
         html = f"""<!DOCTYPE html>
@@ -1612,65 +1954,482 @@ class CameraHubApp:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>Phát Sóng Âm Nạp Wi-Fi Camera C22S</title>
+<title>🚀 Liên Kết & Nạp Wi-Fi Camera C22S</title>
 <style>
-  body {{ background:#0d1117; color:#e6edf3; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; padding:20px; text-align:center; }}
-  .card {{ background:#161b22; border:1px solid #30363d; border-radius:14px; padding:20px; max-width:440px; margin:0 auto; box-shadow:0 8px 28px rgba(0,0,0,0.45); }}
-  .play-btn {{ width:100%; padding:18px; font-size:18px; font-weight:800; border:none; border-radius:12px; background:#238636; color:#fff; cursor:pointer; margin-top:14px; box-shadow:0 4px 14px rgba(35,134,54,0.4); }}
+  body {{ background:#0d1117; color:#e6edf3; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; padding:14px; margin:0; }}
+  .card {{ background:#161b22; border:1px solid #30363d; border-radius:14px; padding:18px; max-width:480px; margin:0 auto; box-shadow:0 8px 28px rgba(0,0,0,0.45); }}
+  .nav-tabs {{ display:flex; gap:6px; margin-bottom:12px; background:#0b0f17; padding:4px; border-radius:10px; border:1px solid #30363d; }}
+  .nav-tab-btn {{ flex:1; padding:9px 6px; font-size:12px; font-weight:700; border:none; border-radius:8px; background:transparent; color:#8b949e; cursor:pointer; text-align:center; transition:0.15s; }}
+  .nav-tab-btn.active {{ background:#21262d; color:#58a6ff; box-shadow:0 2px 8px rgba(0,0,0,0.4); }}
+  .play-btn {{ width:100%; padding:15px; font-size:15px; font-weight:800; border:none; border-radius:12px; background:linear-gradient(135deg,#238636,#2ea043); color:#fff; cursor:pointer; margin-top:12px; box-shadow:0 4px 14px rgba(35,134,54,0.4); }}
+  .play-btn.link-btn {{ background:linear-gradient(135deg,#1f6feb,#238636); box-shadow:0 4px 14px rgba(31,111,235,0.4); }}
   .play-btn:active {{ transform:scale(0.98); }}
-  .stop-btn {{ width:100%; padding:12px; font-size:15px; font-weight:700; border:1px solid #f85149; border-radius:10px; background:rgba(248,81,73,0.15); color:#f85149; cursor:pointer; margin-top:10px; }}
+  .stop-btn {{ width:100%; padding:11px; font-size:14px; font-weight:700; border:1px solid #f85149; border-radius:10px; background:rgba(248,81,73,0.15); color:#f85149; cursor:pointer; margin-top:8px; }}
   input, select {{ width:100%; padding:10px; border-radius:8px; border:1px solid #30363d; background:#0b0f17; color:#e6edf3; font-size:15px; margin-top:4px; box-sizing:border-box; }}
-  label {{ display:block; text-align:left; font-size:12px; color:#8b949e; margin-top:10px; }}
+  label {{ display:block; text-align:left; font-size:12px; color:#8b949e; margin-top:10px; font-weight:600; }}
+  .step-item {{ text-align:left; padding:9px 11px; border-radius:8px; background:#0b0f17; border:1px solid #30363d; margin-top:7px; font-size:13px; line-height:1.4; transition:0.2s; }}
+  .step-item.active {{ border-color:#2f81f7; background:rgba(47,129,247,0.12); color:#58a6ff; }}
+  .step-item.done {{ border-color:#3fb950; background:rgba(63,185,80,0.14); color:#3fb950; }}
+  .step-item.warn {{ border-color:#d29922; background:rgba(210,153,34,0.14); color:#f0883e; }}
 </style>
 </head>
 <body>
   <div class="card">
-    <div style="font-size:38px;">🔊📷</div>
-    <h2 style="margin:8px 0 4px 0; font-size:19px;">Sóng Âm Nạp Wi-Fi C22S (Sonic Wave)</h2>
-    <p style="color:#8b949e; font-size:13px; line-height:1.4;">
-      Đã sửa lỗi 5GHz MLD của app Eye4: Phát chính xác mã <b>BSSID 2.4GHz ({bssid[-4:] if len(bssid)>=4 else 'Auto'})</b> cho camera C22S.
-    </p>
-    <label>Tên mạng Wi-Fi (SSID):</label>
-    <input id="m-ssid" value="{ssid}" oninput="updateWavUrl()">
-    <label>Mật khẩu Wi-Fi:</label>
-    <input id="m-pwd" value="{password}" oninput="updateWavUrl()">
-    <label>BSSID 2.4GHz (Tự động quét):</label>
-    <input id="m-bssid" value="{bssid}" oninput="updateWavUrl()">
-    <label>Chế độ mã hóa sóng âm:</label>
-    <select id="m-mode" onchange="updateWavUrl()">
-      <option value="combo" {"selected" if mode=="combo" else ""}>Kết hợp BSSID 2.4GHz + Tên SSID (Khuyên dùng)</option>
-      <option value="mac" {"selected" if mode=="mac" else ""}>Chuẩn VStarcam MAC 2.4GHz (Nhanh nhất)</option>
-      <option value="ssid" {"selected" if mode=="ssid" else ""}>Chuẩn VStarcam Full SSID</option>
-    </select>
-
-    <button class="play-btn" onclick="startPlay()">🔊 BẤM PHÁT SÓNG ÂM NẠP WI-FI</button>
-    <button class="stop-btn" onclick="stopPlay()">⏹ Dừng phát</button>
-
-    <div id="m-status" style="margin-top:12px; font-size:13px; color:#58a6ff; line-height:1.4;">
-      👉 Hãy bật <b>Max Volume (100% âm lượng)</b> trên điện thoại và đặt loa điện thoại sát lỗ Mic của Camera (cách 2–5 cm).
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <span style="font-size:26px;">🚀📷</span>
+      <a href="/" style="color:#58a6ff; font-size:13px; text-decoration:none; font-weight:600;">← Về Bảng Điều Khiển Live</a>
     </div>
-    <audio id="m-audio" src="{wav_url}" loop style="width:100%; margin-top:12px;" controls></audio>
+
+    <!-- 2 TABS / BRANCHES -->
+    <div class="nav-tabs" style="margin-top:10px;">
+      <button class="nav-tab-btn active" id="tab-btn-link" onclick="switchMobileTab('link')">
+        🔗 Camera Đã Có Wi-Fi<br><span style="font-size:10.5px; font-weight:normal;">Chỉ liên kết Server</span>
+      </button>
+      <button class="nav-tab-btn" id="tab-btn-unbox" onclick="switchMobileTab('unbox')">
+        📦 Khui Hộp Mới<br><span style="font-size:10.5px; font-weight:normal;">Nạp Wi-Fi qua loa</span>
+      </button>
+    </div>
+
+    <div id="m-desc-link" style="color:#8b949e; font-size:12px; line-height:1.45; text-align:left; margin-bottom:10px;">
+      ⚡ <b>Chỉ Liên Kết Server:</b> Camera đang sử dụng hoặc đã vào Wi-Fi / cắm mạng LAN. Server sẽ kết nối trực tiếp qua Internet (WAN P2P / LAN) mà <b>không cần nạp Wi-Fi</b> hay phát âm thanh!
+    </div>
+    <div id="m-desc-unbox" style="color:#8b949e; font-size:12px; line-height:1.45; text-align:left; margin-bottom:10px; display:none;">
+      🔊 <b>Khui Hộp &amp; Nạp Wi-Fi:</b> Phát sóng âm từ loa điện thoại nạp Wi-Fi cho Camera mới khui. Ngay khi Camera vào mạng, Server sẽ bắt tay và <b>tự động tắt sóng âm</b>!
+    </div>
+
+    <!-- COMMON: QR IMAGE / UID -->
+    <div style="background:#0b0f17; border:1px dashed #30363d; border-radius:10px; padding:10px; text-align:center; cursor:pointer;" onclick="document.getElementById('m-qr-file').click()">
+      <input type="file" id="m-qr-file" accept="image/*" style="display:none" onchange="decodeQrPhoto(this.files[0])">
+      <div style="font-size:13px; font-weight:700; color:#58a6ff;">📷 Chụp / Tải ảnh Tem QR dưới đáy Camera</div>
+      <div id="m-qr-msg" style="font-size:11px; color:#8b949e; margin-top:3px;">Hoặc bấm nút "📷 Quét / Chụp" cạnh ô UID bên dưới</div>
+    </div>
+
+    <div style="display:grid; grid-template-columns:1.3fr 1fr; gap:8px;">
+      <div>
+        <label>Mã UID Camera (trên tem đáy) (*):</label>
+        <div style="display:flex; gap:6px;">
+          <input id="m-uid" value="{uid_q}" placeholder="VD: VSTJ082299RLSXK" style="font-family:monospace; flex:1;">
+          <button class="btn" type="button" onclick="document.getElementById('m-qr-file').click()" style="padding:0 8px; font-weight:700; background:#21262d; border-color:#58a6ff; color:#58a6ff; font-size:11px; white-space:nowrap;">📷 Quét / Chụp</button>
+        </div>
+      </div>
+      <div>
+        <label>Tên Phòng / Vị trí:</label>
+        <input id="m-room" value="{room_q}" placeholder="VD: C22S_1">
+      </div>
+    </div>
+
+    <div>
+      <label>Mật khẩu Camera:</label>
+      <input id="m-campwd" value="888888" placeholder="Mặc định: 888888 (hoặc mật khẩu riêng bạn đã đổi)" style="font-family:monospace;">
+    </div>
+
+    <!-- BRANCH 2: WIFI INPUTS (ONLY FOR UNBOX MODE) -->
+    <div id="m-unbox-wifi-section" style="display:none; margin-top:8px; padding-top:8px; border-top:1px solid #30363d;">
+      <label>Tên mạng Wi-Fi 2.4GHz tại nơi lắp Camera (*):</label>
+      <input id="m-ssid" value="{ssid}" placeholder="Nhập đúng tên Wi-Fi 2.4GHz..." oninput="updateWavUrl()">
+      <label>Mật khẩu Wi-Fi (*):</label>
+      <input id="m-pwd" value="{password}" placeholder="Nhập mật khẩu Wi-Fi..." oninput="updateWavUrl()">
+
+      <label>Chế độ Sóng âm:</label>
+      <select id="m-mode" onchange="updateWavUrl()">
+        <option value="ssid" {"selected" if mode=="ssid" else ""}>Chuẩn Full SSID (Mọi mạng)</option>
+        <option value="combo" {"selected" if mode=="combo" else ""}>Kết hợp BSSID + SSID</option>
+      </select>
+      <input type="hidden" id="m-bssid" value="{bssid}">
+
+      <div style="display:flex; gap:8px; margin-top:8px;">
+        <button class="stop-btn" onclick="stopPlay()" style="flex:1;">⏹ Dừng phát âm thanh</button>
+        <button class="stop-btn" onclick="toggleOpticalQr()" style="flex:1; border-color:#58a6ff; color:#58a6ff; background:rgba(47,129,247,0.12);">📱 Hiện Mã QR Quang Học</button>
+      </div>
+
+      <div id="m-opt-qr-wrap" style="display:none; margin-top:10px; background:#fff; padding:10px; border-radius:10px; color:#111; text-align:center;">
+        <img id="m-opt-qr-img" style="width:200px; height:200px; display:block; margin:0 auto;" alt="Optical WiFi QR">
+        <div style="font-size:12px; font-weight:700; margin-top:6px;">Đưa màn hình ĐT cách mắt ống kính Camera 15–20 cm</div>
+      </div>
+      <audio id="m-audio" src="{wav_url}" loop style="width:100%; margin-top:10px;" controls></audio>
+    </div>
+
+    <!-- ACTION BUTTONS -->
+    <div id="m-action-link">
+      <button class="play-btn link-btn" id="m-btn-link" onclick="startMobileLinkOnly()">🔗 Liên Kết Server Ngay (Không Cần Nạp Wi-Fi)</button>
+    </div>
+    <div id="m-action-unbox" style="display:none;">
+      <button class="play-btn" id="m-btn-onboard" onclick="startOneClickMobile()">🔊 Nạp Wi-Fi &amp; Tự Động Liên Kết Server</button>
+    </div>
+
+    <!-- PROGRESS STEPS -->
+    <div id="m-steps" style="margin-top:12px; display:none;">
+      <div id="m-step-1" class="step-item"><b>Bước 1:</b> 📋 Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P...</div>
+      <div id="m-step-2" class="step-item"><b>Bước 2:</b> 🌐 Chờ Camera báo danh lên P2P Cloud...</div>
+      <div id="m-step-3" class="step-item"><b>Bước 3:</b> 🔗 Server đục lỗ UDP &amp; xác thực (<code>CONNECTED</code>)...</div>
+    </div>
+
+    <div id="m-status" style="margin-top:12px; font-size:13px; color:#58a6ff; line-height:1.45; text-align:left;"></div>
   </div>
 <script>
+let onboardPollTimer = null;
+let targetUidHex = null;
+let currentMobileTab = 'link';
+
+function switchMobileTab(mode) {{
+  currentMobileTab = mode;
+  stopPlay();
+  const btnLink = document.getElementById('tab-btn-link');
+  const btnUnbox = document.getElementById('tab-btn-unbox');
+  const descLink = document.getElementById('m-desc-link');
+  const descUnbox = document.getElementById('m-desc-unbox');
+  const wifiSec = document.getElementById('m-unbox-wifi-section');
+  const actLink = document.getElementById('m-action-link');
+  const actUnbox = document.getElementById('m-action-unbox');
+  const statusEl = document.getElementById('m-status');
+  document.getElementById('m-steps').style.display = 'none';
+
+  if (mode === 'link') {{
+    btnLink.className = 'nav-tab-btn active';
+    btnUnbox.className = 'nav-tab-btn';
+    descLink.style.display = 'block';
+    descUnbox.style.display = 'none';
+    wifiSec.style.display = 'none';
+    actLink.style.display = 'block';
+    actUnbox.style.display = 'none';
+    statusEl.innerHTML = '';
+  }} else {{
+    btnLink.className = 'nav-tab-btn';
+    btnUnbox.className = 'nav-tab-btn active';
+    descLink.style.display = 'none';
+    descUnbox.style.display = 'block';
+    wifiSec.style.display = 'block';
+    actLink.style.display = 'none';
+    actUnbox.style.display = 'block';
+    statusEl.innerHTML = '👉 Bật <b>Max Volume (100% âm lượng)</b> trên điện thoại và đặt loa sát lỗ Mic của Camera (cách 2–5 cm).';
+    updateWavUrl();
+  }}
+}}
+
+function downscaleImageFile(file, maxDim = 1600, quality = 0.85) {{
+  return new Promise((resolve) => {{
+    if (!file || !file.type || !file.type.startsWith('image/')) {{
+      return resolve(file);
+    }}
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {{
+      URL.revokeObjectURL(url);
+      let w = img.width;
+      let h = img.height;
+      if (w <= maxDim && h <= maxDim) {{
+        return resolve(file);
+      }}
+      if (w > h) {{
+        h = Math.round((h * maxDim) / w);
+        w = maxDim;
+      }} else {{
+        w = Math.round((w * maxDim) / h);
+        h = maxDim;
+      }}
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      canvas.toBlob((blob) => {{
+        if (blob) {{
+          resolve(blob);
+        }} else {{
+          resolve(file);
+        }}
+      }}, 'image/jpeg', quality);
+    }};
+    img.onerror = () => {{
+      URL.revokeObjectURL(url);
+      resolve(file);
+    }};
+    img.src = url;
+  }});
+}}
+
+async function decodeQrPhoto(file) {{
+  if (!file) return;
+  const msg = document.getElementById('m-qr-msg');
+  msg.textContent = '⏳ Đang tối ưu dung lượng ảnh & giải mã tem QR...';
+  try {{
+    const uploadBlob = await downscaleImageFile(file, 1600, 0.85);
+    const fd = new FormData();
+    fd.append('file', uploadBlob, 'qr.jpg');
+    const res = await fetch('/api/camera/decode-qr', {{ method: 'POST', body: fd }});
+    if (res.status === 413) {{
+      msg.innerHTML = '<span style="color:#f85149;">❌ Ảnh quá lớn (413 Request Entity Too Large). Vui lòng thử lại với ảnh nhỏ hơn hoặc gõ UID.</span>';
+      return;
+    }}
+    const d = await res.json();
+    if (res.ok && d.ok) {{
+      document.getElementById('m-uid').value = d.formatted_did;
+      if (d.suggested_name && !document.getElementById('m-room').value) {{
+        document.getElementById('m-room').value = d.suggested_name;
+      }}
+      msg.innerHTML = `<span style="color:#3fb950;">✅ Đã nhận UID: <b>${{d.formatted_did}}</b></span>`;
+    }} else {{
+      msg.innerHTML = `<span style="color:#f85149;">❌ ${{d.error || 'Không nhận diện được tem QR'}}</span>`;
+    }}
+  }} catch (e) {{
+    msg.textContent = 'Lỗi giải mã QR: ' + e;
+  }}
+}}
+
 function updateWavUrl() {{
   const s = document.getElementById('m-ssid').value.trim();
   const p = document.getElementById('m-pwd').value;
-  const b = document.getElementById('m-bssid').value.trim();
   const m = document.getElementById('m-mode').value;
-  const u = `/api/wifi/sonic.wav?ssid=${{encodeURIComponent(s)}}&password=${{encodeURIComponent(p)}}&bssid=${{encodeURIComponent(b)}}&mode=${{encodeURIComponent(m)}}`;
-  document.getElementById('m-audio').src = u;
-}}
-function startPlay() {{
+  if (!s) return;
+  const u = `/api/wifi/sonic.wav?ssid=${{encodeURIComponent(s)}}&password=${{encodeURIComponent(p)}}&mode=${{encodeURIComponent(m)}}`;
   const a = document.getElementById('m-audio');
-  a.currentTime = 0;
-  a.play();
-  document.getElementById('m-status').innerHTML = '🟢 <b>Đang phát sóng âm 6.5–10.1 kHz (Lặp liên tục)...</b><br>Giữ loa sát Camera (2–5 cm) cho đến khi nghe tiếng Camera báo <i>"Wi-Fi connecting"</i>!';
+  if (a.paused) a.src = u;
 }}
+
+async function startMobileLinkOnly() {{
+  const uid = document.getElementById('m-uid').value.trim();
+  const room = document.getElementById('m-room').value.trim();
+  const camPwd = document.getElementById('m-campwd').value.trim() || '888888';
+
+  if (!uid) {{
+    alert('Vui lòng chụp/tải ảnh tem QR hoặc nhập Mã UID trên thân Camera (VD: VSTJ082299RLSXK)!');
+    document.getElementById('m-uid').focus();
+    return;
+  }}
+
+  const btn = document.getElementById('m-btn-link');
+  btn.disabled = true;
+  btn.textContent = '⏳ Đang đăng ký & Kết nối WAN P2P...';
+
+  const sBox = document.getElementById('m-steps');
+  const s1 = document.getElementById('m-step-1');
+  const s2 = document.getElementById('m-step-2');
+  const s3 = document.getElementById('m-step-3');
+  sBox.style.display = 'block';
+  s1.className = 'step-item active';
+  s1.innerHTML = '<b>Bước 1:</b> 📋 Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P (180s fast-poll)...';
+  s2.className = 'step-item';
+  s2.innerHTML = '<b>Bước 2:</b> 🌐 Bắt tay P2P Cloud (<code>WAITING_FOR_WIFI</code> → <code>ONLINE_PUNCHING</code>)...';
+  s3.className = 'step-item';
+  s3.innerHTML = '<b>Bước 3:</b> 🔗 Server đục lỗ UDP &amp; xác thực (<code>CONNECTED</code>)...';
+
+  try {{
+    const res = await fetch('/api/camera/onboard', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{
+        uid: uid,
+        room_name: room,
+        cam_password: camPwd,
+        wifi_ssid: ""
+      }})
+    }});
+    const d = await res.json();
+    if (!d.ok) {{
+      alert('Lỗi: ' + d.error);
+      return;
+    }}
+    targetUidHex = d.uid;
+    document.getElementById('m-status').innerHTML =
+      `🌐 <b>Đã đăng ký Camera <code>${{d.formatted_did}}</code> (${{d.room_name}})!</b><br>` +
+      `Server đang tự động dò tìm và đục lỗ UDP qua WAN P2P &amp; LAN mỗi 1.5s...`;
+
+    if (onboardPollTimer) clearInterval(onboardPollTimer);
+    onboardPollTimer = setInterval(pollMobileOnboardStatus, 1200);
+  }} catch (e) {{
+    document.getElementById('m-status').innerHTML = '❌ Lỗi kết nối: ' + e;
+  }} finally {{
+    btn.disabled = false;
+    btn.textContent = '🔗 Liên Kết Server Ngay (Không Cần Nạp Wi-Fi)';
+  }}
+}}
+
+async function startOneClickMobile() {{
+  const uid = document.getElementById('m-uid').value.trim();
+  const room = document.getElementById('m-room').value.trim();
+  const ssid = document.getElementById('m-ssid').value.trim();
+  const pwd = document.getElementById('m-pwd').value;
+  const camPwd = document.getElementById('m-campwd').value.trim() || '888888';
+
+  if (!ssid) {{
+    alert('Vui lòng nhập Tên mạng Wi-Fi (2.4GHz) tại nơi đặt camera!');
+    document.getElementById('m-ssid').focus();
+    return;
+  }}
+
+  const a = document.getElementById('m-audio');
+  if (!uid) {{
+    updateWavUrl();
+    a.currentTime = 0;
+    a.play();
+    document.getElementById('m-status').innerHTML = '🟢 <b>Đang phát sóng âm 6.5–10.1 kHz (Lặp liên tục)...</b><br>Hãy nhập thêm Mã UID Camera ở trên để Server tự động liên kết và tự ngắt sóng âm khi hoàn tất!';
+    return;
+  }}
+
+  document.getElementById('m-steps').style.display = 'block';
+  const s1 = document.getElementById('m-step-1');
+  const s2 = document.getElementById('m-step-2');
+  const s3 = document.getElementById('m-step-3');
+  s1.className = 'step-item active';
+  s1.innerHTML = `<b>Bước 1:</b> 🔊 Đang phát sóng âm nạp Wi-Fi <b>"${{ssid}}"</b> từ điện thoại sang Camera...`;
+  s2.className = 'step-item';
+  s2.innerHTML = '<b>Bước 2:</b> 🌐 Chờ Camera vào mạng Wi-Fi &amp; báo danh lên P2P Cloud (<code>WAITING_FOR_WIFI</code> → <code>ONLINE_PUNCHING</code>)...';
+  s3.className = 'step-item';
+  s3.innerHTML = '<b>Bước 3:</b> 🔗 Server đục lỗ UDP &amp; xác thực (<code>CONNECTED</code>)...';
+
+  try {{
+    const res = await fetch('/api/camera/onboard', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{
+        uid: uid,
+        room_name: room,
+        cam_password: camPwd,
+        wifi_ssid: ssid,
+        wifi_password: pwd
+      }})
+    }});
+    const d = await res.json();
+    if (!d.ok) {{
+      alert('Lỗi: ' + d.error);
+      return;
+    }}
+    targetUidHex = d.uid;
+    if (d.wav_data_url) {{
+      a.src = d.wav_data_url;
+      a.currentTime = 0;
+      await a.play();
+    }}
+    if (d.qr_data_url) {{
+      document.getElementById('m-opt-qr-img').src = d.qr_data_url;
+    }}
+    document.getElementById('m-status').innerHTML =
+      `🔊 <b>Đang phát sóng âm nạp Wi-Fi "${{ssid}}" cho Camera <code>${{d.formatted_did}}</code>!</b><br>` +
+      `Giữ loa điện thoại sát lỗ Mic của Camera (2–5 cm). Server đang dò tìm Camera liên tục mỗi 1.5s...`;
+
+    if (onboardPollTimer) clearInterval(onboardPollTimer);
+    onboardPollTimer = setInterval(pollMobileOnboardStatus, 1200);
+  }} catch (e) {{
+    document.getElementById('m-status').innerHTML = '❌ Lỗi: ' + e;
+  }}
+}}
+
+async function pollMobileOnboardStatus() {{
+  if (!targetUidHex) return;
+  try {{
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    const cam = (data.cameras || []).find(c => c.uid === targetUidHex);
+    if (!cam) return;
+
+    const s1 = document.getElementById('m-step-1');
+    const s2 = document.getElementById('m-step-2');
+    const s3 = document.getElementById('m-step-3');
+    const cloudSt = cam.wan_cloud_status || 'WAITING_FOR_WIFI';
+
+    // 1. Fully connected
+    if (cam.state === 'CONNECTED' && !cam.auth_failed) {{
+      stopPlay();
+      if (onboardPollTimer) {{ clearInterval(onboardPollTimer); onboardPollTimer = null; }}
+      s1.className = 'step-item done';
+      s1.innerHTML = (currentMobileTab === 'unbox')
+        ? '<b>Bước 1:</b> ✅ Đã nạp Wi-Fi thành công (Đã tự động tắt sóng âm)'
+        : '<b>Bước 1:</b> ✅ Đã lưu UID &amp; kích hoạt kết nối';
+      s2.className = 'step-item done';
+      s2.innerHTML = '<b>Bước 2:</b> ✅ Camera đã vào mạng &amp; báo danh P2P Cloud (<code>CONNECTED</code>)';
+      s3.className = 'step-item done';
+      s3.innerHTML = `<b>Bước 3:</b> ✅ Server đã đục lỗ UDP (<code>${{cam.connection_mode}}</code>) &amp; nhận luồng Live 25 FPS!`;
+      document.getElementById('m-status').innerHTML =
+        `<div style="padding:12px; border-radius:10px; background:rgba(63,185,80,0.2); border:1px solid #3fb950; color:#3fb950; font-weight:700;">` +
+        `✅ Liên kết hoàn tất! Camera <b>${{cam.room_name}} (${{cam.formatted_did}})</b> đã kết nối trực tiếp với Server qua Internet.<br>` +
+        `<a href="/" style="display:inline-block; margin-top:8px; padding:8px 14px; background:#238636; color:#fff; border-radius:6px; text-decoration:none;">📹 Xem Live Stream Ngay</a></div>`;
+      return;
+    }}
+
+    // 2. Auth failed (wrong camera password)
+    if (cam.auth_failed) {{
+      stopPlay();
+      s1.className = 'step-item done';
+      s2.className = 'step-item done';
+      s3.className = 'step-item warn';
+      s3.innerHTML = '<b>Bước 3:</b> ⚠️ Đã đục lỗ UDP nhưng sai Mật khẩu Camera (hãy nhập đúng mật khẩu Camera vào ô Mật khẩu rồi bấm lại)!';
+      return;
+    }}
+
+    // 3. Camera is online on P2P Cloud -> Hole punching actively in progress!
+    if (cloudSt === 'ONLINE_PUNCHING') {{
+      s1.className = 'step-item done';
+      s1.innerHTML = (currentMobileTab === 'unbox')
+        ? '<b>Bước 1:</b> ✅ Camera đã nhận sóng âm Wi-Fi'
+        : '<b>Bước 1:</b> ✅ Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P';
+      s2.className = 'step-item done';
+      s2.innerHTML = '<b>Bước 2:</b> 🟢 Camera đã ONLINE trên P2P Cloud (Đã bắt được IP &amp; Port công khai)!';
+      s3.className = 'step-item active';
+      s3.innerHTML = `<b>Bước 3:</b> 🔄 Server đang đục lỗ UDP &amp; bắt tay trực tiếp với Camera (<code>${{cam.state}}</code>)...`;
+      return;
+    }}
+
+    // 4. Camera is OFFLINE on Cloud (WAITING_FOR_WIFI or IDLE)
+    if (cloudSt === 'WAITING_FOR_WIFI' || cloudSt === 'IDLE') {{
+      if (currentMobileTab === 'unbox') {{
+        s1.className = 'step-item active';
+        s1.innerHTML = '<b>Bước 1:</b> 🔊 Đang phát sóng âm nạp Wi-Fi từ điện thoại sang Camera...';
+        s2.className = 'step-item warn';
+        s2.innerHTML = '<b>Bước 2:</b> ⏳ Đang phát sóng âm... Chờ Camera nhận sóng âm và online trên P2P Cloud (<code>WAITING_FOR_WIFI</code>)...';
+      }} else {{
+        s1.className = 'step-item done';
+        s1.innerHTML = '<b>Bước 1:</b> 📋 Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P / LAN';
+        s2.className = 'step-item warn';
+        s2.innerHTML = '<b>Bước 2:</b> ⏳ Chờ Camera vào mạng &amp; báo danh lên P2P Cloud (Hiện Camera đang <b>OFFLINE</b> — Hãy chắc chắn Camera đã cắm nguồn và có mạng Wi-Fi/LAN, hoặc chuyển sang tab <b>Khui Hộp Mới</b> để nạp Wi-Fi!)';
+      }}
+      s3.className = 'step-item';
+      s3.innerHTML = '<b>Bước 3:</b> ⏸ Chờ Bước 2 (Camera phải Online trên P2P Cloud trước khi Server có thể đục lỗ UDP)...';
+      return;
+    }}
+
+    // 5. Invalid UID
+    if (cloudSt === 'INVALID_UID') {{
+      stopPlay();
+      s2.className = 'step-item warn';
+      s2.innerHTML = '<b>Bước 2:</b> ❌ Mã UID không hợp lệ hoặc không tồn tại trên hệ thống P2P Cloud!';
+      s3.className = 'step-item';
+      s3.innerHTML = '<b>Bước 3:</b> ⏸ Đã dừng kết nối.';
+      return;
+    }}
+
+    // 6. Fallback
+    s2.className = 'step-item active';
+    s2.innerHTML = `<b>Bước 2:</b> 🌐 Chờ Camera báo danh lên P2P Cloud (Trạng thái: <code>${{cloudSt}}</code>)...`;
+    s3.className = 'step-item';
+    s3.innerHTML = '<b>Bước 3:</b> ⏸ Chờ Bước 2...';
+  }} catch (e) {{}}
+}}
+
+function toggleOpticalQr() {{
+  const w = document.getElementById('m-opt-qr-wrap');
+  const s = document.getElementById('m-ssid').value.trim();
+  const p = document.getElementById('m-pwd').value;
+  if (w.style.display === 'none') {{
+    w.style.display = 'block';
+    if (s && !document.getElementById('m-opt-qr-img').src) {{
+      fetch('/api/wifi/qr', {{
+        method: 'POST', headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{ssid: s, password: p, format: 'eye4'}})
+      }}).then(r => r.json()).then(d => {{
+        if (d.ok) document.getElementById('m-opt-qr-img').src = d.data_url;
+      }});
+    }}
+  }} else {{
+    w.style.display = 'none';
+  }}
+}}
+
 function stopPlay() {{
   const a = document.getElementById('m-audio');
-  a.pause();
-  a.currentTime = 0;
-  document.getElementById('m-status').innerHTML = '⏹ Đã dừng phát sóng âm.';
+  if (a) {{
+    a.pause();
+    a.currentTime = 0;
+  }}
 }}
 </script>
 </body>
@@ -2123,7 +2882,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <button class="tab-btn" onclick="switchTab('settings', this)">Cài đặt & Quản lý Phòng</button>
   </div>
   <div class="toolbar">
-    <button class="btn primary" onclick="openQrModal()" style="font-weight:600;">📷 Thêm Camera (Upload QR)</button>
+    <button class="btn primary" onclick="openQrModal()" style="font-weight:700; background:linear-gradient(135deg,#238636,#2ea043); border-color:#2ea043;">🚀 Khui Camera Mới / Thêm QR (1-Click)</button>
+    <a class="btn" href="/sonic" target="_blank" style="text-decoration:none; border-color:#58a6ff; color:#58a6ff;" title="Trang nạp Wi-Fi rút gọn tối ưu cho màn hình Điện thoại">📱 Chế độ ĐT (/sonic)</a>
     <button class="btn" id="btn-scan-lan" onclick="scanLanNow()" title="Quét toàn bộ 254 IP trong mạng LAN để bắt camera mới">🔍 Quét LAN</button>
     <label>Bố cục:</label>
     <select id="grid-cols" onchange="updateGridCols()">
@@ -2260,15 +3020,36 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <!-- ADD CAMERA BY QR & WIFI PROVISIONING MODAL -->
 <div class="modal-backdrop" id="qr-modal">
-  <div class="modal-box" style="max-width:780px; max-height:92vh; overflow-y:auto;">
+  <div class="modal-box" style="max-width:820px; max-height:94vh; overflow-y:auto;">
     <div class="modal-header">
-      <strong>📷 Thêm Camera bằng Ảnh QR & Nạp Wi-Fi Trực tiếp</strong>
+      <strong>🚀 Thêm Camera (QR &amp; UID) / Khui Hộp Nạp Wi-Fi 1-Click</strong>
       <button class="btn danger" onclick="closeQrModal()">✖ Đóng</button>
     </div>
     <div style="padding:16px; display:flex; flex-direction:column; gap:14px; font-size:13px;">
-      <!-- STEP 1: QR IMAGE UPLOAD -->
+
+      <!-- 2-TAB SEGMENTED CONTROL -->
+      <div style="display:flex; border-bottom:2px solid var(--border); gap:8px;">
+        <button id="modal-tab-link" type="button" onclick="switchModalTab('link')"
+                style="padding:10px 18px; font-size:13px; font-weight:700; border:none; background:none; cursor:pointer; color:#58a6ff; border-bottom:3px solid #1f6feb; margin-bottom:-2px; display:flex; align-items:center; gap:6px;">
+          🔗 Camera Đã Có Wi-Fi (Chỉ Liên Kết Server)
+        </button>
+        <button id="modal-tab-unbox" type="button" onclick="switchModalTab('unbox')"
+                style="padding:10px 18px; font-size:13px; font-weight:700; border:none; background:none; cursor:pointer; color:var(--muted); border-bottom:3px solid transparent; margin-bottom:-2px; display:flex; align-items:center; gap:6px;">
+          📦 Khui Hộp Mới (Nạp Wi-Fi Bằng Sóng Âm &amp; Liên Kết Tự Động)
+        </button>
+      </div>
+
+      <!-- DESCRIPTIONS -->
+      <div id="modal-desc-link" style="color:var(--muted); font-size:12.5px; line-height:1.45; background:#161b22; padding:10px 12px; border-radius:6px; border:1px solid var(--border);">
+        💡 <b>Camera đã có mạng Wi-Fi hoặc cắm dây LAN:</b> Chỉ cần quét/nhập UID. Server từ xa sẽ kích hoạt tìm kiếm WAN P2P &amp; quét LAN, đục lỗ UDP trực tiếp qua Internet mà không cần nạp lại Wi-Fi.
+      </div>
+      <div id="modal-desc-unbox" style="display:none; color:var(--muted); font-size:12.5px; line-height:1.45; background:#161b22; padding:10px 12px; border-radius:6px; border:1px solid #238636;">
+        📦 <b>Camera mới khui hộp (Mật khẩu mặc định <code>888888</code>):</b> Nhập UID + Tên &amp; Mật khẩu Wi-Fi tại nơi lắp. Loa điện thoại/PC sẽ phát sóng âm nạp Wi-Fi vào Camera và Server sẽ tự động đục lỗ UDP bắt tay, rồi <b>tự động tắt sóng âm</b> ngay khi kết nối thành công ("Một lần và mãi mãi")!
+      </div>
+
+      <!-- STEP 1: QR IMAGE UPLOAD & UID -->
       <div style="background:#0b0f17; border:1px solid var(--border); border-radius:8px; padding:12px;">
-        <div style="font-weight:700; margin-bottom:8px; color:#58a6ff;">Bước 1: Tải ảnh chụp Tem QR dưới đáy Camera (hoặc nhập mã UID)</div>
+        <div style="font-weight:700; margin-bottom:8px; color:#58a6ff;">Bước 1: Quét/Tải ảnh Tem QR hoặc Nhập mã UID — Hỗ trợ kết nối Camera ở BẤT KỲ MẠNG NÀO qua Internet (🌐 WAN P2P / Cloud Relay) &amp; LAN</div>
         <div id="qr-dropzone"
              onclick="document.getElementById('qr-file-input').click()"
              ondragover="event.preventDefault(); this.style.borderColor='#2f81f7';"
@@ -2279,20 +3060,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div id="qr-preview-wrap" style="display:none; margin-bottom:8px;">
             <img id="qr-preview-img" style="max-height:130px; border-radius:6px; border:1px solid var(--border);">
           </div>
-          <div style="font-size:13px; font-weight:600; color:var(--text);">📤 Bấm chọn ảnh tem QR, Kéo thả ảnh, hoặc bấm <kbd style="background:#21262d; padding:2px 6px; border-radius:4px;">Ctrl + V</kbd></div>
-          <div style="color:var(--muted); font-size:11px; margin-top:3px;">Tự động đọc mã UID (VD: <code>VSTJ-082279-XTJDT</code>) và tính toán mã PPPP LAN 40 ký tự</div>
+          <div style="font-size:13px; font-weight:600; color:var(--text);">📤 Chụp/Chọn ảnh tem QR dưới đáy Camera, Kéo thả ảnh, hoặc bấm <kbd style="background:#21262d; padding:2px 6px; border-radius:4px;">Ctrl + V</kbd></div>
+          <div style="color:var(--muted); font-size:11px; margin-top:3px;">Camera ở mạng khác / từ xa qua Internet (WAN P2P) có thể thêm trực tiếp bằng mã UID (VD: <code>VSTJ082299RLSXK</code> hoặc <code>VSTJ-082299-RLSXK</code>)</div>
         </div>
 
         <div id="qr-decode-result" style="display:none; margin-top:10px; padding:8px 12px; border-radius:6px; background:rgba(35,134,54,0.15); border:1px solid var(--accent); line-height:1.5; font-size:12px;"></div>
 
-        <div style="display:grid; grid-template-columns:1fr 1fr 110px; gap:10px; margin-top:10px;">
+        <div style="display:grid; grid-template-columns:1.2fr 1fr 1fr 90px; gap:10px; margin-top:10px;">
           <div>
             <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Mã UID trên tem Camera (*):</label>
-            <input type="text" id="qr-did-input" placeholder="VD: VSTJ-082279-XTJDT" style="width:100%; font-family:monospace;">
+            <input type="text" id="qr-did-input" placeholder="VD: VSTJ082299RLSXK" style="width:100%; font-family:monospace;">
           </div>
           <div>
             <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Tên Phòng / Vị trí hiển thị (*):</label>
-            <input type="text" id="qr-room-input" placeholder="VD: Phong_102" style="width:100%;">
+            <input type="text" id="qr-room-input" placeholder="VD: C22S_1" style="width:100%;">
+          </div>
+          <div>
+            <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Mật khẩu Camera:</label>
+            <input type="text" id="qr-pwd-input" value="888888" placeholder="Mặc định: 888888" style="width:100%; font-family:monospace;">
           </div>
           <div>
             <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Model:</label>
@@ -2300,25 +3085,39 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
         <input type="hidden" id="qr-ip-input" value="">
+
+        <!-- ACTION IN STEP 1 WHEN IN LINK-ONLY MODE -->
+        <div id="modal-action-link" style="margin-top:12px; display:flex; gap:10px; align-items:center;">
+          <button class="btn primary" type="button" id="btn-modal-link-only" onclick="startOneClickOnboarding(false)"
+                  style="flex:1; background:linear-gradient(135deg,#1f6feb,#238636); border-color:#388bfd; font-size:14px; font-weight:800; padding:11px 18px; border-radius:8px; box-shadow:0 4px 14px rgba(31,111,235,0.35);">
+            🔗 Liên Kết Server Ngay (Không Cần Nạp Wi-Fi)
+          </button>
+        </div>
       </div>
 
-      <!-- STEP 2: WIFI PROVISIONING -->
-      <div style="background:#0b0f17; border:1px solid var(--border); border-radius:8px; padding:12px;">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-          <span style="font-weight:700; color:#3fb950;">Bước 2: Cấu hình Wi-Fi cho Camera (Tự động quét mạng hiện tại & cho phép đổi tên mạng)</span>
-          <button class="btn" onclick="loadHostWifiInfo(true)" style="font-size:11px; padding:3px 8px;">🔄 Quét lại Wi-Fi hiện tại</button>
+      <!-- STEP 2: 1-CLICK UNBOXING & WIFI PROVISIONING (ONLY IN UNBOX MODE) -->
+      <div id="modal-unbox-step-2" style="display:none; background:#0b0f17; border:1px solid #238636; border-radius:8px; padding:14px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:6px;">
+          <span style="font-weight:700; color:#3fb950; font-size:14px;">Bước 2: Nạp Wi-Fi cho Camera mới khui hộp (Qua loa Điện thoại / PC)</span>
+          <div style="display:flex; gap:6px;">
+            <a class="btn" href="/sonic" target="_blank" style="font-size:11px; padding:3px 8px; text-decoration:none; color:#58a6ff; border-color:#58a6ff;">📱 Mở trang Mobile /sonic</a>
+            <button class="btn" onclick="loadHostWifiInfo(true)" style="font-size:11px; padding:3px 8px;">🔄 Gợi ý Wi-Fi</button>
+          </div>
+        </div>
+        <div style="color:var(--muted); font-size:12px; margin-bottom:10px; line-height:1.45;">
+          <b>"Một lần và mãi mãi":</b> Điện thoại chỉ làm cầu nối tạm thời để phát sóng âm nạp Wi-Fi tại nơi lắp đặt. Ngay khi Camera vào Wi-Fi và báo danh lên P2P Cloud, Server từ xa sẽ tự động đục lỗ UDP bắt tay trực tiếp và <b>tự động ngắt sóng âm</b>!
         </div>
 
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
           <div>
-            <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Tên mạng Wi-Fi (SSID — có thể sửa hoặc chọn):</label>
+            <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Tên Wi-Fi (2.4GHz) tại nơi đặt Camera (*):</label>
             <div style="display:flex; gap:6px;">
-              <input type="text" id="wifi-ssid-input" list="wifi-ssid-list" placeholder="Nhập hoặc chọn tên Wi-Fi (2.4GHz)..." style="width:100%; font-weight:600;" oninput="refreshWifiQrPreview()">
+              <input type="text" id="wifi-ssid-input" list="wifi-ssid-list" placeholder="Nhập tên mạng Wi-Fi 2.4GHz tại nơi lắp..." style="width:100%; font-weight:600;" oninput="onWifiSsidInput()">
               <datalist id="wifi-ssid-list"></datalist>
             </div>
           </div>
           <div>
-            <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Mật khẩu Wi-Fi:</label>
+            <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Mật khẩu Wi-Fi tại nơi đặt Camera (*):</label>
             <div style="display:flex; gap:6px;">
               <input type="password" id="wifi-pwd-input" placeholder="Nhập mật khẩu Wi-Fi..." style="width:100%;" oninput="refreshWifiQrPreview()">
               <button class="btn" type="button" onclick="toggleWifiPwdVis()" title="Hiện/Ẩn mật khẩu" style="padding:5px 8px;">👁️</button>
@@ -2329,59 +3128,98 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         <div id="wifi-scan-status" style="color:var(--muted); font-size:11px; margin-top:6px;"></div>
 
+        <!-- 1-CLICK ONBOARD BUTTON & LIVE 3-STEP TRACKER -->
+        <div id="modal-action-unbox" style="margin-top:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+          <button class="btn primary" type="button" id="btn-oneclick-onboard" onclick="startOneClickOnboarding(true)"
+                  style="flex:1; min-width:260px; background:linear-gradient(135deg,#238636,#2ea043); border-color:#3fb950; font-size:15px; font-weight:800; padding:12px 18px; border-radius:8px; box-shadow:0 4px 14px rgba(35,134,54,0.35);">
+            🔊 Nạp Wi-Fi &amp; Tự Động Liên Kết Server
+          </button>
+          <button class="btn" type="button" onclick="toggleOpticalWifiQrModal()" style="border-color:#58a6ff; color:#58a6ff; padding:11px 12px; font-size:12px;">
+            👁️ Hiện QR Quang Học (Quét bằng mắt Cam)
+          </button>
+          <button class="btn danger" type="button" onclick="stopSonicWave()" style="padding:11px 12px; font-size:12px;">
+            ⏹ Dừng phát âm
+          </button>
+        </div>
+
+        <!-- OPTICAL WIFI QR CODE BOX (FOR CAMERA LENS SCANNING) -->
+        <div id="optical-wifi-qr-box" style="display:none; margin-top:12px; padding:12px; background:#fff; color:#111; border-radius:8px; text-align:center;">
+          <img id="optical-wifi-qr-img" style="width:210px; height:210px; display:block; margin:0 auto;" alt="Optical Wi-Fi QR">
+          <div style="font-size:12px; font-weight:700; margin-top:6px;">📷 Đưa màn hình mã QR này ra trước ống kính Camera (cách 15–20 cm) nếu muốn quét bằng mắt Camera</div>
+        </div>
+
         <!-- VStarcam Sonic Wave Audio Provisioning + Phone Speaker Helper QR -->
-        <div id="wifi-qr-box" style="display:grid; margin-top:12px; padding:12px; background:#161b22; border:1px solid #238636; border-radius:8px; grid-template-columns:195px 1fr; gap:14px; align-items:center;">
+        <div id="wifi-qr-box" style="display:grid; margin-top:12px; padding:12px; background:#161b22; border:1px solid var(--border); border-radius:8px; grid-template-columns:175px 1fr; gap:14px; align-items:center;">
           <div style="text-align:center; background:#fff; padding:8px; border-radius:8px; color:#0d1117;">
-            <img id="wifi-qr-img" style="width:175px; height:175px; display:block; margin:0 auto;" alt="Phone Sonic QR">
-            <div style="font-size:10px; font-weight:700; margin-top:4px; color:#111;">📱 Quét bằng ĐT nếu PC không có loa</div>
+            <img id="wifi-qr-img" style="width:155px; height:155px; display:block; margin:0 auto;" alt="Phone Sonic QR">
+            <div style="font-size:10px; font-weight:700; margin-top:4px; color:#111;">📱 Quét mở trên Điện thoại</div>
           </div>
           <div style="display:flex; flex-direction:column; gap:8px;">
-            <div style="font-weight:700; color:#3fb950; font-size:14px;">🔊 Nạp Wi-Fi bằng Sóng Âm Thanh Chuẩn VStarcam C22S (Sonic Wave 6.5–10.1 kHz)</div>
-            <div style="color:var(--muted); font-size:12px; line-height:1.45;">
-              Model <b>CS22S (VSTJ)</b> nhận cấu hình Wi-Fi qua <b>Micro thu âm</b> (khi cam đang kêu <i>"Please use the App for Wi-Fi configuration"</i>).<br>
-              • <b>Đã fix lỗi Router Wi-Fi 7 MLD (<code id="wifi-target-label">AM10K</code>):</b> App Eye4 trên ĐT lấy nhầm BSSID 5GHz (<code>b8:da</code>) khiến cam 2.4GHz không tìm thấy mạng. Hub đã tự động khóa đúng <b>BSSID 2.4GHz (<code id="sonic-bssid-badge">b8:d9</code>)</b>!
+            <div style="font-weight:700; color:#3fb950; font-size:13px;">🔊 Bộ phát Sóng Âm VStarcam Sonic Wave (6.5–10.1 kHz)</div>
+            <div style="color:var(--muted); font-size:11.5px; line-height:1.45;">
+              Hãy bật <b>Max Volume (80–100% âm lượng)</b> và đặt loa Điện thoại sát lỗ Mic của Camera (cách 2–5 cm) khi Camera đang kêu <i>"Please use the App for Wi-Fi configuration"</i>.<br>
+              • Mạng mục tiêu: <code id="wifi-target-label">Chưa nhập</code> (Mã hóa: <code id="sonic-bssid-badge">Full SSID</code>)
             </div>
 
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-              <button class="btn primary" type="button" id="btn-play-sonic" onclick="playSonicWaveBrowser()" style="background:#238636; border-color:#2ea043; font-size:13px; padding:7px 14px;">
-                🔊 Phát Sóng Âm Nạp Wi-Fi (Loa Trình duyệt)
-              </button>
-              <button class="btn" type="button" onclick="playSonicWavePcSpeaker()" style="border-color:#58a6ff; color:#58a6ff; font-size:12px; padding:7px 10px;">
-                🖥️ Phát ra Loa PC (Windows Direct)
-              </button>
-              <button class="btn danger" type="button" onclick="stopSonicWave()" style="font-size:12px; padding:7px 10px;">
-                ⏹ Dừng
-              </button>
-            </div>
-
-            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-              <audio id="sonic-audio-player" controls loop style="height:30px; width:250px;"></audio>
+              <audio id="sonic-audio-player" controls loop style="height:30px; width:240px;"></audio>
               <select id="wifi-qr-fmt" onchange="refreshWifiQrPreview()" style="font-size:11px; padding:4px 6px;">
-                <option value="combo" selected>Chế độ: Kết hợp BSSID 2.4GHz + Tên SSID (Khuyên dùng)</option>
+                <option value="ssid" selected>Chế độ: Chuẩn VStarcam Full SSID (Mọi mạng Internet/Từ xa)</option>
+                <option value="combo">Chế độ: Kết hợp BSSID 2.4GHz + Tên SSID</option>
                 <option value="mac">Chế độ: Chuẩn VStarcam MAC 2.4GHz (1.8s/gói)</option>
-                <option value="ssid">Chế độ: Chuẩn VStarcam Full SSID (Khi đổi mạng khác)</option>
               </select>
-              <button class="btn" type="button" onclick="pushWifiDirectCgi()" style="font-size:11px;">📡 Bắn set_wifi.cgi</button>
+              <button class="btn" type="button" onclick="playSonicWavePcSpeaker()" style="border-color:#58a6ff; color:#58a6ff; font-size:11px; padding:4px 8px;">
+                🖥️ Loa PC
+              </button>
+              <button class="btn" type="button" onclick="pushWifiDirectCgi()" style="font-size:11px; padding:4px 8px;">📡 Bắn set_wifi.cgi</button>
             </div>
 
             <div id="sonic-mobile-link-box" style="font-size:11px; color:var(--muted);">
-              📱 Nếu máy tính không có loa ngoài: Dùng điện thoại quét mã QR bên trái (hoặc mở <a id="sonic-mobile-link" href="/sonic" target="_blank" style="color:#58a6ff;">link này trên ĐT</a>) để phát sóng âm từ loa điện thoại sát lỗ Mic của Camera (cách 2–5 cm).
+              📱 Đang ngồi trên PC? Dùng ĐT quét mã QR bên trái hoặc mở <a id="sonic-mobile-link" href="/sonic" target="_blank" style="color:#58a6ff;">trang Mobile /sonic</a> để mang ĐT ra chỗ lắp Camera!
             </div>
 
             <div id="wifi-Wait-banner" style="padding:6px 10px; border-radius:6px; background:rgba(47,129,247,0.15); border:1px solid #2f81f7; color:#58a6ff; font-size:12px;">
-              🔄 Hub đang tự động quét mạng LAN ngầm mỗi 4 giây để đón camera kết nối...
+              🔄 Nhập UID + Wi-Fi rồi bấm <b>"🔊 Nạp Wi-Fi &amp; Tự Động Liên Kết Server"</b> để bắt đầu!
             </div>
           </div>
         </div>
       </div>
 
-      <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
-        <button class="btn" type="button" onclick="playSonicWaveBrowser()" style="border-color:#3fb950; color:#3fb950;">🔊 Phát Sóng Âm Nạp Wi-Fi Ngay</button>
+      <!-- 3-STEP LIVE PROGRESS TRACKER (COMMON TO BOTH MODES) -->
+      <div id="onboard-progress-box" style="display:none; padding:12px; background:#161b22; border:1px solid #2f81f7; border-radius:8px;">
+        <div style="font-weight:700; font-size:13px; color:#e6edf3; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
+          <span id="onboard-progress-title">🚀 Tiến trình Liên Kết WAN P2P &amp; LAN (Fast-Poll 1.2s)</span>
+          <span class="badge" id="onboard-cloud-badge" style="color:#58a6ff; border-color:#2f81f7;">WAITING_FOR_WIFI</span>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:7px; font-size:12.5px;">
+          <div id="onboard-step-1" style="padding:8px 11px; border-radius:6px; background:rgba(47,129,247,0.14); border:1px solid #2f81f7; color:#58a6ff;">
+            <b>Bước 1:</b> 📋 Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P / LAN...
+          </div>
+          <div id="onboard-step-2" style="padding:8px 11px; border-radius:6px; background:#0b0f17; border:1px solid var(--border); color:var(--muted);">
+            <b>Bước 2:</b> 🌐 Chờ Camera vào mạng &amp; báo danh lên P2P Cloud (<code>WAITING_FOR_WIFI</code> → <code>ONLINE_PUNCHING</code>)...
+          </div>
+          <div id="onboard-step-3" style="padding:8px 11px; border-radius:6px; background:#0b0f17; border:1px solid var(--border); color:var(--muted);">
+            <b>Bước 3:</b> 🔗 Server đục lỗ UDP &amp; xác thực (<code>CONNECTED</code>)...
+          </div>
+        </div>
+        <div id="onboard-final-banner" style="display:none; margin-top:10px; padding:10px 12px; border-radius:6px; background:rgba(63,185,80,0.2); border:1px solid #3fb950; color:#3fb950; font-weight:700; font-size:13px;"></div>
+      </div>
+
+      <!-- MODAL FOOTER BUTTONS -->
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; border-top:1px solid var(--border); padding-top:10px;">
+        <button class="btn danger" onclick="closeQrModal()">✖ Đóng</button>
         <div style="display:flex; gap:8px;">
-          <button class="btn" onclick="closeQrModal()">Đóng</button>
-          <button class="btn primary" id="btn-submit-qr" onclick="submitAddCameraByQr()" style="font-weight:600;">➕ Lưu Camera vào Hub & Nạp Wi-Fi</button>
+          <button class="btn primary" id="modal-bottom-link-btn" onclick="startOneClickOnboarding(false)" style="font-weight:700;">
+            🔗 Liên Kết Server Ngay
+          </button>
+          <button class="btn primary" id="modal-bottom-unbox-btn" onclick="startOneClickOnboarding(true)" style="display:none; background:linear-gradient(135deg,#238636,#2ea043); border-color:#3fb950; font-weight:700;">
+            🔊 Nạp Wi-Fi &amp; Liên Kết Ngay
+          </button>
         </div>
       </div>
+    </div>
+  </div>
+</div>
     </div>
   </div>
 </div>
@@ -2558,7 +3396,10 @@ function renderCameraCards() {
         <div class="cam-video-wrap" onclick="openFocusModal('${c.uid}')">
           <img id="img-${c.uid}" src="/api/camera/${c.uid}/snapshot.jpg?t=${Date.now()}" alt="${c.room_name}">
           <div class="cam-overlay-top">
-            <span class="room-pill" id="title-${c.uid}">${c.room_name}</span>
+            <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+              <span class="room-pill" id="title-${c.uid}">${c.room_name}</span>
+              <span class="badge" id="mode-${c.uid}">🌐 WAN P2P</span>
+            </div>
             <span class="badge" id="badge-${c.uid}">IDLE</span>
           </div>
         </div>
@@ -2577,7 +3418,7 @@ function renderCameraCards() {
     const sel = document.getElementById('ev-room-filter');
     const curVal = sel.value;
     sel.innerHTML = '<option value="ALL">Tất cả phòng</option>' +
-      camerasData.map(c => `<option value="${c.room_name}">${c.room_name} (${c.ip})</option>`).join('');
+      camerasData.map(c => `<option value="${c.room_name}">${c.room_name} (${c.did || c.formatted_did || c.ip})</option>`).join('');
     sel.value = curVal || 'ALL';
   }
 
@@ -2585,19 +3426,52 @@ function renderCameraCards() {
     const card = document.getElementById('card-' + c.uid);
     if (!card) continue;
     card.className = 'cam-card' + (c.is_recording ? ' recording' : '');
-    const isWaiting = (c.state === 'WAITING_LAN');
+    const isWaiting = (c.state === 'WAITING_LAN' || c.state === 'CONNECTING' || c.state === 'DISCONNECTED');
     const liveFps = (fpsCounters[c.uid] && fpsCounters[c.uid].fps) ? fpsCounters[c.uid].fps : c.fps;
-    const didTag = c.formatted_did ? ` [${c.formatted_did}]` : '';
+    const didStr = c.did || c.formatted_did || c.hw_deviceid || c.short_uid;
+    const ipPort = (c.ip && c.ip !== '0.0.0.0' && c.ip !== 'Chờ Wi-Fi LAN')
+      ? (c.port ? `${c.ip}:${c.port}` : c.ip)
+      : '0.0.0.0:32108';
+    const connMode = (c.connection_mode || 'LAN').toUpperCase();
+
+    const modeBadge = document.getElementById('mode-' + c.uid);
+    if (modeBadge) {
+      if (connMode.includes('RELAY')) {
+        modeBadge.textContent = `☁️ WAN RELAY • ${didStr}`;
+        modeBadge.style.background = 'rgba(163,113,247,0.22)';
+        modeBadge.style.borderColor = 'rgba(163,113,247,0.55)';
+        modeBadge.style.color = '#d2a8ff';
+      } else if (connMode.includes('WAN')) {
+        modeBadge.textContent = `🌐 WAN P2P • ${didStr}`;
+        modeBadge.style.background = 'rgba(47,129,247,0.22)';
+        modeBadge.style.borderColor = 'rgba(47,129,247,0.55)';
+        modeBadge.style.color = '#58a6ff';
+      } else {
+        modeBadge.textContent = `🏠 LAN • ${didStr}`;
+        modeBadge.style.background = 'rgba(63,185,80,0.20)';
+        modeBadge.style.borderColor = 'rgba(63,185,80,0.50)';
+        modeBadge.style.color = '#3fb950';
+      }
+    }
+
     document.getElementById('title-' + c.uid).textContent = isWaiting
-      ? `${c.room_name}${didTag} • Chờ Wi-Fi`
-      : `${c.room_name} (${c.ip}) • ${liveFps} FPS`;
+      ? `${c.room_name} (${ipPort})`
+      : `${c.room_name} (${ipPort}) • ${liveFps} FPS`;
 
     const badge = document.getElementById('badge-' + c.uid);
     if (isWaiting) {
       badge.className = 'badge';
-      badge.style.background = 'rgba(210,153,34,0.25)';
-      badge.style.color = '#f59e0b';
-      badge.textContent = `⏳ CHỜ KẾT NỐI LAN (${c.formatted_did || c.short_uid})`;
+      const cloudSt = c.wan_cloud_status || 'IDLE';
+      if (c.onboarding_active) {
+        badge.style.background = 'rgba(47,129,247,0.28)';
+        badge.style.color = '#58a6ff';
+        badge.style.borderColor = '#2f81f7';
+        badge.textContent = `🚀 KHUI HỘP • ${cloudSt} (${didStr})`;
+      } else {
+        badge.style.background = 'rgba(210,153,34,0.25)';
+        badge.style.color = '#f59e0b';
+        badge.textContent = `⏳ KẾT NỐI ${connMode.replace('_', ' ')} • ${cloudSt}`;
+      }
     } else if (c.is_recording) {
       badge.style.background = '';
       badge.style.color = '';
@@ -2611,8 +3485,8 @@ function renderCameraCards() {
     }
 
     document.getElementById('stat-' + c.uid).textContent = isWaiting
-      ? `UID: ${c.formatted_did || c.hw_deviceid} | RTSP :${c.rtsp_port} | Tự động kết nối khi vào Wi-Fi`
-      : `${c.codec.toUpperCase()} | ${c.kbps} KB/s | Cam ${c.fps}fps | RTSP :${c.rtsp_port} | Clips: ${c.clips_saved}`;
+      ? `UID: ${didStr} | ${ipPort} | RTSP :${c.rtsp_port} | Đang bắt tay ${connMode.replace('_', ' ')}`
+      : `${didStr} (${ipPort}) | ${c.codec.toUpperCase()} | ${c.kbps} KB/s | Cam ${c.fps}fps | RTSP :${c.rtsp_port} | Clips: ${c.clips_saved}`;
 
     const mbtn = document.getElementById('mbtn-' + c.uid);
     if (mbtn) {
@@ -2622,7 +3496,9 @@ function renderCameraCards() {
 
     if (focusUid === c.uid) {
       document.getElementById('focus-info').innerHTML =
-        `<b>IP:</b> ${c.ip}<br><b>RTSP:</b> <code>${c.rtsp_url}</code><br>` +
+        `<b>UID (DID):</b> <code>${didStr}</code><br>` +
+        `<b>Chế độ:</b> ${connMode} (<code>${ipPort}</code>)<br>` +
+        `<b>RTSP:</b> <code>${c.rtsp_url}</code><br>` +
         `<b>Bitrate:</b> ${c.kbps} KB/s (${c.fps} fps)<br>` +
         `<b>Bộ đệm RAM:</b> ${c.ram_buffer_kb} KB<br>` +
         `<b>Trạng thái:</b> ${c.is_recording ? '🔴 Đang ghi chuyển động' : '🟢 Đang chờ trên RAM (0 ghi đĩa)'}`;
@@ -2801,9 +3677,61 @@ async function saveSettings() {
 // =========================================================================
 
 let wifiPollTimer = null;
+let onboardFastPollTimer = null;
 let lastAddedUid = null;
+let hostCurrentSsid = '';
+let hostCurrentBssid = '';
+let currentModalTab = 'link';
 
-function openQrModal(prefillDid = '', prefillRoom = '') {
+function switchModalTab(mode) {
+  currentModalTab = mode;
+  stopSonicWave();
+  const btnLink = document.getElementById('modal-tab-link');
+  const btnUnbox = document.getElementById('modal-tab-unbox');
+  const descLink = document.getElementById('modal-desc-link');
+  const descUnbox = document.getElementById('modal-desc-unbox');
+  const step2 = document.getElementById('modal-unbox-step-2');
+  const actLink = document.getElementById('modal-action-link');
+  const bottomLink = document.getElementById('modal-bottom-link-btn');
+  const bottomUnbox = document.getElementById('modal-bottom-unbox-btn');
+  const pBox = document.getElementById('onboard-progress-box');
+  if (pBox) pBox.style.display = 'none';
+
+  if (mode === 'link') {
+    if (btnLink) {
+      btnLink.style.color = '#58a6ff';
+      btnLink.style.borderBottom = '3px solid #1f6feb';
+    }
+    if (btnUnbox) {
+      btnUnbox.style.color = 'var(--muted)';
+      btnUnbox.style.borderBottom = '3px solid transparent';
+    }
+    if (descLink) descLink.style.display = 'block';
+    if (descUnbox) descUnbox.style.display = 'none';
+    if (step2) step2.style.display = 'none';
+    if (actLink) actLink.style.display = 'flex';
+    if (bottomLink) bottomLink.style.display = 'inline-block';
+    if (bottomUnbox) bottomUnbox.style.display = 'none';
+  } else {
+    if (btnLink) {
+      btnLink.style.color = 'var(--muted)';
+      btnLink.style.borderBottom = '3px solid transparent';
+    }
+    if (btnUnbox) {
+      btnUnbox.style.color = '#3fb950';
+      btnUnbox.style.borderBottom = '3px solid #238636';
+    }
+    if (descLink) descLink.style.display = 'none';
+    if (descUnbox) descUnbox.style.display = 'block';
+    if (step2) step2.style.display = 'block';
+    if (actLink) actLink.style.display = 'none';
+    if (bottomLink) bottomLink.style.display = 'none';
+    if (bottomUnbox) bottomUnbox.style.display = 'inline-block';
+    loadHostWifiInfo(false);
+  }
+}
+
+function openQrModal(prefillDid = '', prefillRoom = '', defaultTab = 'link') {
   document.getElementById('qr-modal').classList.add('open');
   const nextIdx = (camerasData ? camerasData.length : 1) + 1;
   const roomInp = document.getElementById('qr-room-input');
@@ -2813,7 +3741,7 @@ function openQrModal(prefillDid = '', prefillRoom = '') {
   } else if (!roomInp.value) {
     roomInp.value = 'Phong_' + (100 + nextIdx);
   }
-  loadHostWifiInfo(false);
+  switchModalTab(defaultTab);
   startWifiWaitPolling();
 }
 
@@ -2824,6 +3752,292 @@ function closeQrModal() {
     clearInterval(wifiPollTimer);
     wifiPollTimer = null;
   }
+  if (onboardFastPollTimer) {
+    clearInterval(onboardFastPollTimer);
+    onboardFastPollTimer = null;
+  }
+}
+
+function onWifiSsidInput() {
+  const ssid = document.getElementById('wifi-ssid-input').value.trim();
+  const bssidInp = document.getElementById('wifi-bssid-input');
+  if (hostCurrentSsid && ssid !== hostCurrentSsid) {
+    bssidInp.value = '';
+  } else if (hostCurrentSsid && ssid === hostCurrentSsid && hostCurrentBssid) {
+    bssidInp.value = hostCurrentBssid;
+  }
+  refreshWifiQrPreview();
+}
+
+function toggleOpticalWifiQrModal() {
+  const box = document.getElementById('optical-wifi-qr-box');
+  const img = document.getElementById('optical-wifi-qr-img');
+  if (box.style.display === 'none') {
+    const ssid = document.getElementById('wifi-ssid-input').value.trim();
+    const pwd = document.getElementById('wifi-pwd-input').value;
+    const bssid = document.getElementById('wifi-bssid-input').value.trim();
+    if (!ssid) {
+      alert('Vui lòng nhập Tên Wi-Fi (2.4GHz) trước khi hiện mã QR quang học!');
+      return;
+    }
+    box.style.display = 'block';
+    fetch('/api/wifi/qr', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ ssid, password: pwd, bssid, format: 'eye4' })
+    }).then(r => r.json()).then(d => {
+      if (d.ok && d.data_url) img.src = d.data_url;
+    }).catch(() => {});
+  } else {
+    box.style.display = 'none';
+  }
+}
+
+async function startOneClickOnboarding(isUnbox = null) {
+  if (isUnbox === null) {
+    isUnbox = (currentModalTab === 'unbox');
+  }
+  const did = document.getElementById('qr-did-input').value.trim();
+  const room = document.getElementById('qr-room-input').value.trim();
+  const camPwd = ((document.getElementById('qr-pwd-input') || {}).value || '888888').trim() || '888888';
+  const ssid = document.getElementById('wifi-ssid-input').value.trim();
+  const wifiPwd = document.getElementById('wifi-pwd-input').value;
+  const wifiBssid = document.getElementById('wifi-bssid-input').value.trim();
+
+  if (!did) {
+    alert('Vui lòng chụp/tải ảnh tem QR hoặc nhập Mã UID trên thân Camera (VD: VSTJ082299RLSXK)!');
+    document.getElementById('qr-did-input').focus();
+    return;
+  }
+  if (isUnbox && !ssid) {
+    alert('Vui lòng nhập Tên mạng Wi-Fi (2.4GHz) tại nơi đặt Camera!');
+    document.getElementById('wifi-ssid-input').focus();
+    return;
+  }
+
+  const btnLink = document.getElementById('btn-modal-link-only');
+  const btnUnbox = document.getElementById('btn-oneclick-onboard');
+  const btmLink = document.getElementById('modal-bottom-link-btn');
+  const btmUnbox = document.getElementById('modal-bottom-unbox-btn');
+  if (btnLink) btnLink.disabled = true;
+  if (btnUnbox) btnUnbox.disabled = true;
+  if (btmLink) btmLink.disabled = true;
+  if (btmUnbox) btmUnbox.disabled = true;
+
+  if (isUnbox) {
+    if (btnUnbox) btnUnbox.textContent = '⏳ Đang đăng ký UID & Tạo sóng âm nạp Wi-Fi...';
+  } else {
+    if (btnLink) btnLink.textContent = '⏳ Đang kích hoạt kết nối WAN P2P & LAN...';
+  }
+
+  const pBox = document.getElementById('onboard-progress-box');
+  const pTitle = document.getElementById('onboard-progress-title');
+  const s1 = document.getElementById('onboard-step-1');
+  const s2 = document.getElementById('onboard-step-2');
+  const s3 = document.getElementById('onboard-step-3');
+  const fBanner = document.getElementById('onboard-final-banner');
+  const cBadge = document.getElementById('onboard-cloud-badge');
+
+  pBox.style.display = 'block';
+  fBanner.style.display = 'none';
+  if (pTitle) {
+    pTitle.textContent = isUnbox
+      ? '🚀 Tiến trình Khui Hộp & Nạp Wi-Fi (Fast-Poll 1.2s)'
+      : '🚀 Tiến trình Liên Kết WAN P2P & LAN (Fast-Poll 1.2s)';
+  }
+  s1.style.cssText = 'padding:8px 11px; border-radius:6px; background:rgba(47,129,247,0.16); border:1px solid #2f81f7; color:#58a6ff;';
+  if (isUnbox) {
+    s1.innerHTML = `<b>Bước 1:</b> 🔊 Đang phát sóng âm nạp Wi-Fi <b>"${ssid}"</b> từ điện thoại/loa sang Camera...`;
+  } else {
+    s1.innerHTML = `<b>Bước 1:</b> 📋 Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P / LAN (180s fast-poll)...`;
+  }
+  s2.style.cssText = 'padding:8px 11px; border-radius:6px; background:#0b0f17; border:1px solid var(--border); color:var(--muted);';
+  s2.innerHTML = '<b>Bước 2:</b> 🌐 Chờ Camera vào mạng &amp; báo danh lên P2P Cloud (<code>WAITING_FOR_WIFI</code> → <code>ONLINE_PUNCHING</code>)...';
+  s3.style.cssText = 'padding:8px 11px; border-radius:6px; background:#0b0f17; border:1px solid var(--border); color:var(--muted);';
+  s3.innerHTML = '<b>Bước 3:</b> 🔗 Server đục lỗ UDP &amp; xác thực (<code>CONNECTED</code>)...';
+
+  try {
+    const res = await fetch('/api/camera/onboard', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        uid: did,
+        room_name: room,
+        cam_password: camPwd,
+        wifi_ssid: isUnbox ? ssid : '',
+        wifi_password: isUnbox ? wifiPwd : '',
+        wifi_bssid: (isUnbox && hostCurrentSsid && ssid === hostCurrentSsid) ? wifiBssid : ''
+      })
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      alert('Lỗi: ' + data.error);
+      return;
+    }
+
+    lastAddedUid = data.uid;
+    document.getElementById('room-Rename-list').dataset.count = '';
+    if (cBadge) cBadge.textContent = data.wan_cloud_status || 'WAITING_FOR_WIFI';
+
+    if (isUnbox && data.qr_data_url) {
+      document.getElementById('optical-wifi-qr-img').src = data.qr_data_url;
+    }
+
+    if (isUnbox && data.wav_data_url) {
+      const player = document.getElementById('sonic-audio-player');
+      player.src = data.wav_data_url;
+      player.currentTime = 0;
+      try {
+        await player.play();
+      } catch (playErr) {
+        console.warn('Autoplay blocked:', playErr);
+      }
+    }
+
+    const banner = document.getElementById('wifi-Wait-banner');
+    if (banner) {
+      banner.style.borderColor = '#3fb950';
+      banner.style.color = '#3fb950';
+      if (isUnbox) {
+        banner.innerHTML =
+          `🔊 <b>Đang phát Sóng Âm Nạp Wi-Fi "${ssid}" cho Camera <code>${data.formatted_did}</code> (${data.room_name})!</b><br>` +
+          `👉 Hãy bật <b>Max Volume (80–100%)</b> và đặt loa Điện thoại sát lỗ Mic của Camera (2–5 cm). Sóng âm sẽ <b>tự động tắt</b> ngay khi Server bắt tay xong!`;
+      } else {
+        banner.innerHTML =
+          `🌐 <b>Đã đăng ký Camera <code>${data.formatted_did}</code> (${data.room_name})!</b><br>` +
+          `Server đang tích cực đục lỗ UDP qua WAN P2P &amp; quét LAN mỗi 1.2s...`;
+      }
+    }
+
+    await pollStatus();
+    if (onboardFastPollTimer) clearInterval(onboardFastPollTimer);
+    onboardFastPollTimer = setInterval(pollOnboardingProgress, 1200);
+  } catch (e) {
+    alert('Lỗi kết nối tới Server: ' + e);
+  } finally {
+    if (btnLink) {
+      btnLink.disabled = false;
+      btnLink.textContent = '🔗 Liên Kết Server Ngay (Không Cần Nạp Wi-Fi)';
+    }
+    if (btnUnbox) {
+      btnUnbox.disabled = false;
+      btnUnbox.textContent = '🔊 Nạp Wi-Fi & Tự Động Liên Kết Server';
+    }
+    if (btmLink) btmLink.disabled = false;
+    if (btmUnbox) btmUnbox.disabled = false;
+  }
+}
+
+async function pollOnboardingProgress() {
+  if (!lastAddedUid) return;
+  await pollStatus();
+  const cam = camerasData.find(c => c.uid === lastAddedUid);
+  if (!cam) return;
+
+  const s1 = document.getElementById('onboard-step-1');
+  const s2 = document.getElementById('onboard-step-2');
+  const s3 = document.getElementById('onboard-step-3');
+  const fBanner = document.getElementById('onboard-final-banner');
+  const cBadge = document.getElementById('onboard-cloud-badge');
+  const cloudSt = cam.wan_cloud_status || 'WAITING_FOR_WIFI';
+  if (cBadge) cBadge.textContent = cloudSt;
+
+  const doneStyle = 'padding:8px 11px; border-radius:6px; background:rgba(63,185,80,0.16); border:1px solid #3fb950; color:#3fb950;';
+  const activeStyle = 'padding:8px 11px; border-radius:6px; background:rgba(47,129,247,0.16); border:1px solid #2f81f7; color:#58a6ff;';
+  const warnStyle = 'padding:8px 11px; border-radius:6px; background:rgba(210,153,34,0.16); border:1px solid #d29922; color:#f0883e;';
+  const pendingStyle = 'padding:8px 11px; border-radius:6px; background:#0b0f17; border:1px solid var(--border); color:var(--muted);';
+
+  // 1. Fully connected
+  if (cam.state === 'CONNECTED' && !cam.auth_failed) {
+    stopSonicWave();
+    if (onboardFastPollTimer) {
+      clearInterval(onboardFastPollTimer);
+      onboardFastPollTimer = null;
+    }
+    if (cBadge) {
+      cBadge.textContent = 'CONNECTED';
+      cBadge.style.color = '#3fb950';
+      cBadge.style.borderColor = '#3fb950';
+    }
+    s1.style.cssText = doneStyle;
+    s1.innerHTML = (currentModalTab === 'unbox')
+      ? '<b>Bước 1:</b> ✅ Đã nạp Wi-Fi từ điện thoại sang Camera (Đã tự động ngắt sóng âm!)'
+      : '<b>Bước 1:</b> ✅ Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P / LAN';
+    s2.style.cssText = doneStyle;
+    s2.innerHTML = '<b>Bước 2:</b> ✅ Camera đã vào mạng &amp; báo danh lên P2P Cloud (<code>CONNECTED</code>)';
+    s3.style.cssText = doneStyle;
+    s3.innerHTML = `<b>Bước 3:</b> ✅ Server đã đục lỗ UDP (<code>${cam.connection_mode}</code>) &amp; xác thực thành công!`;
+
+    fBanner.style.display = 'block';
+    fBanner.innerHTML =
+      `✅ Liên kết hoàn tất! Camera <b>${cam.room_name} (${cam.formatted_did})</b> đã kết nối trực tiếp với Server qua Internet. Bạn có thể xem Live stream ngay!`;
+
+    const wBanner = document.getElementById('wifi-Wait-banner');
+    if (wBanner) {
+      wBanner.style.background = 'rgba(35,134,54,0.25)';
+      wBanner.style.borderColor = '#3fb950';
+      wBanner.style.color = '#3fb950';
+      wBanner.innerHTML = `✅ Liên kết hoàn tất! Camera đã kết nối trực tiếp với Server qua Internet.`;
+    }
+    return;
+  }
+
+  // 2. Auth failed
+  if (cam.auth_failed) {
+    stopSonicWave();
+    s1.style.cssText = doneStyle;
+    s2.style.cssText = doneStyle;
+    s3.style.cssText = warnStyle;
+    s3.innerHTML = '<b>Bước 3:</b> ⚠️ Đã đục lỗ UDP tới Camera nhưng sai Mật khẩu Camera (hãy nhập đúng mật khẩu Camera vào ô Mật khẩu rồi bấm lại)!';
+    return;
+  }
+
+  // 3. Camera is ONLINE on P2P Cloud -> Hole punching actively in progress!
+  if (cloudSt === 'ONLINE_PUNCHING') {
+    s1.style.cssText = doneStyle;
+    s1.innerHTML = (currentModalTab === 'unbox')
+      ? '<b>Bước 1:</b> ✅ Camera đã nhận sóng âm Wi-Fi'
+      : '<b>Bước 1:</b> ✅ Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P';
+    s2.style.cssText = doneStyle;
+    s2.innerHTML = `<b>Bước 2:</b> 🟢 Camera đã ONLINE trên P2P Cloud (Đã bắt được IP &amp; Port công khai)!`;
+    s3.style.cssText = activeStyle;
+    s3.innerHTML = `<b>Bước 3:</b> 🔄 Server đang đục lỗ UDP &amp; bắt tay trực tiếp với Camera (<code>${cam.state}</code>)...`;
+    return;
+  }
+
+  // 4. Camera is OFFLINE on Cloud (WAITING_FOR_WIFI or IDLE)
+  if (cloudSt === 'WAITING_FOR_WIFI' || cloudSt === 'IDLE') {
+    if (currentModalTab === 'unbox') {
+      s1.style.cssText = activeStyle;
+      s1.innerHTML = '<b>Bước 1:</b> 🔊 Đang phát sóng âm nạp Wi-Fi từ điện thoại/loa sang Camera...';
+      s2.style.cssText = warnStyle;
+      s2.innerHTML = '<b>Bước 2:</b> ⏳ Đang phát sóng âm... Chờ Camera nhận sóng âm và online trên P2P Cloud (<code>WAITING_FOR_WIFI</code>)...';
+    } else {
+      s1.style.cssText = doneStyle;
+      s1.innerHTML = '<b>Bước 1:</b> 📋 Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P / LAN';
+      s2.style.cssText = warnStyle;
+      s2.innerHTML = '<b>Bước 2:</b> ⏳ Chờ Camera kết nối Wi-Fi &amp; báo danh lên P2P Cloud (Hiện Camera đang <b>OFFLINE</b> — Hãy chắc chắn Camera đã cắm nguồn và có mạng Wi-Fi/LAN, hoặc chuyển sang tab <b>Khui Hộp Mới</b> để nạp Wi-Fi!)';
+    }
+    s3.style.cssText = pendingStyle;
+    s3.innerHTML = '<b>Bước 3:</b> ⏸ Chờ Bước 2 (Camera phải Online trên P2P Cloud trước khi Server có thể đục lỗ UDP)...';
+    return;
+  }
+
+  // 5. Invalid UID
+  if (cloudSt === 'INVALID_UID') {
+    stopSonicWave();
+    s2.style.cssText = warnStyle;
+    s2.innerHTML = '<b>Bước 2:</b> ❌ Mã UID không hợp lệ hoặc không tồn tại trên hệ thống P2P Cloud!';
+    s3.style.cssText = pendingStyle;
+    s3.innerHTML = '<b>Bước 3:</b> ⏸ Đã dừng kết nối.';
+    return;
+  }
+
+  // 6. Fallback
+  s2.style.cssText = activeStyle;
+  s2.innerHTML = `<b>Bước 2:</b> 🌐 Chờ Camera báo danh lên P2P Cloud (Trạng thái: <code>${cloudSt}</code>)...`;
+  s3.style.cssText = pendingStyle;
+  s3.innerHTML = '<b>Bước 3:</b> ⏸ Chờ Bước 2...';
 }
 
 function startWifiWaitPolling() {
@@ -2833,8 +4047,9 @@ function startWifiWaitPolling() {
     await fetch('/api/camera/scan', { method: 'POST' });
     await pollStatus();
     if (lastAddedUid) {
-      const found = camerasData.find(c => c.uid === lastAddedUid && c.state === 'CONNECTED');
+      const found = camerasData.find(c => c.uid === lastAddedUid && c.state === 'CONNECTED' && !c.auth_failed);
       if (found) {
+        stopSonicWave();
         const banner = document.getElementById('wifi-Wait-banner');
         if (banner) {
           banner.style.background = 'rgba(35,134,54,0.25)';
@@ -2849,11 +4064,14 @@ function startWifiWaitPolling() {
 
 async function loadHostWifiInfo(forceOverwrite = false) {
   const statusEl = document.getElementById('wifi-scan-status');
-  statusEl.textContent = '⏳ Đang quét tên mạng Wi-Fi hiện tại của máy tính...';
+  statusEl.textContent = '⏳ Đang kiểm tra gợi ý Wi-Fi...';
   try {
     const res = await fetch('/api/wifi/info');
     const data = await res.json();
     if (!data.ok) return;
+
+    hostCurrentSsid = data.current_ssid || '';
+    hostCurrentBssid = data.current_bssid || '';
 
     const ssidInp = document.getElementById('wifi-ssid-input');
     const pwdInp = document.getElementById('wifi-pwd-input');
@@ -2869,16 +4087,18 @@ async function loadHostWifiInfo(forceOverwrite = false) {
     if ((forceOverwrite || !ssidInp.value) && data.current_ssid) {
       ssidInp.value = data.current_ssid;
     }
-    if (data.current_bssid) {
+    if (ssidInp.value === data.current_ssid && data.current_bssid) {
       bssidInp.value = data.current_bssid;
+    } else {
+      bssidInp.value = '';
     }
-    if ((forceOverwrite || !pwdInp.value) && data.saved_password) {
+    if ((forceOverwrite || !pwdInp.value) && data.saved_password && ssidInp.value === data.current_ssid) {
       pwdInp.value = data.saved_password;
     }
 
     let msg = data.current_ssid
-      ? `✅ Đã tự động điền mạng Wi-Fi hiện tại: <b>${data.current_ssid}</b>` + (data.saved_password ? ' (đã tự động lấy mật khẩu lưu trên máy — bạn có thể sửa tên mạng hoặc mật khẩu tùy ý).' : ' (vui lòng nhập mật khẩu Wi-Fi).')
-      : 'ℹ️ Hãy nhập tên mạng Wi-Fi (2.4GHz) và mật khẩu của bạn.';
+      ? `✅ Gợi ý Wi-Fi: <b>${data.current_ssid}</b> (Nếu bạn đang mở trên Điện thoại ở nơi khác, hãy sửa thành <b>Tên Wi-Fi 2.4GHz</b> tại nơi lắp Camera).`
+      : 'ℹ️ Hãy nhập Tên mạng Wi-Fi (2.4GHz) và mật khẩu Wi-Fi tại nơi đặt Camera.';
     if (data.camera_hotspots && data.camera_hotspots.length > 0) {
       msg += `<br>📡 <b>Phát hiện Wi-Fi nội bộ của Camera gần đây:</b> <code>${data.camera_hotspots.join(', ')}</code>`;
     }
@@ -2887,7 +4107,7 @@ async function loadHostWifiInfo(forceOverwrite = false) {
       refreshWifiQrPreview(false);
     }
   } catch (e) {
-    statusEl.textContent = 'Không thể tự động quét Wi-Fi: ' + e;
+    statusEl.textContent = 'Hãy nhập Tên mạng Wi-Fi (2.4GHz) và mật khẩu Wi-Fi tại nơi đặt Camera.';
   }
 }
 
@@ -3061,6 +4281,48 @@ window.addEventListener('paste', (ev) => {
   }
 });
 
+function downscaleImageFile(file, maxDim = 1600, quality = 0.85) {
+  return new Promise((resolve) => {
+    if (!file || !file.type || !file.type.startsWith('image/')) {
+      return resolve(file);
+    }
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      let w = img.width;
+      let h = img.height;
+      if (w <= maxDim && h <= maxDim) {
+        return resolve(file);
+      }
+      if (w > h) {
+        h = Math.round((h * maxDim) / w);
+        w = maxDim;
+      } else {
+        w = Math.round((w * maxDim) / h);
+        h = maxDim;
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      canvas.toBlob((blob) => {
+        if (blob) {
+          resolve(blob);
+        } else {
+          resolve(file);
+        }
+      }, 'image/jpeg', quality);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(file);
+    };
+    img.src = url;
+  });
+}
+
 async function handleQrFileSelect(file) {
   if (!file) return;
   const previewWrap = document.getElementById('qr-preview-wrap');
@@ -3071,18 +4333,25 @@ async function handleQrFileSelect(file) {
   const resBox = document.getElementById('qr-decode-result');
   resBox.style.display = 'block';
   resBox.style.borderColor = 'var(--border)';
-  resBox.innerHTML = '⏳ Đang phân tích & giải mã ảnh QR dưới đáy camera...';
-
-  const fd = new FormData();
-  fd.append('file', file);
+  resBox.innerHTML = '⏳ Đang tối ưu dung lượng ảnh & giải mã tem QR...';
 
   try {
+    const uploadBlob = await downscaleImageFile(file, 1600, 0.85);
+    const fd = new FormData();
+    fd.append('file', uploadBlob, 'qr.jpg');
+
     const res = await fetch('/api/camera/decode-qr', { method: 'POST', body: fd });
-    const data = await res.json();
-    if (!data.ok) {
+    if (res.status === 413) {
       resBox.style.background = 'rgba(218,54,51,0.15)';
       resBox.style.borderColor = 'var(--danger)';
-      resBox.innerHTML = `❌ <b>${data.error}</b>`;
+      resBox.innerHTML = '❌ <b>Ảnh quá lớn (413 Request Entity Too Large). Vui lòng thử lại với ảnh nhỏ hơn hoặc nhập mã UID.</b>';
+      return;
+    }
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      resBox.style.background = 'rgba(218,54,51,0.15)';
+      resBox.style.borderColor = 'var(--danger)';
+      resBox.innerHTML = `❌ <b>${data.error || 'Lỗi giải mã ảnh QR'}</b>`;
       return;
     }
     document.getElementById('qr-did-input').value = data.formatted_did;
@@ -3108,20 +4377,29 @@ async function handleQrFileSelect(file) {
 async function submitAddCameraByQr() {
   const did = document.getElementById('qr-did-input').value.trim();
   const room = document.getElementById('qr-room-input').value.trim();
+  const pwd = (document.getElementById('qr-pwd-input') || {}).value || '888888';
   const model = document.getElementById('qr-model-input').value.trim();
   const ip = document.getElementById('qr-ip-input').value.trim();
   if (!did) {
-    alert('Vui lòng tải ảnh chụp tem QR hoặc nhập mã UID trên thân camera (VD: VSTJ-082279-XTJDT)!');
+    alert('Vui lòng tải ảnh chụp tem QR hoặc nhập mã UID trên thân camera (VD: VSTJ082299RLSXK)!');
     return;
   }
   const btn = document.getElementById('btn-submit-qr');
   btn.disabled = true;
-  btn.textContent = '⏳ Đang lưu & tạo mã QR Wi-Fi...';
+  btn.textContent = '⏳ Đang lưu & kết nối WAN P2P / LAN...';
   try {
     const res = await fetch('/api/camera/add', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ device_id: did, room_name: room, model: model, ip: ip })
+      body: JSON.stringify({
+        device_id: did,
+        uid: did,
+        room_name: room,
+        name: room,
+        password: pwd.trim(),
+        model: model,
+        ip: ip
+      })
     });
     const data = await res.json();
     if (!data.ok) {
@@ -3134,11 +4412,11 @@ async function submitAddCameraByQr() {
     refreshWifiQrPreview(true);
     const banner = document.getElementById('wifi-Wait-banner');
     if (banner) {
-      banner.innerHTML = `✅ <b>Đã lưu ${data.room_name} (${data.formatted_did}) lên Grid!</b> Bây giờ hãy đưa mắt Camera quét mã QR bên trái để nạp Wi-Fi <b>${document.getElementById('wifi-ssid-input').value}</b>.`;
+      banner.innerHTML = `✅ <b>Đã thêm ${data.room_name} (${data.formatted_did}) và bắt đầu kết nối WAN P2P (Internet) &amp; LAN!</b> Nếu camera chưa có Wi-Fi, bạn có thể phát sóng âm bên trên để nạp Wi-Fi.`;
     }
   } finally {
     btn.disabled = false;
-    btn.textContent = '➕ Lưu Camera vào Hub & Tạo QR Nạp Wi-Fi';
+    btn.textContent = '➕ Lưu Camera vào Hub & Kết nối WAN P2P / Nạp Wi-Fi';
   }
 }
 
@@ -3187,7 +4465,7 @@ connectStreamWs();
 
 
 def build_web_app(hub: CameraHubApp) -> web.Application:
-    app = web.Application()
+    app = web.Application(client_max_size=64 * 1024 * 1024)
     app.on_startup.append(hub.start_background_tasks)
     app.on_cleanup.append(hub.stop_background_tasks)
 
@@ -3203,8 +4481,11 @@ def build_web_app(hub: CameraHubApp) -> web.Application:
     app.router.add_get("/sonic", hub.handle_mobile_sonic_page)
     app.router.add_post("/api/wifi/qr", hub.handle_wifi_qr)
     app.router.add_post("/api/camera/provision-wifi", hub.handle_provision_wifi)
+    app.router.add_post("/api/camera/onboard", hub.handle_onboard_camera)
     app.router.add_post("/api/camera/decode-qr", hub.handle_decode_qr)
-    app.router.add_post("/api/camera/add", hub.handle_add_camera)
+    app.router.add_post("/api/camera/add", hub.handle_add_camera_qr)
+    app.router.add_post("/api/camera/add-qr", hub.handle_add_camera_qr)
+    app.router.add_post("/api/camera/add_qr", hub.handle_add_camera_qr)
     app.router.add_post("/api/camera/scan", hub.handle_scan_lan)
     app.router.add_delete("/api/camera/{uid}", hub.handle_delete_camera)
     app.router.add_post("/api/camera/{uid}/ptz", hub.handle_ptz)
