@@ -1955,7 +1955,7 @@ class CameraHubApp:
         bssid = request.query.get("bssid") or (info.get("current_bssid") if ssid == info.get("current_ssid") else "") or ""
         uid_q = request.query.get("uid") or request.query.get("did") or ""
         room_q = request.query.get("room_name") or ""
-        mode = request.query.get("mode") or ("combo" if bssid else "ssid")
+        mode = request.query.get("mode") or ("mac" if bssid else "ssid")
         qs = urllib.parse.urlencode({"ssid": ssid or "WiFi", "password": password, "bssid": bssid, "mode": mode})
         wav_url = f"/api/wifi/sonic.wav?{qs}"
 
@@ -2051,7 +2051,7 @@ class CameraHubApp:
         </div>
         <div>
           <label>MAC Router / BSSID (Khuyên dùng):</label>
-          <input id="m-bssid" value="{bssid}" placeholder="VD: 001e hoặc xem đáy router" oninput="updateWavUrl()">
+          <input id="m-bssid" value="{bssid}" placeholder="VD: 001e hoặc xem đáy router" autocapitalize="off" autocomplete="off" oninput="syncModeFromBssid(); updateWavUrl()">
         </div>
       </div>
 
@@ -2192,6 +2192,12 @@ async function decodeQrPhoto(file) {{
   }} catch (e) {{
     msg.textContent = 'Lỗi giải mã QR: ' + e;
   }}
+}}
+
+// Eye4 only ever plays the MAC variant, so pick it as soon as a usable MAC is typed.
+function syncModeFromBssid() {{
+  const hex = ((document.getElementById('m-bssid') || {{}}).value || '').replace(/[^0-9a-fA-F]/g, '');
+  document.getElementById('m-mode').value = hex.length >= 4 ? 'mac' : 'ssid';
 }}
 
 function updateWavUrl() {{
@@ -3147,7 +3153,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             </div>
           </div>
         </div>
-        <input type="hidden" id="wifi-bssid-input" value="">
+        <div style="margin-top:8px;">
+          <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">4 số cuối MAC router, in trên tem đáy router (VD: <code>001e</code>) — nên nhập, đây là cách app Eye4 nạp Wi-Fi:</label>
+          <input type="text" id="wifi-bssid-input" value="" placeholder="VD: 001e (để trống = phát Full SSID, chưa kiểm chứng trên C22S)" style="width:100%;" autocapitalize="off" autocomplete="off" oninput="syncSonicModeFromBssid(); refreshWifiQrPreview()">
+        </div>
 
         <div id="wifi-scan-status" style="color:var(--muted); font-size:11px; margin-top:6px;"></div>
 
@@ -3784,7 +3793,7 @@ function closeQrModal() {
 function onWifiSsidInput() {
   const ssid = document.getElementById('wifi-ssid-input').value.trim();
   const bssidInp = document.getElementById('wifi-bssid-input');
-  if (hostCurrentSsid && ssid !== hostCurrentSsid) {
+  if (hostCurrentSsid && ssid !== hostCurrentSsid && bssidInp.value === hostCurrentBssid) {
     bssidInp.value = '';
   } else if (hostCurrentSsid && ssid === hostCurrentSsid && hostCurrentBssid) {
     bssidInp.value = hostCurrentBssid;
@@ -3902,6 +3911,7 @@ async function startOneClickOnboarding(isUnbox = null) {
     lastAddedUid = data.uid;
     document.getElementById('room-Rename-list').dataset.count = '';
     if (cBadge) cBadge.textContent = data.wan_cloud_status || 'WAITING_FOR_WIFI';
+    let autoplayBlocked = false;
 
     if (isUnbox && data.qr_data_url) {
       document.getElementById('optical-wifi-qr-img').src = data.qr_data_url;
@@ -3915,6 +3925,9 @@ async function startOneClickOnboarding(isUnbox = null) {
         await player.play();
       } catch (playErr) {
         console.warn('Autoplay blocked:', playErr);
+        autoplayBlocked = true;
+        const qrBox = document.getElementById('wifi-qr-box');
+        if (qrBox) qrBox.style.display = 'grid';
       }
     }
 
@@ -3922,9 +3935,14 @@ async function startOneClickOnboarding(isUnbox = null) {
     if (banner) {
       banner.style.borderColor = '#3fb950';
       banner.style.color = '#3fb950';
-      if (isUnbox) {
+      if (isUnbox && autoplayBlocked) {
+        banner.style.borderColor = '#d29922';
+        banner.style.color = '#f0883e';
         banner.innerHTML =
-          `🔊 <b>Đang phát Sóng Âm Nạp Wi-Fi "${ssid}" cho Camera <code>${data.formatted_did}</code> (${data.room_name})!</b><br>` +
+          `⚠️ <b>Trình duyệt đã chặn tự phát âm thanh.</b> Hãy bấm nút ▶ trên thanh phát âm bên dưới để bắt đầu phát sóng âm (chế độ: <b>${data.mode || ''}</b>).`;
+      } else if (isUnbox) {
+        banner.innerHTML =
+          `🔊 <b>Đang phát Sóng Âm Nạp Wi-Fi "${ssid}" cho Camera <code>${data.formatted_did}</code> (${data.room_name})!</b> (chế độ: <b>${data.mode || ''}</b>)<br>` +
           `👉 Hãy bật <b>Max Volume (80–100%)</b> và đặt loa Điện thoại sát lỗ Mic của Camera (2–5 cm). Sóng âm sẽ <b>tự động tắt</b> ngay khi Server bắt tay xong!`;
       } else {
         banner.innerHTML =
@@ -4113,7 +4131,8 @@ async function loadHostWifiInfo(forceOverwrite = false) {
     }
     if (ssidInp.value === data.current_ssid && data.current_bssid) {
       bssidInp.value = data.current_bssid;
-    } else {
+    } else if (hostCurrentBssid && bssidInp.value === hostCurrentBssid) {
+      // Only drop a value we auto-filled ourselves; never wipe a MAC the user typed.
       bssidInp.value = '';
     }
     if ((forceOverwrite || !pwdInp.value) && data.saved_password && ssidInp.value === data.current_ssid) {
@@ -4138,6 +4157,13 @@ async function loadHostWifiInfo(forceOverwrite = false) {
 function toggleWifiPwdVis() {
   const inp = document.getElementById('wifi-pwd-input');
   inp.type = (inp.type === 'password') ? 'text' : 'password';
+}
+
+// Eye4 only ever plays the MAC variant, so pick it as soon as a usable MAC is typed.
+function syncSonicModeFromBssid() {
+  const hex = document.getElementById('wifi-bssid-input').value.replace(/[^0-9a-fA-F]/g, '');
+  const sel = document.getElementById('wifi-qr-fmt');
+  if (sel) sel.value = hex.length >= 4 ? 'mac' : 'ssid';
 }
 
 let qrDebounce = null;
