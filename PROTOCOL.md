@@ -409,21 +409,35 @@ GET /audiostream.cgi?streamid=10&loginuse=admin&loginpas=888888&user=admin&pwd=8
 GET /set_factory_param.cgi?alarm_server=http://host:port&loginuse=admin&loginpas=888888&user=admin&pwd=888888&
 ```
 
-**Control and settings** (all verified against VSTJ firmware 48.82.230.19 unless marked):
+**Control and settings** (verified against live VSTJ firmware `48.82.230.19` and `48.82.230.12`):
 
 | CGI | Purpose |
 |-----|---------|
 | `decoder_control.cgi?command=N&onestep=0/1` | PTZ. 0/2/4/6 = up/down/left/right, +1 = stop; 90–93 = diagonals; 25 = center; 26/27 = vertical patrol start/stop; 28/29 = horizontal patrol start/stop; 30+2k / 31+2k = set / go to preset k (0-based, 16 presets) |
-| `camera_control.cgi?param=P&value=V` | 1 brightness, 2 contrast, 8 saturation, 9 hue (0–255); 24 mic volume, 25 speaker volume (0–31); 3 mains frequency; 5 flip (0 normal, 1 flip, 2 mirror, 3 both); 14 IR-cut; 18 OSD |
-| `get_camera_params.cgi` | Image state: `vbright`, `vcontrast`, `vhue`, `vsaturation`, `flip`, `mode`, `ircut`, `involume`, `outvolume`, `enc_*`, `MainStreamWidth/Height` |
-| `get_misc.cgi` / `set_misc.cgi` | `ptz_patrol_rate` (+ `_up/_down/_left/_right_rate`), `ptz_center_onstart`, `preset_onstart`, `ptruntimes`, `led_mode`, `osdenable` |
-| `get_params.cgi` | Everything else: network, Wi-Fi, users, NTP/timezone, `alarm_motion_armed`, `alarm_motion_sensitivity`, schedules |
-| `get_record.cgi` | Encoder + SD recording settings |
-| `trans_cmd_string.cgi?cmd=2127&command=1` | Human tracking state (`enable`, `track_status`); `command=0&enable=0/1` to set (set form not verified) |
-| `trans_cmd_string.cgi?cmd=2126&command=1` | Humanoid frame state (`bHumanoidFrame`, `sensitive`); `command=0&bHumanoidFrame=0/1` to set (set form not verified) |
-| `get_alarm.cgi` | **Not supported** on this firmware (`cgi="not support"`) |
+| `camera_control.cgi?param=P&value=V` | 1 brightness, 2 contrast, 8 saturation, 9 hue (0–255); 24 mic volume, 25 speaker volume (0–31); 3 mains frequency (`0`=50Hz, `1`=60Hz); 5 flip (`0` normal, `1` vertical, `2` mirror, `3` 180°); 14 IR-cut (`0` day/off, `1` auto, `2` forced night B&W); 18 OSD (note: `.19` ignores `param=18&value=0`, use `set_misc.cgi?osdenable=0/1`) |
+| `get_camera_params.cgi` | Image, audio & stream summary: `vbright`, `vcontrast`, `vhue`, `vsaturation`, `flip`, `mode`, `ircut`, `involume`, `outvolume`, `speed`, `enc_*`, `MainStreamWidth/Height` |
+| `get_misc.cgi` / `set_misc.cgi` | Writable: `osdenable`, `led_mode` (0/1/2), `ptz_patrol_rate` (+ `_up/_down/_left/_right_rate`, 1–10), `ptz_center_onstart` (0/1). Read-only on C22S: `preset_onstart`, `ptruntimes`, `ptz_disppreset`, `ptz_soft_limit_max_level/vert`, `ptz_soft_limit_stop_percent_*` |
+| `get_params.cgi` | Core config (174 keys): LAN IP/DHCP/DNS/port, Wi-Fi STA credentials, users (`user1..3_*`), NTP/timezone (`tz` POSIX inverted seconds, e.g. `-28800` = UTC+8), `alarm_motion_armed`, `alarm_motion_sensitivity` (1–10), `motion_plan1..21`, `alarm_schedule_*`, DDNS/Mail/FTP/PPPoE/`dev2..9_*`, `rtsp_auth_enable`, `onvif_support_enable` |
+| `get_record.cgi` | Main/Sub/Sub2 video encoder config + SD recording settings & `record_schedule_*` (`set_recordsch.cgi` is accepted, `set_record.cgi` is `not support`) |
+| `get_rtsp.cgi` / `set_rtsp.cgi` | RTSP server config: `rtspenable` (0/1), `rtspport` (`10554`), `rtspuser`, `rtsppwd` (writable via `set_rtsp.cgi?rtspenable=...&rtspport=...`) |
+| `get_onvif.cgi` / `set_onvif.cgi` | ONVIF service toggle: `onvifenable` (0/1, writable via `set_onvif.cgi?onvifenable=0/1`) |
+| `get_factory_param.cgi` | Factory cloud/push servers (`factory_server`, `factory_alarmserver`, `factory_heatbeat`, `support_pigeon_push`, `support_cloud_storage`, `production_order`, `shipment_order`) |
+| `get_login.cgi` / `check_user.cgi` | Current logged-in user/privilege (`loginuser`, `pri=255`) and concurrent P2P session count (`current_users` / `max_support_users=4`) |
+| `get_wifi_scan_result.cgi` / `get_record_file.cgi` / `get_log.cgi` | Cached Wi-Fi AP scan list, SD file pagination, and device log buffer |
+| `set_alarm.cgi` / `set_datetime.cgi` / `set_media.cgi` / `set_ddns.cgi` / `set_network.cgi` | Additional verified writable CGI handlers returning `result=ok` |
+| `trans_cmd_string.cgi?cmd=2016&command=1` | Lens/aspect parameter (`ratio`) |
+| `trans_cmd_string.cgi?cmd=2017&command=11&mark=123456&type=T` | 21-slot timing plans: `T=1` `motion_record_plan*`; `T=2` `motion_push_plan*` (`.19`) / `T=4` `record_plan*` (`.19`) or `motion_push_plan*` (`.12`); `T=5` `nurse_plan*`; `T=7` `depart_detect_plan*` (`.19`) |
+| `trans_cmd_string.cgi?cmd=2105&command=1` | Video codec format (`videoFormat`: `1` = H.265) |
+| `trans_cmd_string.cgi?cmd=2112&command=1` | Cry detection enable (`enable=0/1` on `.19`; `command=0&enable=0/1` to set) |
+| `trans_cmd_string.cgi?cmd=2122&command=1` | RTSP over TLS (`tls_enable=0/1`; `command=0&tls_enable=0/1` to set) |
+| `trans_cmd_string.cgi?cmd=2123&command=1` | 18×22 motion detection region bitmask (`md_reign0..17`, 22 bits/row = `4194303`, `.19`) |
+| `trans_cmd_string.cgi?cmd=2126&command=1` | Humanoid detection & framing (`sensitive=0..3`; `bHumanoidFrame=0/1` on `.19` only; `command=0&...` to set) |
+| `trans_cmd_string.cgi?cmd=2127&command=1` | Human tracking (`enable=0/1`, `track_status`; `command=0&enable=0/1` to set) |
+| `trans_cmd_string.cgi?cmd=2136&command=1` | Departure detection time in seconds (`detectTime` on `.19`; `command=0&detectTime=N` to set) |
+| `trans_cmd_string.cgi?cmd=2137&command=1` | Smoke / extended AI alert enable (`enable=0/1` on `.19`; `command=0&enable=0/1` to set) |
+| `get_alarm.cgi` / `get_mirror.cgi` / `get_preset.cgi` | **Not supported** on this firmware (`cgi="not support"`) |
 
-`get_status.cgi` also reports the model's capability flags: `haveMotor`, `haveMic`, `haveHorn`, `haveTf`, `support_AI`, `support_humanDetect`, `support_humanoidFrame`, `support_motionArea`, `support_cryDetect`, `support_smokeDetect`, `support_departDetect`, `support_pixel_shift`, `support_h264_h265_shift`.
+`get_status.cgi` also reports the model's capability flags: `haveMotor`, `haveMic`, `haveHorn`, `haveTf`, `haveWifi`, `support_AI`, `support_humanDetect`, `support_humanoidFrame`, `support_motionArea`, `support_cryDetect`, `CryDetectEnable`, `support_smokeDetect`, `support_departDetect`, `support_voiceTypedef`, `support_rtspTls`, `support_pixel_shift`, `support_h264_h265_shift`.
 
 ### CGI Responses
 
@@ -433,7 +447,7 @@ Each reply is one message on channel 0, possibly spanning several DRW packets:
 01 0A | id (LE16) | text length (LE16) | 00 01 | text ...
 ```
 
-`id` identifies the CGI being answered: `0x6001` get_status, `0x6002` get_params, `0x6003` get_camera_params, `0x6005` get_misc, `0x6006` get_record, `0x6012` camera_control (`result= 0;` once executed), `0x60D1` trans_cmd_string, `0x0000` unsupported CGI. Continuation packets carry raw text with no header; the message is complete when `text length` bytes have arrived. Replies come back in command order.
+`id` identifies the CGI being answered: `0x6001` `get_status`, `0x6002` `get_params`, `0x6003` `get_camera_params`, `0x6004` `get_log`, `0x6005` `get_misc`, `0x6006` `get_record`, `0x6007` `get_record_file`, `0x6008` `get_wifi_scan_result`, `0x6009` `get_factory_param`, `0x600C` `set_alarm`, `0x6012` `camera_control`, `0x6013` `set_datetime`, `0x6014` `set_media`, `0x6016` `set_ddns`, `0x6017` `set_misc`, `0x601F` `get_login`, `0x6021` `set_network`, `0x6029` `set_recordsch`, `0x602D` `set_rtsp`, `0x60A0` `check_user`, `0x60AA` `get_rtsp`, `0x60AB` `get_onvif`, `0x60AC` `set_onvif`, `0x60D1` `trans_cmd_string`, `0x0000` unsupported CGI. Continuation packets carry raw text with no header; the message is complete when `text length` bytes have arrived. Replies come back in command order.
 
 Responses contain key=value pairs like:
 ```

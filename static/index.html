@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>C22S Camera Hub &amp; Smart NVR</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/v4/css/tokens.css">
+  <link rel="stylesheet" href="/static/v4/css/layout.css">
+  <link rel="stylesheet" href="/static/v4/css/components.css">
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Sticky Tactical Command Topbar -->
+    <header class="topbar">
+      <div class="brand-group">
+        <div class="brand-mark">
+          <div class="brand-logo">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"/>
+              <rect x="2" y="6" width="14" height="12" rx="2"/>
+            </svg>
+          </div>
+          <span>C22S Camera Hub</span>
+        </div>
+        <div class="health-strip">
+          <span class="badge" id="hdr-cam-count">0 Camera</span>
+          <span class="badge warn" id="hdr-ws-status"><span class="status-dot"></span><span>Connecting WS</span></span>
+          <span class="badge mono hide-mobile" id="hdr-storage">RAM 0 MB · 0 clip</span>
+        </div>
+      </div>
+
+      <nav class="nav-tabs" role="tablist" aria-label="Chế độ chính">
+        <button type="button" class="tab-btn active" data-tab="live" role="tab" aria-selected="true">
+          <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></svg>
+          <span>Live Grid</span>
+        </button>
+        <button type="button" class="tab-btn" data-tab="events" role="tab" aria-selected="false">
+          <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 3v18"/><path d="M3 7.5h4"/><path d="M3 12h18"/><path d="M3 16.5h4"/><path d="M17 3v18"/><path d="M17 7.5h4"/><path d="M17 16.5h4"/></svg>
+          <span>Sự kiện</span>
+        </button>
+        <button type="button" class="tab-btn" data-tab="settings" role="tab" aria-selected="false">
+          <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></svg>
+          <span>Cài đặt Hub</span>
+        </button>
+      </nav>
+
+      <div class="topbar-actions">
+        <button type="button" class="btn success" id="btn-open-qr">
+          <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
+          <span>Thêm Camera</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="app-main">
+      <!-- TAB 1: LIVE GRID -->
+      <section class="view-section active" id="tab-live">
+        <div class="grid-toolbar">
+          <div class="grid-toolbar-left">
+            <button type="button" class="btn sm" id="btn-scan-lan">
+              <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19.07 4.93A10 10 0 0 0 6.99 3.34"/><path d="M4 6h.01"/><path d="M2.29 9.62A10 10 0 1 0 21.31 8.35"/><path d="M16.24 7.76A6 6 0 1 0 8.23 16.67"/><path d="M12 18h.01"/><path d="M17.99 11.66A6 6 0 0 1 15.77 16.67"/><circle cx="12" cy="12" r="2"/><path d="m13.41 10.59 5.66-5.66"/></svg>
+              <span>Quét LAN</span>
+            </button>
+            <a class="btn sm" href="/sonic" target="_blank" rel="noopener">
+              <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg>
+              <span>Mở trên ĐT (/sonic)</span>
+            </a>
+          </div>
+          <div class="grid-toolbar-right">
+            <label class="toolbar-label hide-mobile" for="grid-cols">Bố cục:</label>
+            <select id="grid-cols" class="hide-mobile" aria-label="Số cột lưới camera">
+              <option value="auto">Tự động</option>
+              <option value="2">2 Cột</option>
+              <option value="3">3 Cột</option>
+              <option value="4">4 Cột</option>
+            </select>
+            <label class="toolbar-label" for="grid-fps">Độ mượt WS:</label>
+            <select id="grid-fps" aria-label="Tốc độ khung hình lưới Live">
+              <option value="25" selected>25 FPS (Real-time)</option>
+              <option value="12">12 FPS (Tiết kiệm)</option>
+              <option value="5">5 FPS (Nhẹ mạng)</option>
+            </select>
+          </div>
+        </div>
+        <div class="cam-grid" id="cam-grid"></div>
+      </section>
+
+      <!-- TAB 2: RECORDED EVENTS -->
+      <section class="view-section" id="tab-events">
+        <div class="events-toolbar">
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+            <label class="toolbar-label" for="ev-room-filter">Phòng:</label>
+            <select id="ev-room-filter">
+              <option value="ALL">Tất cả phòng</option>
+            </select>
+            <label class="toolbar-label" for="ev-date-filter">Ngày:</label>
+            <select id="ev-date-filter">
+              <option value="ALL">Tất cả ngày</option>
+            </select>
+            <label class="toolbar-label" for="ev-trigger-filter">Loại:</label>
+            <select id="ev-trigger-filter">
+              <option value="ALL">Tất cả kích hoạt</option>
+              <option value="PFRAME">Chuyển động AI</option>
+              <option value="HW_ALARM">Cảnh báo Camera</option>
+              <option value="MANUAL">Ghi thủ công</option>
+              <option value="TEST">Ghi nhanh</option>
+            </select>
+            <span class="badge mono" id="ev-count-badge">0 clip</span>
+          </div>
+          <button type="button" class="btn sm" id="ev-refresh-btn">
+            <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
+            <span>Làm mới</span>
+          </button>
+        </div>
+        <div id="events-container" style="margin-top:14px;"></div>
+        <div id="ev-load-sentinel" style="height:1px;" aria-hidden="true"></div>
+        <div id="ev-load-more-wrap" style="display:none; justify-content:center; margin-top:18px;">
+          <button type="button" class="btn" id="ev-load-more-btn">Xem thêm clip</button>
+        </div>
+      </section>
+
+      <!-- TAB 3: HUB SETTINGS & NETWORK DIAGNOSTICS -->
+      <section class="view-section" id="tab-settings">
+        <div class="settings-grid">
+          <div class="card-panel">
+            <div class="panel-heading">
+              <span class="panel-heading-title">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+                <span>Ghi hình thông minh &amp; Lưu trữ NVR</span>
+              </span>
+            </div>
+            <div class="form-row">
+              <div>
+                <label for="set-preroll">Pre-roll Buffer trong RAM (giây)</label>
+                <div class="form-hint">Số giây ghi ngược trước khi phát hiện chuyển động.</div>
+              </div>
+              <input id="set-preroll" type="number" min="2" max="60" style="width:92px;">
+            </div>
+            <div class="form-row">
+              <div>
+                <label for="set-postroll">Post-roll sau khi hết chuyển động (giây)</label>
+              </div>
+              <input id="set-postroll" type="number" min="3" max="120" style="width:92px;">
+            </div>
+            <div class="form-row">
+              <div>
+                <label for="set-sens">Độ nhạy P-Frame Spike (1.3 = rất nhạy, 4.0 = ít nhạy)</label>
+                <div class="form-hint">Ngưỡng kích thước P-frame đột biến so với trung bình trượt.</div>
+              </div>
+              <input id="set-sens" type="number" step="0.1" min="1.2" max="10" style="width:92px;">
+            </div>
+            <div class="form-row">
+              <div>
+                <label for="set-pframe-cd">Thời gian nghỉ sau mỗi clip P-Frame (giây)</label>
+                <div class="form-hint">Chống tách nhiều clip liên tiếp; không chặn AI Camera (HW Alarm).</div>
+              </div>
+              <input id="set-pframe-cd" type="number" step="1" min="0" max="300" style="width:92px;">
+            </div>
+            <div class="form-row">
+              <label for="set-pframe-en">Kích hoạt ghi bằng P-Frame Spike AI</label>
+              <input id="set-pframe-en" type="checkbox">
+            </div>
+            <div class="form-row">
+              <div>
+                <label for="set-auto-25fps">Tự động ép 25 FPS khi kết nối</label>
+                <div class="form-hint">Tự gửi <code>set_media.cgi</code> lên camera đang chạy 15fps sau khi handshake.</div>
+              </div>
+              <input id="set-auto-25fps" type="checkbox">
+            </div>
+            <div class="form-row">
+              <label for="set-maxgb">Dung lượng clip tối đa (GB)</label>
+              <input id="set-maxgb" type="number" min="1" max="2000" style="width:92px;">
+            </div>
+            <div class="form-row">
+              <label for="set-freegb">Chừa trống ổ đĩa tối thiểu (GB)</label>
+              <input id="set-freegb" type="number" min="1" max="500" style="width:92px;">
+            </div>
+            <div style="margin-top:14px; display:flex; justify-content:flex-end;">
+              <button type="button" class="btn primary" id="btn-save-hub-settings">Lưu &amp; Áp dụng ngay</button>
+            </div>
+          </div>
+
+          <div class="card-panel">
+            <div class="panel-heading">
+              <span class="panel-heading-title">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
+                <span>Quản lý Phòng &amp; Vòng đời Camera</span>
+              </span>
+            </div>
+            <div id="room-Rename-list"></div>
+          </div>
+
+          <div class="card-panel full-span">
+            <div class="panel-heading">
+              <span class="panel-heading-title">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>
+                <span>Chẩn đoán Mạng, WAN P2P &amp; Độ tin cậy Kênh lệnh</span>
+              </span>
+              <button type="button" class="btn sm" id="btn-refresh-diag" title="Cập nhật chỉ số RTT và kết nối mới nhất">
+                <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
+                <span>Làm mới</span>
+              </button>
+            </div>
+            <div class="diag-table-wrap">
+              <table class="diag-table">
+                <thead>
+                  <tr>
+                    <th>Camera / DID</th>
+                    <th>Đường truyền &amp; IP</th>
+                    <th>RTT</th>
+                    <th>Luồng Video</th>
+                    <th>Trạng thái &amp; DRW Retx</th>
+                    <th style="text-align:right;">Tác vụ</th>
+                  </tr>
+                </thead>
+                <tbody id="net-diag-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- MODAL 1: FOCUS & PTZ WORKBENCH -->
+  <div class="modal-backdrop" id="focus-modal" role="dialog" aria-modal="true" aria-labelledby="focus-title">
+    <div class="modal-box focus-modal-box">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <strong id="focus-title" style="font-size:15px;">Camera</strong>
+          <span class="badge ok mono" id="focus-fps-badge">0 FPS Live</span>
+        </div>
+        <div class="modal-header-actions">
+          <button type="button" class="btn sm" id="focus-rec20-btn">Ghi nhanh</button>
+          <button type="button" class="btn sm" id="focus-fit-btn" title="Chuyển giữa vừa khung (Contain) và tràn khung (Cover)">Vừa / Tràn</button>
+          <button type="button" class="btn sm" id="focus-snap-btn" title="Chụp & tải ảnh hiện tại">Chụp ảnh</button>
+          <button type="button" class="btn sm" id="focus-settings-btn" title="Mở trình đọc 27 CGI đầy đủ">27 CGI</button>
+          <button type="button" class="btn sm" id="focus-fs-btn" title="Toàn màn hình">Fullscreen</button>
+        </div>
+        <button type="button" class="btn sm danger modal-close-pin" id="focus-close-btn">Đóng</button>
+      </div>
+
+      <div class="focus-body">
+        <div class="focus-stage-wrap">
+          <div class="focus-stage" id="focus-stage">
+            <img id="focus-img" alt="Luồng xem trực tiếp Camera">
+            <div class="focus-stage-toast" id="ptz-status"></div>
+          </div>
+          <div class="focus-stage-hud">
+            <span class="mono" id="focus-hud-meta">—</span>
+            <span class="mono" id="focus-info">—</span>
+          </div>
+        </div>
+
+        <aside class="ptz-sidebar">
+          <div class="ptz-subtabs" role="tablist">
+            <button type="button" class="ptz-subtab-btn active" data-ptz-tab="ptz">Xoay &amp; Góc nhớ</button>
+            <button type="button" class="ptz-subtab-btn" data-ptz-tab="image">Hình &amp; AI</button>
+            <button type="button" class="ptz-subtab-btn" data-ptz-tab="sys">Mạng &amp; CGI</button>
+          </div>
+          <div class="ptz-conn-banner" id="ptz-conn-banner" style="display:none;" role="status">
+            <div class="ptz-conn-text" id="ptz-conn-text"></div>
+            <div class="ptz-conn-actions" id="ptz-conn-actions"></div>
+          </div>
+
+          <!-- Subtab 1: PTZ & Presets -->
+          <div class="ptz-tab-pane active" id="ptz-pane-ptz">
+            <div class="ptz-group">
+              <div class="ptz-group-title">Điều khiển Xoay PTZ (Chạm = nhích · Giữ / Phím mũi tên = xoay)</div>
+              <div class="dpad">
+                <button type="button" class="btn" data-ptz="leftup" aria-label="Lên trái">↖</button>
+                <button type="button" class="btn" data-ptz="up" aria-label="Lên">▲</button>
+                <button type="button" class="btn" data-ptz="rightup" aria-label="Lên phải">↗</button>
+                <button type="button" class="btn" data-ptz="left" aria-label="Trái">◀</button>
+                <button type="button" class="btn" id="ptz-center-btn" title="Về tâm / Patrol Home" aria-label="Về tâm">●</button>
+                <button type="button" class="btn" data-ptz="right" aria-label="Phải">▶</button>
+                <button type="button" class="btn" data-ptz="leftdown" aria-label="Xuống trái">↙</button>
+                <button type="button" class="btn" data-ptz="down" aria-label="Xuống">▼</button>
+                <button type="button" class="btn" data-ptz="rightdown" aria-label="Xuống phải">↘</button>
+              </div>
+              <div class="ptz-btn-row" style="justify-content:center;">
+                <button type="button" class="btn sm" id="ptz-hscan-btn">Quét ngang</button>
+                <button type="button" class="btn sm" id="ptz-vscan-btn">Quét dọc</button>
+                <button type="button" class="btn sm danger" id="ptz-stop-btn">Dừng khẩn cấp</button>
+              </div>
+              <div class="sl-row" style="margin-top:4px;">
+                <span class="sl-label">Tốc độ xoay</span>
+                <input id="sl-ptzspeed" type="range" min="1" max="10" value="5">
+                <span class="sl-val" id="val-ptzspeed">5</span>
+              </div>
+            </div>
+
+            <div class="ptz-group">
+              <div class="ptz-group-title">16 Góc nhớ nhanh (Presets)</div>
+              <div class="preset-grid" id="preset-grid"></div>
+              <div class="ptz-btn-row" style="margin-top:4px;">
+                <select id="ptz-preset" style="flex:1;">
+                  <option value="1">Góc 1</option><option value="2">Góc 2</option><option value="3">Góc 3</option><option value="4">Góc 4</option>
+                  <option value="5">Góc 5</option><option value="6">Góc 6</option><option value="7">Góc 7</option><option value="8">Góc 8</option>
+                  <option value="9">Góc 9</option><option value="10">Góc 10</option><option value="11">Góc 11</option><option value="12">Góc 12</option>
+                  <option value="13">Góc 13</option><option value="14">Góc 14</option><option value="15">Góc 15</option><option value="16">Góc 16</option>
+                </select>
+                <button type="button" class="btn sm primary" id="ptz-preset-go-btn">Gọi</button>
+                <button type="button" class="btn sm" id="ptz-preset-save-btn">Lưu đè</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Subtab 2: Image, Audio & AI -->
+          <div class="ptz-tab-pane" id="ptz-pane-image">
+            <div class="ptz-group">
+              <div class="ptz-group-title">Hồng ngoại, Lật hình &amp; Tốc độ khung hình</div>
+              <div class="ptz-btn-row">
+                <button type="button" class="btn sm" id="btn-ir-1" data-cam-act="ir_auto">IR Tự động</button>
+                <button type="button" class="btn sm" id="btn-ir-2" data-cam-act="ir_on">Bật IR</button>
+                <button type="button" class="btn sm" id="btn-ir-0" data-cam-act="ir_off">Tắt IR</button>
+              </div>
+              <div class="ptz-btn-row">
+                <button type="button" class="btn sm" id="btn-flip-0" data-cam-act="flip_normal">Chuẩn</button>
+                <button type="button" class="btn sm" id="btn-flip-3" data-cam-act="flip_vh">Lật 180°</button>
+                <button type="button" class="btn sm" id="btn-flip-1" data-cam-act="flip_v">Lật dọc</button>
+                <button type="button" class="btn sm" id="btn-flip-2" data-cam-act="flip_h">Gương</button>
+              </div>
+              <div class="ptz-btn-row">
+                <button type="button" class="btn sm" id="btn-osd-1" data-cam-act="osd_on">Hiện OSD</button>
+                <button type="button" class="btn sm" id="btn-osd-0" data-cam-act="osd_off">Ẩn OSD</button>
+                <button type="button" class="btn sm" id="btn-hz-0" data-cam-act="hz_50">50Hz</button>
+                <button type="button" class="btn sm" id="btn-hz-1" data-cam-act="hz_60">60Hz</button>
+              </div>
+              <div class="ptz-btn-row">
+                <span style="font-size:11.5px; color:var(--text-muted); margin-right:2px;">FPS Camera:</span>
+                <button type="button" class="btn sm" id="btn-camfps-15" data-cam-act="enc_framerate" data-cam-val="15">15</button>
+                <button type="button" class="btn sm" id="btn-camfps-20" data-cam-act="enc_framerate" data-cam-val="20">20</button>
+                <button type="button" class="btn sm" id="btn-camfps-25" data-cam-act="enc_framerate" data-cam-val="25">25</button>
+                <button type="button" class="btn sm" id="btn-camfps-30" data-cam-act="enc_framerate" data-cam-val="30">30</button>
+              </div>
+            </div>
+
+            <div class="ptz-group">
+              <div class="ptz-group-title">Cảm biến ảnh &amp; Âm thanh 2 chiều</div>
+              <div class="sl-row"><span class="sl-label">Độ sáng</span><input id="sl-brightness" type="range" min="0" max="255" value="128"><span class="sl-val" id="val-brightness">128</span></div>
+              <div class="sl-row"><span class="sl-label">Tương phản</span><input id="sl-contrast" type="range" min="0" max="255" value="128"><span class="sl-val" id="val-contrast">128</span></div>
+              <div class="sl-row"><span class="sl-label">Bão hòa</span><input id="sl-saturation" type="range" min="0" max="255" value="128"><span class="sl-val" id="val-saturation">128</span></div>
+              <div class="sl-row"><span class="sl-label">Micro</span><input id="sl-mic" type="range" min="0" max="31" value="24"><span class="sl-val" id="val-mic">24</span></div>
+              <div class="sl-row"><span class="sl-label">Loa</span><input id="sl-speaker" type="range" min="0" max="31" value="24"><span class="sl-val" id="val-speaker">24</span></div>
+            </div>
+
+            <div class="ptz-group">
+              <div class="ptz-group-title">AI Theo dõi, Khung người &amp; Đèn trạng thái</div>
+              <div class="sl-row"><span class="sl-label">Nhạy CĐ</span><input id="sl-motion" type="range" min="1" max="10" value="5"><span class="sl-val" id="val-motion">5</span></div>
+              <div class="ptz-btn-row">
+                <button type="button" class="btn sm" id="btn-led-1" data-cam-act="led_mode" data-cam-val="1">Bật LED</button>
+                <button type="button" class="btn sm" id="btn-led-0" data-cam-act="led_mode" data-cam-val="0">Tắt LED</button>
+              </div>
+              <div class="ptz-btn-row">
+                <span style="font-size:11.5px; color:var(--text-muted);">Bám người:</span>
+                <button type="button" class="btn sm" id="btn-track-1" data-cam-act="track_on">Bật</button>
+                <button type="button" class="btn sm" id="btn-track-0" data-cam-act="track_off">Tắt</button>
+              </div>
+              <div class="ptz-btn-row">
+                <span style="font-size:11.5px; color:var(--text-muted);">Khung người:</span>
+                <button type="button" class="btn sm" id="btn-hf-1" data-cam-act="humanframe_on">Bật</button>
+                <button type="button" class="btn sm" id="btn-hf-0" data-cam-act="humanframe_off">Tắt</button>
+              </div>
+              <div class="ptz-btn-row" id="row-human-sens" style="display:none;">
+                <span style="font-size:11.5px; color:var(--text-muted);">Độ nhạy AI:</span>
+                <button type="button" class="btn sm" id="btn-hsens-0" data-cam-act="human_sensitive" data-cam-val="0">Tắt</button>
+                <button type="button" class="btn sm" id="btn-hsens-1" data-cam-act="human_sensitive" data-cam-val="1">Thấp</button>
+                <button type="button" class="btn sm" id="btn-hsens-2" data-cam-act="human_sensitive" data-cam-val="2">TB</button>
+                <button type="button" class="btn sm" id="btn-hsens-3" data-cam-act="human_sensitive" data-cam-val="3">Cao</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Subtab 3: System, Params & Raw CGI -->
+          <div class="ptz-tab-pane" id="ptz-pane-sys">
+            <div class="ptz-group">
+              <div class="ptz-group-title">Tác vụ hệ thống &amp; Mạng P2P</div>
+              <div class="ptz-btn-row">
+                <button type="button" class="btn sm" id="focus-opt-p2p-btn">Tối ưu P2P</button>
+                <button type="button" class="btn sm" id="focus-wifi-btn">Đổi Wi-Fi</button>
+                <button type="button" class="btn sm" id="focus-pwd-btn">Đổi mật khẩu</button>
+                <button type="button" class="btn sm danger" id="focus-reboot-btn">Khởi động lại</button>
+              </div>
+            </div>
+
+            <div class="ptz-group">
+              <div class="ptz-group-title" style="justify-content:space-between;">
+                <span>Năng lực &amp; Thông số trực tiếp</span>
+                <button type="button" class="btn sm primary" id="focus-load-params-btn">Đọc từ camera</button>
+              </div>
+              <div id="cam-caps" style="display:flex; flex-wrap:wrap; gap:4px;"></div>
+              <input id="cam-params-filter" type="search" placeholder="Lọc key / giá trị..." style="width:100%;">
+              <div class="cam-params" id="cam-params"></div>
+            </div>
+
+            <div class="ptz-group">
+              <div class="ptz-group-title">Raw CGI Debug Console</div>
+              <div style="display:flex; gap:6px;">
+                <input id="raw-cgi" type="text" placeholder="get_camera_params.cgi" style="flex:1; font-family:var(--font-mono); font-size:12px;">
+                <button type="button" class="btn sm primary" id="raw-cgi-send-btn">Gửi</button>
+              </div>
+              <pre id="raw-cgi-out" class="mono" style="display:none; max-height:150px; overflow:auto; padding:8px; background:var(--bg-canvas); border:1px solid var(--border-subtle); border-radius:var(--radius-sm); font-size:11px; margin:0; white-space:pre-wrap; word-break:break-word;"></pre>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 2: 27-CGI CAMERA SETTINGS INSPECTOR -->
+  <div class="modal-backdrop" id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-box settings-modal-box">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <strong id="settings-title" style="font-size:15px;">Setting Camera</strong>
+          <span class="badge info" id="settings-conn-badge">P2P</span>
+          <span class="badge ok" id="settings-fw-badge" style="display:none;">FW</span>
+        </div>
+        <button type="button" class="btn sm danger" id="settings-close-btn">Đóng</button>
+      </div>
+
+      <div class="set-toolbar">
+        <div class="set-toolbar-row">
+          <button type="button" class="btn primary" id="btn-read-cam-settings">Đọc setting hiện tại của camera</button>
+          <input id="settings-filter" type="search" placeholder="Lọc tên setting, key CGI hoặc giá trị..." style="flex:1 1 200px; min-width:0;">
+          <button type="button" class="btn sm" id="settings-expand-btn">+ Mở hết</button>
+          <button type="button" class="btn sm" id="settings-collapse-btn">— Thu gọn</button>
+          <button type="button" class="btn sm" id="btn-copy-settings" disabled>Copy JSON</button>
+        </div>
+        <div id="settings-status" style="font-size:12px; color:var(--text-muted);"></div>
+      </div>
+
+      <div class="set-workspace">
+        <nav class="set-rail" id="settings-cat-rail" style="display:none;" aria-label="Nhóm cấu hình camera"></nav>
+        <div class="set-body" id="settings-content"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 3: ONBOARDING & WI-FI PROVISIONING WIZARD -->
+  <div class="modal-backdrop" id="qr-modal" role="dialog" aria-modal="true" aria-labelledby="qr-modal-title">
+    <div class="modal-box qr-modal-box">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <strong id="qr-modal-title" style="font-size:15px;">Thêm Camera &amp; Cấp Wi-Fi Thông minh</strong>
+        </div>
+        <button type="button" class="btn sm danger" id="qr-close-btn">Đóng</button>
+      </div>
+
+      <div class="qr-modal-scroll">
+        <div class="wizard-tabs">
+          <button type="button" class="wizard-tab-btn active" data-wiz-tab="link">Nhánh 1: Gán nhanh Camera đang chạy</button>
+          <button type="button" class="wizard-tab-btn" data-wiz-tab="unbox">Nhánh 2: Khui hộp Camera mới (Cấp Wi-Fi)</button>
+        </div>
+        <div id="qr-wiz-subtitle" style="font-size:12.5px; color:var(--text-muted);"></div>
+
+        <div class="wizard-card">
+          <div class="qr-dropzone" id="qr-dropzone">
+            <div style="font-weight:700; font-size:13px; color:var(--text-primary);">Kéo thả, chọn ảnh hoặc nhấn Ctrl+V dán ảnh Tem QR đáy camera</div>
+            <div style="font-size:11.5px; color:var(--text-muted); margin-top:3px;">Hoặc gõ trực tiếp mã UID (VD: <code>VSTJ-082299-RLSXK</code>) vào ô bên dưới</div>
+            <input id="qr-file-input" type="file" accept="image/*" style="display:none;">
+          </div>
+
+          <div class="qr-fields-grid">
+            <div>
+              <label class="field-label" for="qr-did-input">Mã UID / DID Camera</label>
+              <input id="qr-did-input" type="text" placeholder="VSTJ082299RLSXK" style="width:100%; font-family:var(--font-mono);">
+            </div>
+            <div>
+              <label class="field-label" for="qr-room-input">Tên phòng</label>
+              <input id="qr-room-input" type="text" placeholder="Phòng khách" style="width:100%;">
+            </div>
+            <div>
+              <label class="field-label" for="qr-pwd-input">Mật khẩu Camera</label>
+              <div style="display:flex; gap:4px;">
+                <input id="qr-pwd-input" type="password" value="888888" placeholder="888888" style="flex:1; min-width:0;">
+                <button type="button" class="btn sm icon-btn" id="qr-pwd-eye" aria-label="Hiện/ẩn mật khẩu Camera">
+                  <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>
+                </button>
+              </div>
+            </div>
+            <div>
+              <label class="field-label" for="qr-ip-input">IP (Tuỳ chọn)</label>
+              <input id="qr-ip-input" type="text" placeholder="Auto P2P" style="width:100%;">
+            </div>
+          </div>
+
+          <details style="font-size:12px; color:var(--text-muted);">
+            <summary style="cursor:pointer;">Tùy chọn tài khoản quản trị camera (nếu không phải admin)</summary>
+            <div style="margin-top:8px; max-width:260px;">
+              <label class="field-label" for="qr-user-input">Username</label>
+              <input id="qr-user-input" type="text" value="admin" style="width:100%;">
+            </div>
+          </details>
+        </div>
+
+        <!-- Branch 2 Only: Wi-Fi 2.4GHz & Sonic Wave Controls -->
+        <div class="wizard-card" id="wiz-unbox-wifi-sec" style="display:none;">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+            <strong style="font-size:13px;">Cấu hình Wi-Fi 2.4GHz cho Camera</strong>
+            <button type="button" class="btn sm" id="btn-refresh-wifi-info">Quét Wi-Fi quanh Hub</button>
+          </div>
+          <div id="wifi-ssid-chips" style="display:flex; gap:5px; flex-wrap:wrap;"></div>
+
+          <div class="wifi-fields-grid">
+            <div>
+              <label class="field-label" for="wifi-ssid-input">Tên Wi-Fi 2.4GHz (SSID)</label>
+              <input id="wifi-ssid-input" type="text" placeholder="Nhập chính xác SSID 2.4GHz..." style="width:100%;">
+            </div>
+            <div>
+              <label class="field-label" for="wifi-pwd-input">Mật khẩu Wi-Fi</label>
+              <div style="display:flex; gap:4px;">
+                <input id="wifi-pwd-input" type="password" placeholder="Bỏ trống nếu mạng mở" style="flex:1; min-width:0;">
+                <button type="button" class="btn sm icon-btn" id="wifi-pwd-eye" aria-label="Hiện/ẩn mật khẩu Wi-Fi">
+                  <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <details style="font-size:12px; color:var(--text-muted);">
+            <summary style="cursor:pointer;">Tùy chọn nâng cao (BSSID Router &amp; Chế độ mã hóa Sonic Wave)</summary>
+            <div class="wifi-fields-grid" style="margin-top:8px;">
+              <div>
+                <label class="field-label" for="wifi-bssid-input">MAC Router (BSSID 2.4GHz)</label>
+                <input id="wifi-bssid-input" type="text" placeholder="aa:bb:cc:dd:ee:ff" style="width:100%; font-family:var(--font-mono);">
+              </div>
+              <div>
+                <label class="field-label" for="sonic-mode-select">Chuẩn phát Sonic Wave</label>
+                <select id="sonic-mode-select" style="width:100%;">
+                  <option value="mac">MAC + SSID Hash (Eye4 chuẩn)</option>
+                  <option value="ssid">SSID thuần</option>
+                  <option value="both">Gửi cả 2 pha</option>
+                </select>
+              </div>
+            </div>
+          </details>
+        </div>
+
+        <!-- Primary Action Bars -->
+        <div id="wiz-link-actions" style="display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap;">
+          <button type="button" class="btn primary lg" id="btn-link-camera-submit">Gán &amp; Kết nối P2P ngay</button>
+        </div>
+
+        <div id="wiz-unbox-actions" style="display:none; gap:8px; flex-wrap:wrap; align-items:center; justify-content:space-between;">
+          <div style="display:flex; gap:6px; flex-wrap:wrap;">
+            <button type="button" class="btn sm" id="btn-sonic-browser">Phát Loa Trình duyệt</button>
+            <button type="button" class="btn sm" id="btn-sonic-pc">Phát Loa Server</button>
+            <button type="button" class="btn sm" id="btn-wifi-qr">Tạo QR Quang học</button>
+            <button type="button" class="btn sm" id="btn-wifi-cgi">Đẩy CGI trực tiếp</button>
+          </div>
+          <button type="button" class="btn success lg" id="btn-onboard-unbox">1-Click Khui hộp &amp; Nạp Wi-Fi</button>
+        </div>
+
+        <div id="qr-status-line" style="display:none; font-size:12.5px; font-weight:600; padding:8px 12px; border-radius:var(--radius-sm); background:var(--bg-inset); border:1px solid var(--border-subtle);"></div>
+
+        <!-- Audio + Optical QR + Mobile Handoff -->
+        <div class="wizard-card" id="sonic-output-panel" style="display:none;">
+          <strong style="font-size:13px;">Sóng âm Sonic Wave &amp; Mã QR Quang học</strong>
+          <audio id="sonic-audio" controls style="width:100%; height:36px;"></audio>
+          <div id="wifi-qr-box" style="display:none; flex-direction:column; align-items:center; gap:6px; padding:10px; background:#fff; border-radius:var(--radius-sm);">
+            <img id="wifi-qr-preview" alt="QR Wi-Fi Camera" style="width:200px; height:200px; object-fit:contain;">
+            <span style="color:#0f172a; font-size:12px; font-weight:700;">Giơ mã QR này trước mắt camera cách 15–25cm</span>
+          </div>
+          <div class="sonic-qr-layout" id="mobile-sonic-handoff" style="display:none;">
+            <div style="background:#fff; padding:8px; border-radius:var(--radius-sm); display:flex; justify-content:center;">
+              <img id="mobile-sonic-qr-img" alt="Mở /sonic trên điện thoại" style="width:148px; height:148px;">
+            </div>
+            <div style="display:flex; flex-direction:column; gap:6px; min-width:0;">
+              <strong style="font-size:13px;">Phát sóng âm bằng Điện thoại gần Camera</strong>
+              <span style="font-size:12px; color:var(--text-muted);">Quét mã QR bên trái bằng Camera điện thoại để mở trang <code>/sonic</code> và áp sát loa vào camera.</span>
+              <a id="mobile-sonic-url" href="#" target="_blank" rel="noopener" class="mono" style="font-size:11.5px; color:var(--accent-text); word-break:break-all;">—</a>
+              <div>
+                <button type="button" class="btn sm" id="btn-copy-mobile-url">Copy link /sonic</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Live 180s Progress -->
+        <div class="wizard-card" id="onboard-progress-card" style="display:none;">
+          <strong style="font-size:13px;">Tiến trình kết nối Camera (Tối đa 180s)</strong>
+          <div class="step-item" id="ob-step-1">1. <span class="ob-step-text">Lưu UID lên Hub...</span></div>
+          <div class="step-item" id="ob-step-2">2. <span class="ob-step-text">Chờ camera nhận Wi-Fi / P2P...</span></div>
+          <div class="step-item" id="ob-step-3">3. <span class="ob-step-text">Bắt tay &amp; mở luồng Live...</span></div>
+          <div id="ob-live-msg" class="mono" style="font-size:11.5px; color:var(--text-muted);"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL 4: RECORDED CLIP PLAYBACK -->
+  <div class="modal-backdrop" id="play-modal" role="dialog" aria-modal="true" aria-labelledby="play-title">
+    <div class="modal-box play-modal-box">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <strong id="play-title" style="font-size:14.5px;">Xem lại sự kiện</strong>
+          <div class="segmented-group">
+            <button type="button" class="seg-btn play-speed-btn" data-speed="0.5">0.5x</button>
+            <button type="button" class="seg-btn play-speed-btn active" data-speed="1">1x</button>
+            <button type="button" class="seg-btn play-speed-btn" data-speed="1.5">1.5x</button>
+            <button type="button" class="seg-btn play-speed-btn" data-speed="2">2x</button>
+          </div>
+        </div>
+        <div class="modal-header-actions">
+          <a class="btn sm" id="play-dl" href="#" download>Tải MP4</a>
+          <button type="button" class="btn sm danger" id="play-close-btn">Đóng</button>
+        </div>
+      </div>
+      <div class="play-stage">
+        <video id="play-video" controls playsinline preload="metadata"></video>
+        <div class="play-loading" id="play-loading" style="display:none;">Đang nạp video...</div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/static/v4/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Mobile Onboarding — C22S Camera Hub</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/v4/css/tokens.css">
+  <link rel="stylesheet" href="/static/v4/css/components.css">
+  <!--SONIC_INIT_JSON-->
+  <style>
+    body {
+      padding: 12px 12px 28px;
+      background: var(--bg-canvas);
+    }
+    .mobile-shell {
+      max-width: 540px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .mobile-topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+    }
+    .mobile-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .mobile-field-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    @media (max-width: 460px) {
+      .mobile-field-row {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+    input[type="text"],
+    input[type="password"],
+    select {
+      font-size: 16px;
+      min-height: 40px;
+      width: 100%;
+    }
+    .qr-scan-label {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 12px;
+      border: 2px dashed var(--border-default);
+      border-radius: var(--radius-md);
+      background: var(--bg-inset);
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 13.5px;
+      color: var(--accent-text);
+    }
+  </style>
+</head>
+<body>
+  <div class="mobile-shell">
+    <header class="mobile-topbar">
+      <div style="display:flex; align-items:center; gap:8px; min-width:0;">
+        <a class="btn sm" href="/" aria-label="Quay về Dashboard">
+          <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>
+          <span>Hub</span>
+        </a>
+        <strong style="font-size:14.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Thêm Camera trên ĐT</strong>
+      </div>
+      <span class="badge info">Sonic + QR</span>
+    </header>
+
+    <div class="wizard-tabs">
+      <button type="button" class="wizard-tab-btn active" id="tab-btn-link">
+        <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+        <span>Gán Camera đã chạy</span>
+      </button>
+      <button type="button" class="wizard-tab-btn" id="tab-btn-unbox">
+        <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>
+        <span>Khui hộp (Nạp Wi-Fi)</span>
+      </button>
+    </div>
+
+    <div class="mobile-card">
+      <label class="qr-scan-label" for="m-qr-file">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="5" height="5" x="3" y="3" rx="1"/><rect width="5" height="5" x="16" y="3" rx="1"/><rect width="5" height="5" x="3" y="16" rx="1"/><path d="M21 16h-3a2 2 0 0 0-2 2v3"/><path d="M21 21v.01"/><path d="M12 7v3a2 2 0 0 1-2 2H7"/></svg>
+        <span>Chụp / Chọn ảnh Tem QR dưới đáy Camera</span>
+        <input id="m-qr-file" type="file" accept="image/*" capture="environment" style="display:none;">
+      </label>
+
+      <div>
+        <label class="field-label" for="m-uid">Mã UID Camera</label>
+        <input id="m-uid" type="text" placeholder="VSTJ082299RLSXK" style="font-family:var(--font-mono);">
+      </div>
+
+      <div class="mobile-field-row">
+        <div>
+          <label class="field-label" for="m-room">Tên phòng</label>
+          <input id="m-room" type="text" placeholder="VD: Phòng khách">
+        </div>
+        <div>
+          <label class="field-label" for="m-campwd">Mật khẩu Camera</label>
+          <div style="display:flex; gap:6px;">
+            <input id="m-campwd" type="password" value="888888" style="flex:1;">
+            <button type="button" class="btn icon-btn" id="m-campwd-eye" aria-label="Hiện/ẩn mật khẩu Camera" style="min-height:40px; min-width:40px;">
+              <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Branch 2: Unbox & Wi-Fi Sonic -->
+      <div id="m-unbox-wifi-section" style="display:none; flex-direction:column; gap:10px; border-top:1px solid var(--border-subtle); padding-top:12px;">
+        <div>
+          <label class="field-label" for="m-ssid">Tên Wi-Fi 2.4GHz (SSID)</label>
+          <input id="m-ssid" type="text" placeholder="Tên mạng Wi-Fi...">
+        </div>
+        <div>
+          <label class="field-label" for="m-pwd">Mật khẩu Wi-Fi</label>
+          <div style="display:flex; gap:6px;">
+            <input id="m-pwd" type="password" placeholder="Bỏ trống nếu mạng mở" style="flex:1;">
+            <button type="button" class="btn icon-btn" id="m-pwd-eye" aria-label="Hiện/ẩn mật khẩu Wi-Fi" style="min-height:40px; min-width:40px;">
+              <svg class="icon icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <details style="font-size:12.5px; color:var(--text-muted);">
+          <summary style="cursor:pointer;">Tùy chọn nâng cao (BSSID Router &amp; Mode Sonic)</summary>
+          <div style="display:flex; flex-direction:column; gap:8px; margin-top:8px;">
+            <div>
+              <label class="field-label" for="m-bssid">BSSID Router (MAC 2.4GHz)</label>
+              <input id="m-bssid" type="text" placeholder="aa:bb:cc:dd:ee:ff" style="font-family:var(--font-mono);">
+            </div>
+            <div>
+              <label class="field-label" for="m-mode">Chuẩn mã hóa âm thanh</label>
+              <select id="m-mode">
+                <option value="mac">MAC + SSID Hash</option>
+                <option value="ssid">SSID thuần</option>
+                <option value="both">Gửi cả 2 pha</option>
+              </select>
+            </div>
+          </div>
+        </details>
+
+        <div style="display:flex; flex-direction:column; gap:8px; padding:10px; background:var(--bg-inset); border:1px solid var(--border-subtle); border-radius:var(--radius-sm);">
+          <div style="font-size:12px; color:var(--text-secondary); font-weight:600;">Trình phát sóng âm Sonic (bật max loa, kê sát mic camera)</div>
+          <audio id="m-audio" controls style="width:100%; height:40px;"></audio>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button type="button" class="btn sm" id="m-btn-play-audio" style="flex:1;">Phát lại sóng âm</button>
+            <button type="button" class="btn sm" id="m-btn-stop-audio">Dừng âm</button>
+            <button type="button" class="btn sm" id="m-btn-opt-qr" style="flex:1;">Hiện QR Quang học</button>
+          </div>
+          <div id="m-opt-qr-wrap" style="display:none; flex-direction:column; align-items:center; gap:6px; padding:10px; background:#fff; border-radius:var(--radius-sm);">
+            <img id="m-opt-qr-img" alt="QR Wi-Fi" style="width:220px; height:220px; object-fit:contain;">
+            <span style="color:#0f172a; font-size:12px; font-weight:700;">Giơ mã QR này trước camera 15–25cm</span>
+          </div>
+        </div>
+      </div>
+
+      <button type="button" class="btn primary lg" id="m-btn-link">Gán Camera lên Hub ngay</button>
+      <button type="button" class="btn success lg" id="m-btn-onboard" style="display:none;">1-Click Khui hộp &amp; Phát sóng âm</button>
+
+      <div id="m-status" style="display:none; padding:9px 11px; border-radius:var(--radius-sm); background:var(--bg-inset); border:1px solid var(--border-subtle); font-size:13px; font-weight:600;"></div>
+    </div>
+
+    <div class="mobile-card" id="m-steps" style="display:none;">
+      <strong style="font-size:13.5px;">Tiến trình kết nối Camera</strong>
+      <div class="step-item" id="m-st-1">1. Lưu UID lên Hub</div>
+      <div class="step-item" id="m-st-2">2. Phát Sonic / Đục lỗ P2P</div>
+      <div class="step-item" id="m-st-3">3. Camera Online &amp; Stream Live</div>
+    </div>
+  </div>
+
+  <script type="module" src="/static/v4/js/sonic.js"></script>
+</body>
+</html>

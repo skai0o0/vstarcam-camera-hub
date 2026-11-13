@@ -27,7 +27,38 @@ from typing import Awaitable, Callable, Deque, Dict, List, Optional, Tuple
 
 from eye4_rtsp_proxy import FFMPEG_BIN, FRAME_I
 
+try:
+    import cv2
+    import numpy as np
+    HAS_CV2 = True
+except ImportError:
+    cv2 = None
+    np = None
+    HAS_CV2 = False
+
 log = logging.getLogger("eye4.recorder")
+
+
+def make_compact_jpeg_thumb(raw_jpg: bytes, max_width: int = 480, quality: int = 74) -> bytes:
+    """Downscale a JPEG thumbnail to keep event history fast & light on WAN/mobile."""
+    if not raw_jpg or not HAS_CV2:
+        return raw_jpg
+    try:
+        arr = np.frombuffer(raw_jpg, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return raw_jpg
+        h, w = img.shape[:2]
+        if w <= max_width:
+            return raw_jpg
+        new_h = max(2, int(round(h * (max_width / float(w)))))
+        small = cv2.resize(img, (max_width, new_h), interpolation=cv2.INTER_AREA)
+        ok, enc = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        if ok:
+            return bytes(enc)
+    except Exception:
+        pass
+    return raw_jpg
 
 
 class VideoFrameItem:
@@ -55,11 +86,12 @@ class CameraMotionRecorder:
         uid: str,
         room_name: str,
         recordings_dir: str,
-        pre_roll_sec: float = 10.0,
-        post_roll_sec: float = 10.0,
+        pre_roll_sec: float = 6.0,
+        post_roll_sec: float = 6.0,
         max_clip_sec: float = 300.0,
-        pframe_sensitivity: float = 2.25,
+        pframe_sensitivity: float = 2.8,
         enable_pframe_trigger: bool = True,
+        pframe_cooldown_sec: float = 20.0,
         snapshot_getter: Optional[Callable[[], Awaitable[Optional[bytes]]]] = None,
     ):
         self.uid = uid
@@ -70,6 +102,7 @@ class CameraMotionRecorder:
         self.max_clip_sec = float(max_clip_sec)
         self.pframe_sensitivity = float(pframe_sensitivity)
         self.enable_pframe_trigger = bool(enable_pframe_trigger)
+        self.pframe_cooldown_sec = max(0.0, float(pframe_cooldown_sec))
         self.snapshot_getter = snapshot_getter
 
         # Circular RAM buffer holding (pre_roll_sec + 4s) of frames
@@ -100,6 +133,8 @@ class CameraMotionRecorder:
         self._pframe_ema: float = 0.0
         self._pframe_spike_count: int = 0
         self._warmup_frames: int = 0
+        self._last_saved_end_mono: float = 0.0
+        self._last_clip_finished_mono: float = 0.0
 
         # Telemetry metrics (bitrate & FPS)
         self._stat_window_start: float = time.monotonic()
@@ -120,6 +155,8 @@ class CameraMotionRecorder:
         self._live_in_queue: asyncio.Queue = asyncio.Queue(maxsize=90)
         self._live_starting: bool = False
         self._live_tasks: set = set()
+        self._live_need_keyframe: bool = True
+        self._last_gap_mono: float = 0.0
 
     def set_room_name(self, name: str):
         self.room_name = name.strip() or self.uid[:12]
@@ -191,27 +228,81 @@ class CameraMotionRecorder:
                 pass
         return self.latest_live_jpeg
 
+    def _drain_live_queue(self) -> int:
+        """Discard queued pre-gap frames so the live FFmpeg decoder won't consume stale P-frames."""
+        dropped = 0
+        q = getattr(self, "_live_in_queue", None)
+        if q is not None:
+            while True:
+                try:
+                    q.get_nowait()
+                    dropped += 1
+                except asyncio.QueueEmpty:
+                    break
+        return dropped
+
+    def on_video_gap(self):
+        """Mark an upstream video packet gap/reset so live decoder waits for an intact I-frame."""
+        self._last_gap_mono = time.monotonic()
+        self._live_need_keyframe = True
+        dropped = self._drain_live_queue()
+        if dropped:
+            log.debug("[%s] Video gap: purged %d stale queued frame(s), waiting for clean IDR",
+                      self.room_name, dropped)
+
+    async def _drain_live_stderr(self, proc):
+        """Read FFmpeg stderr asynchronously to avoid pipe blocking and catch POC ref errors."""
+        stderr = getattr(proc, "stderr", None)
+        if stderr is None:
+            return
+        last_warn = 0.0
+        try:
+            while True:
+                line = await stderr.readline()
+                if not line:
+                    break
+                msg = line.decode("utf-8", errors="replace").strip()
+                if not msg:
+                    continue
+                if "Could not find ref with POC" in msg or "co located POCs" in msg:
+                    self._live_need_keyframe = True
+                    self._drain_live_queue()
+                now = time.monotonic()
+                if (now - last_warn) >= 5.0:
+                    last_warn = now
+                    log.warning("[%s] Live FFmpeg stderr: %s", self.room_name, msg[:200])
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
     def _get_prime_bitstream(self) -> bytes:
         """
-        Grab the latest 1-2 GOPs from the RAM Ring Buffer (starting on an I-Frame
-        and ending at the latest P-Frame, at least ~80 KB when available) so FFmpeg
-        completes stream probing in ~35ms and lands on the exact live reference frame.
+        Grab the latest 1-2 unbroken GOPs from the RAM Ring Buffer (starting on an I-Frame
+        after the last packet gap and ending at the latest P-Frame) so FFmpeg
+        completes stream probing quickly on a clean reference frame.
         """
         frames = list(self._ring_buffer)
         if not frames:
+            self._live_need_keyframe = True
             return b""
 
-        iframe_indices = [i for i, f in enumerate(frames) if f.is_iframe]
+        iframe_indices = [
+            i for i, f in enumerate(frames)
+            if f.is_iframe and f.mono_ts > self._last_gap_mono
+        ]
         if not iframe_indices:
+            self._live_need_keyframe = True
             return b""
 
-        # Prefer the latest I-frame; if that slice is < 125KB and an earlier I-frame exists,
+        # Prefer the latest I-frame; if that slice is < 125KB and an earlier clean I-frame exists,
         # include the earlier GOP so FFmpeg's stream probe (~115KB) completes immediately.
         chosen_idx = iframe_indices[-1]
         tail_bytes = sum(len(f.data) for f in frames[chosen_idx:])
         if tail_bytes < 125000 and len(iframe_indices) >= 2:
             chosen_idx = iframe_indices[-2]
 
+        self._live_primed_mono = time.monotonic()
         header = self._build_header_prefix()
         chunks = []
         for f in frames[chosen_idx:]:
@@ -271,9 +362,13 @@ class CameraMotionRecorder:
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
             )
             self._live_proc = proc
+            self._live_need_keyframe = (
+                getattr(self, "_live_primed_mono", 0.0) <= getattr(self, "_last_gap_mono", 0.0)
+            )
+            self._live_stderr_task = asyncio.create_task(self._drain_live_stderr(proc))
             log.info(
                 "[%s] Started real-time 25fps live stream decoder (pid=%d, prime=%.1f KB)",
                 self.room_name, proc.pid, len(prime_bytes) / 1024.0,
@@ -386,6 +481,15 @@ class CameraMotionRecorder:
 
     def trigger_motion(self, reason: str = "MOTION"):
         now_mono = time.monotonic()
+        if (
+            not self.is_recording
+            and reason == "PFRAME_SPIKE"
+            and self.pframe_cooldown_sec > 0
+            and self._last_clip_finished_mono > 0
+            and (now_mono - self._last_clip_finished_mono) < self.pframe_cooldown_sec
+        ):
+            return
+
         now_wall = time.time()
         self.last_motion_mono = now_mono
         self.last_motion_wall = now_wall
@@ -419,17 +523,27 @@ class CameraMotionRecorder:
 
         # 2. Feed live 25fps decoder if active
         if self._live_proc is not None and (now_mono - self._last_viewer_mono) <= self.LIVE_IDLE_TIMEOUT_SEC:
-            header = self._build_header_prefix() if item.is_iframe else b""
-            annexb = self._wrap_annexb(data, header)
-            if self._live_in_queue.full():
-                try:
-                    self._live_in_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            try:
-                self._live_in_queue.put_nowait(annexb)
-            except asyncio.QueueFull:
+            if self._live_need_keyframe and not item.is_iframe:
                 pass
+            else:
+                if item.is_iframe:
+                    self._live_need_keyframe = False
+                header = self._build_header_prefix() if item.is_iframe else b""
+                annexb = self._wrap_annexb(data, header)
+                if self._live_in_queue.full():
+                    while not self._live_in_queue.empty():
+                        try:
+                            self._live_in_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    if not item.is_iframe:
+                        self._live_need_keyframe = True
+                        annexb = b""
+                if annexb:
+                    try:
+                        self._live_in_queue.put_nowait(annexb)
+                    except asyncio.QueueFull:
+                        pass
 
         # 3. P-Frame byte-size spike analysis (0% CPU motion detector)
         if not item.is_iframe:
@@ -440,11 +554,19 @@ class CameraMotionRecorder:
                 alpha = 0.02 if frame_len > self._pframe_ema * 1.4 else 0.08
                 self._pframe_ema = (1.0 - alpha) * self._pframe_ema + alpha * frame_len
 
-            if self.enable_pframe_trigger and self._warmup_frames > 60:
-                threshold = max(self._pframe_ema * self.pframe_sensitivity, self._pframe_ema + 2200, 4800)
+            in_pframe_cooldown = (
+                not self.is_recording
+                and self.pframe_cooldown_sec > 0
+                and self._last_clip_finished_mono > 0
+                and (now_mono - self._last_clip_finished_mono) < self.pframe_cooldown_sec
+            )
+            if in_pframe_cooldown:
+                self._pframe_spike_count = 0
+            elif self.enable_pframe_trigger and self._warmup_frames > 60:
+                threshold = max(self._pframe_ema * self.pframe_sensitivity, self._pframe_ema + 3000, 6500)
                 if frame_len > threshold:
                     self._pframe_spike_count += 1
-                    if self._pframe_spike_count >= 4:
+                    if self._pframe_spike_count >= 8:
                         self._pframe_spike_count = 0
                         self.trigger_motion(reason="PFRAME_SPIKE")
                 else:
@@ -480,7 +602,12 @@ class CameraMotionRecorder:
     ):
         """Extract the last `pre_roll_sec` from the RAM ring buffer (starting on an I-Frame)."""
         self.is_recording = True
-        target_mono = now_mono if split_segment else (now_mono - self.pre_roll_sec)
+        if split_segment:
+            target_mono = now_mono
+        else:
+            target_mono = now_mono - self.pre_roll_sec
+            if self._last_saved_end_mono > 0:
+                target_mono = max(target_mono, self._last_saved_end_mono)
 
         frames_list = list(self._ring_buffer)
         start_idx = 0
@@ -541,6 +668,8 @@ class CameraMotionRecorder:
         if not self.is_recording:
             return
         self.is_recording = False
+        self._last_clip_finished_mono = time.monotonic()
+        self._pframe_spike_count = 0
         frames = self._active_frames
         self._active_frames = []
         self._active_bytes = 0
@@ -549,6 +678,7 @@ class CameraMotionRecorder:
 
         if len(frames) < 5:
             return
+        self._last_saved_end_mono = max(self._last_saved_end_mono, frames[-1].mono_ts)
 
         start_wall = self.record_start_wall
         end_wall = frames[-1].wall_ts
@@ -641,10 +771,20 @@ class CameraMotionRecorder:
             log.warning("[%s] Failed to mux MP4 clip: %s", self.room_name, e)
             return
 
+        if not os.path.exists(mp4_path) or os.path.getsize(mp4_path) < 8192:
+            log.warning("[%s] Discarding corrupt/empty MP4 clip (< 8 KB): %s", self.room_name, os.path.basename(mp4_path))
+            try:
+                if os.path.exists(mp4_path):
+                    os.remove(mp4_path)
+            except OSError:
+                pass
+            return
+
         if thumb_bytes:
             try:
+                compact = make_compact_jpeg_thumb(thumb_bytes, max_width=480, quality=74)
                 with open(jpg_path, "wb") as jf:
-                    jf.write(thumb_bytes)
+                    jf.write(compact)
             except OSError:
                 pass
         else:
@@ -659,8 +799,10 @@ class CameraMotionRecorder:
                     mp4_path,
                     "-frames:v",
                     "1",
+                    "-vf",
+                    "scale=480:-2",
                     "-q:v",
-                    "5",
+                    "7",
                     jpg_path,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
@@ -718,11 +860,18 @@ class StorageManager:
         self.min_free_gb = float(min_free_gb)
         os.makedirs(self.recordings_dir, exist_ok=True)
 
-    def list_events(self, room_filter: Optional[str] = None, date_filter: Optional[str] = None, limit: int = 200) -> List[dict]:
-        events = []
+    def _scan_events(
+        self,
+        room_filter: Optional[str] = None,
+        date_filter: Optional[str] = None,
+        trigger_filter: Optional[str] = None,
+    ) -> Tuple[List[dict], List[str]]:
+        events: List[dict] = []
+        avail_dates = set()
         if not os.path.isdir(self.recordings_dir):
-            return events
+            return events, []
 
+        trig_upper = str(trigger_filter or "ALL").upper()
         for root, _dirs, files in os.walk(self.recordings_dir):
             for fname in files:
                 if not fname.endswith(".json"):
@@ -734,14 +883,50 @@ class StorageManager:
                     if room_filter and room_filter != "ALL":
                         if meta.get("safe_room") != room_filter and meta.get("room_name") != room_filter and meta.get("uid") != room_filter:
                             continue
-                    if date_filter and date_filter != "ALL":
-                        if meta.get("date") != date_filter:
+                    if trig_upper != "ALL":
+                        if trig_upper not in str(meta.get("reason") or "").upper():
                             continue
+                    ev_date = meta.get("date")
+                    if ev_date:
+                        avail_dates.add(ev_date)
+                    if date_filter and date_filter != "ALL" and ev_date != date_filter:
+                        continue
                     events.append(meta)
                 except Exception:
                     continue
 
         events.sort(key=lambda x: x.get("start_ts", 0), reverse=True)
+        return events, sorted(avail_dates, reverse=True)
+
+    def query_events(
+        self,
+        room_filter: Optional[str] = None,
+        date_filter: Optional[str] = None,
+        trigger_filter: Optional[str] = None,
+        offset: int = 0,
+        limit: int = 24,
+    ) -> dict:
+        """Return paginated, filtered event metadata plus available dates."""
+        events, dates = self._scan_events(
+            room_filter=room_filter,
+            date_filter=date_filter,
+            trigger_filter=trigger_filter,
+        )
+        safe_offset = max(0, int(offset))
+        safe_limit = max(1, min(100, int(limit)))
+        page = events[safe_offset : safe_offset + safe_limit]
+        total = len(events)
+        return {
+            "events": page,
+            "total": total,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": (safe_offset + len(page)) < total,
+            "dates": dates,
+        }
+
+    def list_events(self, room_filter: Optional[str] = None, date_filter: Optional[str] = None, limit: int = 200) -> List[dict]:
+        events, _ = self._scan_events(room_filter=room_filter, date_filter=date_filter)
         return events[:limit]
 
     def get_storage_stats(self) -> dict:

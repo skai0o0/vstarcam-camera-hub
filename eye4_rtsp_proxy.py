@@ -723,9 +723,26 @@ _CGI_KV_RE = re.compile(r'([A-Za-z_][\w\.\[\]]*)\s*=\s*(?:"([^"\r\n]*)"|([^;&\r\
 
 # Reliable command channel tuning (PPPP DRW is an ordered, ACKed stream: the
 # camera only executes command index N after it has received every index < N)
-CMD_RTO_INITIAL = 0.25     # first retransmit after 250 ms without an ACK
+CMD_RTO_INITIAL = 0.25     # first retransmit after 250 ms without an ACK (LAN / baseline)
 CMD_RTO_MAX = 1.5          # retransmit backoff cap
 CMD_RETX_BURST = 16        # max packets retransmitted per tick (oldest first)
+UDP_RCVBUF_BYTES = 4 * 1024 * 1024
+UDP_SNDBUF_BYTES = 2 * 1024 * 1024
+
+
+def _configure_udp_socket(sock: Optional[socket.socket]) -> None:
+    """Apply broadcast and enlarged UDP buffers to prevent burst packet drops."""
+    if sock is None:
+        return
+    for opt_name, val in (
+        (socket.SO_BROADCAST, 1),
+        (socket.SO_RCVBUF, UDP_RCVBUF_BYTES),
+        (socket.SO_SNDBUF, UDP_SNDBUF_BYTES),
+    ):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt_name, val)
+        except OSError:
+            pass
 CMD_POLL_BACKLOG = 4       # skip status polls while this many commands are un-ACKed
 CMD_POLL_REPLY_WAIT = 15.0 # don't queue another status poll until the last one was answered
 
@@ -736,9 +753,26 @@ CGI_REPLY_IDS = {
     "get_status.cgi": 0x6001,
     "get_params.cgi": 0x6002,
     "get_camera_params.cgi": 0x6003,
+    "get_log.cgi": 0x6004,
     "get_misc.cgi": 0x6005,
     "get_record.cgi": 0x6006,
+    "get_record_file.cgi": 0x6007,
+    "get_wifi_scan_result.cgi": 0x6008,
+    "get_factory_param.cgi": 0x6009,
+    "set_alarm.cgi": 0x600C,
     "camera_control.cgi": 0x6012,
+    "set_datetime.cgi": 0x6013,
+    "set_media.cgi": 0x6014,
+    "set_ddns.cgi": 0x6016,
+    "set_misc.cgi": 0x6017,
+    "get_login.cgi": 0x601F,
+    "set_network.cgi": 0x6021,
+    "set_recordsch.cgi": 0x6029,
+    "set_rtsp.cgi": 0x602D,
+    "check_user.cgi": 0x60A0,
+    "get_rtsp.cgi": 0x60AA,
+    "get_onvif.cgi": 0x60AB,
+    "set_onvif.cgi": 0x60AC,
     "trans_cmd_string.cgi": 0x60D1,
 }
 CGI_REPLY_UNSUPPORTED = 0x0000   # body: result= 0; cgi="not support";
@@ -873,6 +907,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self.alarm_poll_interval: float = 1.0
         self._last_alarm_status: Optional[int] = None
         self._alarm_poll_task: Optional[asyncio.Task] = None
+        self.video_gap_callback = None  # Called when VideoReassembly drops packets/frames
 
         self.transport: Optional[asyncio.DatagramTransport] = None
         self.cameras: dict[str, CameraInfo] = {}
@@ -920,7 +955,13 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         # the generic list (which includes other users' "super devices") as a fallback.
         self._wan_relay_candidates: set[tuple[str, int]] = set()
         self._wan_relay_fallbacks: set[tuple[str, int]] = set()
+        self._wan_relay_probe_sent: dict[tuple[str, int], float] = {}
+        self._wan_relay_offers: dict[tuple[str, int], tuple[float, int, tuple[str, int], bytes]] = {}
         self._wan_relay_session: Optional[tuple[tuple[str, int], bytes]] = None  # ((ip, port), magic)
+        self._wan_relay_rtt_ms: Optional[float] = None
+        self._wan_list_req_sent: bool = False
+        self._commit_relay_on_offer: bool = False
+        self._cmd_srtt: Optional[float] = None
         self._used_wan_p2p: bool = False
         self._punch_rsp_data: dict[str, bytes] = {}
         self._raw_drw_buffer: list[bytes] = []  # Buffer raw DRW for PSK detection
@@ -1070,8 +1111,13 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                             self._send_relay_port_requests([relay_addr])
                 elif mtype == 0x69:
                     if not self._wan_relay_session and not self.connected:
+                        new_fallbacks = []
                         for relay_addr in wan_p2p.parse_wan_list_req_ack(dec):
+                            if relay_addr not in self._wan_relay_fallbacks:
+                                new_fallbacks.append(relay_addr)
                             self._wan_relay_fallbacks.add(relay_addr)
+                        if new_fallbacks:
+                            self._send_relay_port_requests(new_fallbacks)
                 elif mtype == 0x81 and len(dec) >= 5:
                     log.info("WAN RLY_REQ_ACK from %s:%d — result=0x%02X", ip, port, dec[4])
             return
@@ -1182,13 +1228,21 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
     #   4. RLY_PKT (0x83) to relay:session port -> RLY_RDY (0x84); from then on the relay
     #      forwards DRW traffic both ways as if it were the camera.
 
-    def _send_relay_port_requests(self, relays):
+    def _send_relay_port_requests(self, relays, force: bool = False):
         if not self.transport or self.transport.is_closing():
             return
+        now = asyncio.get_event_loop().time()
         key = self._get_wan_p2p_key()
         hello = wan_p2p.build_wan_rly_hello(key)
         port_req = wan_p2p.build_wan_rly_port(key)
         for relay_addr in relays:
+            if not force:
+                if relay_addr in self._wan_relay_offers:
+                    continue
+                last_sent = self._wan_relay_probe_sent.get(relay_addr, 0.0)
+                if (now - last_sent) < 0.6:
+                    continue
+            self._wan_relay_probe_sent[relay_addr] = now
             try:
                 self.transport.sendto(hello, relay_addr)
                 self.transport.sendto(port_req, relay_addr)
@@ -1212,23 +1266,45 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                 pass
         self.transport.sendto(wan_p2p.build_wan_rly_pkt(magic, cam.bin_did, key), relay_addr)
 
+    def _commit_best_relay(self) -> bool:
+        """Pick the lowest-RTT probed relay offer and send RLY_REQ (0x80) to bind it."""
+        if self._wan_relay_session or self.connected or not self._wan_relay_offers:
+            return False
+        best_addr, best_entry = min(
+            self._wan_relay_offers.items(),
+            key=lambda kv: (kv[1][0] + (15.0 if kv[1][1] else 0.0), kv[1][1], kv[1][0]),
+        )
+        rtt_ms, _fallback_rank, relay_addr, magic = best_entry
+        self._wan_relay_session = (relay_addr, magic)
+        self._wan_relay_targets[relay_addr] = magic
+        self._used_wan_p2p = True
+        self._wan_relay_rtt_ms = rtt_ms
+        self._commit_relay_on_offer = False
+        if self._active_camera:
+            self._active_camera.wan_relay_rtt_ms = round(rtt_ms, 1)
+        log.info("WAN relay %s:%d selected (RTT=%.1fms from %d offers, session=%s) — sending RLY_REQ",
+                 relay_addr[0], best_addr[1], rtt_ms, len(self._wan_relay_offers),
+                 f"{relay_addr[0]}:{relay_addr[1]}")
+        self._send_relay_request()
+        return True
+
     def _handle_relay_port_ack(self, data: bytes, addr: tuple):
-        if self._wan_relay_session or self.connected:
-            return
-        # Prefer server-recommended relays; only fall back to the generic list if there are none.
-        if addr not in self._wan_relay_candidates and self._wan_relay_candidates:
+        if self._wan_relay_session or self.connected or addr in self._wan_relay_offers:
             return
         parsed = wan_p2p.parse_wan_rly_port_ack(p2p_proprietary_decrypt(self._get_wan_p2p_key(), data))
         if not parsed:
             return
         magic, session_port = parsed
+        now = asyncio.get_event_loop().time()
+        t_sent = self._wan_relay_probe_sent.get(addr)
+        rtt_ms = max(0.5, (now - t_sent) * 1000.0) if t_sent else 999.0
+        fallback_rank = 0 if (addr in self._wan_relay_candidates or not self._wan_relay_candidates) else 1
         relay_addr = (addr[0], session_port)
-        self._wan_relay_session = (relay_addr, magic)
-        self._wan_relay_targets[relay_addr] = magic
-        self._used_wan_p2p = True
-        log.info("WAN relay %s:%d allocated session port %d (magic=%s) — sending RLY_REQ",
-                 addr[0], addr[1], session_port, magic.hex())
-        self._send_relay_request()
+        self._wan_relay_offers[addr] = (rtt_ms, fallback_rank, relay_addr, magic)
+        log.info("WAN relay offer %s:%d -> port=%d rtt=%.1fms (rec=%s)",
+                 addr[0], addr[1], session_port, rtt_ms, fallback_rank == 0)
+        if self._commit_relay_on_offer:
+            self._commit_best_relay()
 
     def error_received(self, exc):
         if isinstance(exc, ConnectionResetError) or getattr(exc, "winerror", 0) == 10054:
@@ -1319,6 +1395,10 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self._drw_addr = addr
         self._drw_port = addr[1]
         if self._active_camera:
+            if getattr(self._active_camera, "connection_mode", "") != "WAN_RELAY":
+                self._active_camera.wan_relay_rtt_ms = None
+            elif self._wan_relay_rtt_ms is not None:
+                self._active_camera.wan_relay_rtt_ms = round(self._wan_relay_rtt_ms, 1)
             if (self._active_camera.connection_mode in ("WAN_P2P", "WAN_RELAY")
                     or self._used_wan_p2p
                     or self._active_camera.ip in ("0.0.0.0", "Chờ Wi-Fi LAN", "")):
@@ -1347,14 +1427,15 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         if channel not in self._pending_acks:
             self._pending_acks[channel] = []
         self._pending_acks[channel].append(index)
-        # Flush when we have enough indices or for command channel (ACK immediately)
-        if channel == 0 or len(self._pending_acks[channel]) >= 16:
+        # Flush promptly for media channels so WAN cameras don't retransmit before ACKs arrive;
+        # command channel still flushes immediately.
+        if channel == 0 or len(self._pending_acks[channel]) >= 6:
             self._flush_acks_for_channel(channel, addr)
         else:
             # Schedule a flush timer if one isn't already pending
             if self._ack_flush_task is None:
                 self._ack_flush_task = asyncio.get_event_loop().call_later(
-                    0.05, self._flush_all_acks_timer)
+                    0.008, self._flush_all_acks_timer)
 
         # Track seen indices — skip retransmissions for processing
         # Uses a sliding window to handle 16-bit index wraparound (0-65535)
@@ -1461,6 +1542,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             "alarm_status=" in text
             or "support_motion" in text
             or "support_humanoidFrame" in text
+            or "humanoidFrame=" in text
         )
         log.log(logging.DEBUG if is_alarm_poll else logging.INFO,
                 "CMD response (%d bytes): first16=%s", len(payload), payload[:16].hex())
@@ -1506,8 +1588,14 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         if not payload:
             return
         if not self._video_reassembly:
-            self._video_reassembly = VideoReassembly(self._on_video_frame)
+            self._video_reassembly = VideoReassembly(
+                self._on_video_frame, gap_callback=self._on_video_gap
+            )
         self._video_reassembly.feed(index, payload)
+
+    def _on_video_gap(self):
+        if self.video_gap_callback:
+            self.video_gap_callback()
 
     def _handle_audio_data(self, index: int, payload: bytes):
         if not payload:
@@ -1582,9 +1670,12 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                             last_relay_req_t = now_loop
                             self._send_relay_request()
                     elif requested_relay:
-                        # No relay has answered yet: keep asking for a session port.
-                        self._send_relay_port_requests(
-                            list(self._wan_relay_candidates or self._wan_relay_fallbacks))
+                        # Fallback window passed: bind the fastest probed offer or keep probing.
+                        self._commit_relay_on_offer = True
+                        if not self._commit_best_relay():
+                            self._send_relay_port_requests(
+                                list(self._wan_relay_candidates | self._wan_relay_fallbacks),
+                                force=True)
                     if is_onboarding:
                         if (now_loop - last_req_t) >= 1.5 and elapsed <= 12.0 and camera.wan_servers:
                             last_req_t = now_loop
@@ -1593,20 +1684,38 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                             for srv in camera.wan_servers:
                                 self.transport.sendto(hello_pkt, srv)
                                 self.transport.sendto(req_pkt, srv)
+                            log.debug("WAN onboarding P2P_REQ refresh @ %.1fs", elapsed)
                     else:
-                        if elapsed >= 1.5 and not resent_req and camera.wan_servers:
+                        if (now_loop - last_req_t) >= 1.0 and elapsed <= 2.6 and camera.wan_servers:
                             resent_req = True
                             last_req_t = now_loop
                             req_pkt = wan_p2p.build_wan_p2p_req(camera.bin_did, local_ip, local_port, key)
                             for srv in camera.wan_servers:
                                 self.transport.sendto(req_pkt, srv)
-                    if elapsed >= 2.0 and not requested_relay and camera.wan_servers:
+                    best_offer_rtt = min((v[0] for v in self._wan_relay_offers.values()), default=999.0)
+                    if (
+                        (elapsed >= 0.8 and not self._wan_list_req_sent)
+                        or (elapsed >= 1.8 and best_offer_rtt > 80.0 and not getattr(self, "_wan_list_req_retried", False))
+                    ) and camera.wan_servers:
                         if not is_onboarding or self._wan_punch_targets or getattr(cam_ref, "wan_cloud_status", "IDLE") == "ONLINE_PUNCHING":
-                            requested_relay = True
-                            log.info("WAN P2P direct punch not yet complete at %.1fs — requesting Cloud Relay (0x67)...", elapsed)
+                            if self._wan_list_req_sent:
+                                self._wan_list_req_retried = True
+                            self._wan_list_req_sent = True
                             list_req = wan_p2p.build_wan_list_req(camera.bin_did, key)
                             for srv in camera.wan_servers:
                                 self.transport.sendto(list_req, srv)
+                            log.debug("Pre-probing WAN Cloud Relays (0x67) @ %.1fs (best_rtt=%.1fms)", elapsed, best_offer_rtt)
+                    if elapsed >= 2.8 and not requested_relay and camera.wan_servers:
+                        if not is_onboarding or self._wan_punch_targets or getattr(cam_ref, "wan_cloud_status", "IDLE") == "ONLINE_PUNCHING":
+                            requested_relay = True
+                            self._commit_relay_on_offer = True
+                            if self._wan_relay_offers:
+                                self._commit_best_relay()
+                            else:
+                                log.info("WAN P2P direct punch not complete at %.1fs — requesting Cloud Relay (0x67)...", elapsed)
+                                list_req = wan_p2p.build_wan_list_req(camera.bin_did, key)
+                                for srv in camera.wan_servers:
+                                    self.transport.sendto(list_req, srv)
         except asyncio.CancelledError:
             pass
 
@@ -1629,11 +1738,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                 allow_broadcast=True,
             )
             sock = self.transport.get_extra_info("socket")
-            if sock:
-                try:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                except OSError:
-                    pass
+            _configure_udp_socket(sock)
 
         if self._wan_punch_task and not self._wan_punch_task.done():
             self._wan_punch_task.cancel()
@@ -2118,8 +2223,12 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                 continue
             now = asyncio.get_event_loop().time()
             last_video = getattr(self, '_last_video_drw_time', 0)
-            # If video stopped for 1+ second, re-request (camera needs periodic requests)
-            if last_video > 0 and now - last_video > 1:
+            is_wan = bool(
+                self._active_camera and getattr(self._active_camera, "connection_mode", "") in ("WAN_P2P", "WAN_RELAY")
+            ) or self._used_wan_p2p
+            stall_sec = 2.5 if is_wan else 1.5
+            # If video stopped beyond jitter threshold, re-request stream
+            if last_video > 0 and now - last_video > stall_sec:
                 gap = now - last_video
                 self._video_rerequests += 1
                 if self._video_rerequests <= 30:
@@ -2135,7 +2244,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                     await self._send_start_audio()
                 else:
                     await self._send_start_video()
-            elif last_video > 0 and now - last_video <= 1:
+            elif last_video > 0 and now - last_video <= stall_sec:
                 # Video stream is active, reset counter
                 if self._video_rerequests > 0:
                     self._video_rerequests = 0
@@ -2247,6 +2356,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             self._seen_drw_indices[CH_VIDEO].clear()
         self._drw_high_water[CH_VIDEO] = -1
         self._video_reassembly = None
+        self._on_video_gap()
         # streamid=10 = main stream (H.264, 1080p)
         cgi = (f"GET /livestream.cgi?"
                f"streamid=10&substream=1"
@@ -2386,9 +2496,17 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         return idx
 
     def _on_cmd_acked(self, indices):
+        now_rtt = asyncio.get_event_loop().time()
         for idx in indices:
-            if self._cmd_unacked.pop(idx, None) is not None:
+            ent = self._cmd_unacked.pop(idx, None)
+            if ent is not None:
                 self._cmd_ack_seen = True
+                if ent[3] == 0:
+                    sample = max(0.005, min(2.0, now_rtt - ent[1]))
+                    self._cmd_srtt = (
+                        sample if self._cmd_srtt is None
+                        else (0.75 * self._cmd_srtt + 0.25 * sample)
+                    )
             fut = self._cmd_ack_waiters.pop(idx, None)
             if fut and not fut.done():
                 fut.set_result(True)
@@ -2416,10 +2534,17 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                 addr = self._get_drw_addr()
                 if not addr:
                     continue
+                base_rto = CMD_RTO_INITIAL
+                if self._wan_relay_rtt_ms is not None:
+                    base_rto = max(base_rto, min(0.75, (self._wan_relay_rtt_ms / 1000.0) * 1.9 + 0.04))
+                elif self._active_camera and getattr(self._active_camera, "connection_mode", "") == "WAN_RELAY":
+                    base_rto = max(base_rto, 0.42)
+                if self._cmd_srtt is not None:
+                    base_rto = max(base_rto, min(0.75, self._cmd_srtt * 1.8 + 0.04))
                 now = loop.time()
                 sent = 0
                 for idx, ent in list(self._cmd_unacked.items()):
-                    rto = min(CMD_RTO_INITIAL * (1.5 ** ent[3]), CMD_RTO_MAX)
+                    rto = min(base_rto * (1.5 ** ent[3]), CMD_RTO_MAX)
                     if now - ent[2] < rto:
                         continue
                     ent[2] = now
@@ -2617,10 +2742,12 @@ class VideoReassembly:
     resyncs.
     """
 
-    REORDER_WINDOW = 64
+    REORDER_WINDOW = 256
+    REORDER_TIMEOUT_SEC = 1.0
 
-    def __init__(self, frame_callback):
+    def __init__(self, frame_callback, gap_callback=None):
         self.frame_callback = frame_callback
+        self.gap_callback = gap_callback
         self._buffer = bytearray()
         self._off = 0  # current read offset into _buffer
         self._current_frame_type = FRAME_P
@@ -2631,6 +2758,7 @@ class VideoReassembly:
         self._frames_received = 0
         self._reorder_buf: dict[int, bytes] = {}
         self._next_expected_idx: Optional[int] = None
+        self._gap_wait_since: float = 0.0
         self._gap_count = 0
         self._frames_dropped = 0
 
@@ -2648,10 +2776,16 @@ class VideoReassembly:
             self._feed_ordered(data)
             self._next_expected_idx = (self._next_expected_idx + 1) & 0xFFFF
             self._flush_reorder_buf()
+            if not self._reorder_buf:
+                self._gap_wait_since = 0.0
         elif ((index - self._next_expected_idx) & 0xFFFF) < 0x8000:
             # Future packet within forward half of 16-bit range: buffer it
+            now = time.monotonic()
+            if not self._reorder_buf or self._gap_wait_since == 0.0:
+                self._gap_wait_since = now
             self._reorder_buf[index] = data
-            if len(self._reorder_buf) >= self.REORDER_WINDOW:
+            if (len(self._reorder_buf) >= self.REORDER_WINDOW
+                    or (now - self._gap_wait_since) >= self.REORDER_TIMEOUT_SEC):
                 self._handle_gap()
         # else: old/duplicate (deduped upstream — ignore here too)
 
@@ -2660,6 +2794,10 @@ class VideoReassembly:
             data = self._reorder_buf.pop(self._next_expected_idx)
             self._feed_ordered(data)
             self._next_expected_idx = (self._next_expected_idx + 1) & 0xFFFF
+        if self._reorder_buf:
+            self._gap_wait_since = time.monotonic()
+        else:
+            self._gap_wait_since = 0.0
 
     def _handle_gap(self):
         if not self._reorder_buf:
@@ -2681,6 +2819,9 @@ class VideoReassembly:
             self._buffer = bytearray()
             self._off = 0
         self._next_expected_idx = min_idx
+        self._gap_wait_since = 0.0
+        if self.gap_callback:
+            self.gap_callback()
         self._flush_reorder_buf()
 
     def _feed_ordered(self, data: bytes):
@@ -3105,6 +3246,13 @@ class CameraSession:
                 alarm_server_addr=self.alarm_server_addr,
                 camera=self.camera,
             )
+            def on_gap():
+                if self.rtsp:
+                    self.rtsp.reset_gop_cache()
+                if self.recorder:
+                    self.recorder.on_video_gap()
+
+            self.protocol.video_gap_callback = on_gap
 
             # Wire motion detection if webhook or recorder is configured
             if self.motion_webhook or self.recorder:
@@ -3127,8 +3275,7 @@ class CameraSession:
                 allow_broadcast=True,
             )
             sock = self.transport.get_extra_info("socket")
-            if sock:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            _configure_udp_socket(sock)
 
             # Run targeted LAN discovery only if camera has a known LAN IP and is in LAN mode
             if self.camera.ip and self.camera.ip not in ("0.0.0.0", "Chờ Wi-Fi LAN") and self.camera.connection_mode == "LAN":
@@ -3220,6 +3367,8 @@ class CameraSession:
 
     async def _teardown_protocol(self):
         """Tear down protocol+transport without stopping RTSP server."""
+        if self.recorder:
+            self.recorder.on_video_gap()
         if self.protocol:
             await self.protocol.stop()
             self.protocol = None
@@ -3303,7 +3452,7 @@ class CameraSession:
                 await self._teardown_protocol()
                 # Clear cached I-frame so Scrypted doesn't serve a stale snapshot
                 if self.rtsp:
-                    self.rtsp._cached_iframe = None
+                    self.rtsp.reset_gop_cache()
                 self.state = STATE_RECONNECTING
                 if time.monotonic() < getattr(self.camera, "onboarding_until", 0.0):
                     continue
@@ -3337,6 +3486,30 @@ class CameraSession:
             await self._connect()
         except Exception as e:
             log.warning("[%s] Direct reconnect failed: %s", self.camera.label, e)
+
+    async def force_reconnect(self):
+        """Manually tear down the current transport and negotiate a fresh P2P / low-RTT relay path."""
+        if self._connecting:
+            return False
+        log.info("[%s] Manual connection re-probe requested (was %s via %s:%s)",
+                 self.camera.label,
+                 getattr(self.camera, "connection_mode", "?"),
+                 self.camera.ip, self.camera.port)
+        await self._teardown_protocol()
+        if self.rtsp:
+            self.rtsp.reset_gop_cache()
+        if self.recorder:
+            self.recorder.on_video_gap()
+        self.camera.wan_relay_rtt_ms = None
+        if getattr(self.camera, "bin_did", None) and getattr(self.camera, "connection_mode", "") != "LAN":
+            self.camera.ip = "0.0.0.0"
+            self.camera.port = 32108
+            self.camera.discovery_port = 0
+            self.camera.connection_mode = "WAN_P2P"
+        self.state = STATE_CONNECTING
+        self._backoff = 3.0
+        asyncio.create_task(self._connect())
+        return True
 
 
 # =============================================================================
@@ -3376,13 +3549,20 @@ class RTSPServer:
         self._audio_packets_received = 0
         self._last_audio_push_time: float = 0
         self.audio_frames_sent = 0
-        # Cached last I-frame for instant start of new clients
+        # Cached last I-frame (for snapshots) and intact current GOP (for clean RTSP join)
         self._cached_iframe: Optional[bytes] = None
+        self._cached_gop: list[bytes] = []
+        self.MAX_CACHED_GOP_FRAMES = 150
         # Snapshot endpoint: bound concurrency and cache the encoded JPEG
         self._snapshot_server: Optional[asyncio.Server] = None
         self._snapshot_sem = asyncio.Semaphore(2)
         self._snapshot_cache: Optional[tuple[float, bytes]] = None  # (time, jpeg)
         self.SNAPSHOT_CACHE_TTL = 1.0
+
+    def reset_gop_cache(self):
+        """Drop cached GOP/I-frame on upstream gap or reconnect so new clients wait for a clean IDR."""
+        self._cached_iframe = None
+        self._cached_gop.clear()
 
     async def start(self):
         self._running = True
@@ -3661,35 +3841,48 @@ class RTSPServer:
 
             is_iframe = (frame_type == FRAME_I or frame_type == 0)
 
-            # Always cache I-frames, even when no clients are playing,
-            # so new clients can get instant video start.
+            # Always maintain the intact current GOP starting from the latest I-frame
+            # so newly connecting RTSP clients never decode P-frames against a stale I-frame.
             if is_iframe:
                 self._cached_iframe = data
+                self._cached_gop = [data]
 
             playing_clients = [c for c in self._clients if c.playing]
             if not playing_clients:
+                if not is_iframe and self._cached_gop:
+                    if len(self._cached_gop) < self.MAX_CACHED_GOP_FRAMES:
+                        self._cached_gop.append(data)
+                    else:
+                        self._cached_gop.clear()
                 continue
 
-            # Check for new clients that need their first I-frame
+            # Check for new clients that need an intact GOP / I-frame start
             new_clients = [c for c in playing_clients if not c.got_iframe]
             if new_clients:
-                # Send cached I-frame for instant video start.
-                iframe_data = data if is_iframe else self._cached_iframe
-                if not iframe_data:
-                    log.info(":%d New client waiting for I-frame (cached=%s, is_iframe=%s, ft=%d)",
-                             self.port, self._cached_iframe is not None, is_iframe, frame_type)
-                if iframe_data:
+                if is_iframe:
                     for c in new_clients:
                         c.got_iframe = True
-                    log.info(":%d Sending %s I-frame (%d bytes) to %d new client(s)",
-                             self.port, "live" if is_iframe else "cached",
-                             len(iframe_data), len(new_clients))
-                    if not is_iframe:
-                        await self._send_frame_to_clients(iframe_data, new_clients)
+                    log.info(":%d Sending live I-frame (%d bytes) to %d new client(s)",
+                             self.port, len(data), len(new_clients))
+                elif self._cached_gop:
+                    for c in new_clients:
+                        c.got_iframe = True
+                    log.info(":%d Replaying cached GOP (%d frames) to %d new client(s)",
+                             self.port, len(self._cached_gop), len(new_clients))
+                    for gop_frame in self._cached_gop:
+                        await self._send_frame_to_clients(gop_frame, new_clients)
                         self._rtp_ts = (self._rtp_ts + 3000) & 0xFFFFFFFF
+                else:
+                    log.info(":%d New client waiting for clean I-frame (gop_cached=False, ft=%d)",
+                             self.port, frame_type)
 
-            # Send current frame to all clients that have received an I-frame
+            # Send current frame to all clients that have received an intact GOP/I-frame
             ready_clients = [c for c in playing_clients if c.got_iframe]
+            if not is_iframe and self._cached_gop:
+                if len(self._cached_gop) < self.MAX_CACHED_GOP_FRAMES:
+                    self._cached_gop.append(data)
+                else:
+                    self._cached_gop.clear()
             if not ready_clients:
                 continue
 

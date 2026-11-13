@@ -15,6 +15,7 @@ Runs in a single async Python process:
 
 import argparse
 import asyncio
+import collections
 import datetime
 import json
 import logging
@@ -25,12 +26,14 @@ from typing import Dict, Optional, Set
 from aiohttp import WSMsgType, web
 
 import eye4_rtsp_proxy as proxy
-from motion_recorder import CameraMotionRecorder, StorageManager
+from motion_recorder import CameraMotionRecorder, StorageManager, make_compact_jpeg_thumb
 
 log = logging.getLogger("eye4.hub")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+STATIC_ASSET_VER = "v4"
 
 
 
@@ -801,10 +804,12 @@ class CameraHubApp:
 
         # Hub NVR settings (persisted in YAML config under 'hub')
         hub_cfg = self.config.get("hub", {}) if isinstance(self.config.get("hub"), dict) else {}
-        self.pre_roll_sec: float = float(hub_cfg.get("pre_roll_sec", 10.0))
-        self.post_roll_sec: float = float(hub_cfg.get("post_roll_sec", 10.0))
-        self.pframe_sensitivity: float = float(hub_cfg.get("pframe_sensitivity", 2.25))
+        self.pre_roll_sec: float = float(hub_cfg.get("pre_roll_sec", 6.0))
+        self.post_roll_sec: float = float(hub_cfg.get("post_roll_sec", 6.0))
+        self.pframe_sensitivity: float = float(hub_cfg.get("pframe_sensitivity", 2.8))
+        self.pframe_cooldown_sec: float = float(hub_cfg.get("pframe_cooldown_sec", 20.0))
         self.enable_pframe_trigger: bool = bool(hub_cfg.get("enable_pframe_trigger", True))
+        self.auto_25fps: bool = bool(hub_cfg.get("auto_25fps", True))
         self.max_storage_gb: float = float(hub_cfg.get("max_storage_gb", 50.0))
         self.min_free_gb: float = float(hub_cfg.get("min_free_gb", 10.0))
 
@@ -816,15 +821,20 @@ class CameraHubApp:
         self._running = False
         self._discovery_task: Optional[asyncio.Task] = None
         self._quota_task: Optional[asyncio.Task] = None
+        self._fps_guard_task: Optional[asyncio.Task] = None
+        self._fps_checked_protos: Dict[str, int] = {}
         self._ptz_stop_tasks: Dict[str, asyncio.Task] = {}
         self._ptz_last_move: Dict[str, tuple] = {}   # uid -> (decoder_control code, started_at)
+        self._thumb_cache: collections.OrderedDict = collections.OrderedDict()
 
     def _save_hub_config(self):
         self.config["hub"] = {
             "pre_roll_sec": self.pre_roll_sec,
             "post_roll_sec": self.post_roll_sec,
             "pframe_sensitivity": self.pframe_sensitivity,
+            "pframe_cooldown_sec": self.pframe_cooldown_sec,
             "enable_pframe_trigger": self.enable_pframe_trigger,
+            "auto_25fps": self.auto_25fps,
             "max_storage_gb": self.max_storage_gb,
             "min_free_gb": self.min_free_gb,
         }
@@ -944,6 +954,7 @@ class CameraHubApp:
             post_roll_sec=self.post_roll_sec,
             pframe_sensitivity=self.pframe_sensitivity,
             enable_pframe_trigger=self.enable_pframe_trigger,
+            pframe_cooldown_sec=self.pframe_cooldown_sec,
             snapshot_getter=get_snap,
         )
         session.recorder = recorder
@@ -982,12 +993,13 @@ class CameraHubApp:
         self._running = True
         self._discovery_task = asyncio.create_task(self._discovery_loop())
         self._quota_task = asyncio.create_task(self._quota_loop())
+        self._fps_guard_task = asyncio.create_task(self._fps_guard_loop())
 
     async def stop_background_tasks(self, app: web.Application):
         self._running = False
         for ws in list(self.ws_clients):
             await ws.close()
-        for t in (self._discovery_task, self._quota_task):
+        for t in (self._discovery_task, self._quota_task, self._fps_guard_task):
             if t:
                 t.cancel()
         for sess in list(self.sessions.values()):
@@ -1079,12 +1091,93 @@ class CameraHubApp:
             except Exception as e:
                 log.debug("Quota check error: %s", e)
 
+    async def _sync_camera_fps_once(self, uid: str, sess):
+        """Ensure camera main stream encoder FPS meets target (fixes .12 firmware 15 FPS default)."""
+        proto = getattr(sess, "protocol", None)
+        if (not proto or not proto.enc_mode
+                or sess.state != proxy.STATE_CONNECTED
+                or getattr(proto, "auth_failed", False)):
+            return
+        proto_id = id(proto)
+        if self._fps_checked_protos.get(uid) == proto_id:
+            return
+
+        cam_cfg = (self.config.get("cameras") or {}).get(uid)
+        explicit = cam_cfg.get("target_fps") if isinstance(cam_cfg, dict) else None
+        if explicit is None and not self.auto_25fps:
+            self._fps_checked_protos[uid] = proto_id
+            return
+
+        params = await proto.query_cgi("get_camera_params.cgi", timeout=6.0)
+        if not params or "enc_framerate" not in params:
+            return
+        try:
+            cur_fps = int(float(params["enc_framerate"]))
+        except (TypeError, ValueError):
+            self._fps_checked_protos[uid] = proto_id
+            return
+        try:
+            cur_kf = int(float(params.get("enc_keyframe", 0) or 0))
+        except (TypeError, ValueError):
+            cur_kf = 0
+
+        if explicit is not None:
+            desired = int(explicit)
+            desired_kf = max(desired, min(150, desired * 2))
+            need_update = (desired > 0 and cur_fps != desired) or (0 < cur_kf < desired_kf)
+        else:
+            desired = 25
+            desired_kf = 50   # 2s GOP cuts static H.265 keyframe overhead cleanly
+            need_update = (0 < cur_fps < 25) or (0 < cur_kf < desired_kf)
+
+        if need_update:
+            res = await proto.query_cgi(
+                f"set_media.cgi?mainrate=0&enc_framerate={desired}&enc_keyframe={desired_kf}",
+                timeout=6.0,
+            )
+            if res and str(res.get("result", "")).lower() not in ("-1", "-2", "erro", "error"):
+                log.info(
+                    "[%s] Synced camera main-stream encoder FPS %d -> %d (enc_keyframe %d -> %d)",
+                    uid[:8], cur_fps, desired, cur_kf, desired_kf,
+                )
+            else:
+                log.warning("[%s] Failed to sync camera FPS/GOP %d -> %d: %s", uid[:8], cur_fps, desired, res)
+                return
+
+        # Prefer VBR (0) over CBR (1) to save H.265 disk size on static scenes
+        if str(params.get("enc_ratemode", "")) == "1":
+            vbr_res = await proto.query_cgi("set_media.cgi?mainrate=0&enc_ratemode=0", timeout=5.0)
+            if vbr_res and str(vbr_res.get("result", "")).lower() not in ("-1", "-2", "erro", "error"):
+                log.info("[%s] Switched camera encoder rate mode CBR -> VBR (0)", uid[:8])
+
+        self._fps_checked_protos[uid] = proto_id
+
+    async def _fps_guard_loop(self):
+        """Check newly connected camera sessions once to keep main-stream FPS in sync."""
+        while self._running:
+            await asyncio.sleep(6)
+            for uid, sess in list(self.sessions.items()):
+                try:
+                    await self._sync_camera_fps_once(uid, sess)
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    log.debug("[%s] FPS guard check failed: %s", uid[:8], e)
+
     # =========================================================================
     # HTTP & WebSocket API Handlers
     # =========================================================================
 
     async def handle_index(self, request: web.Request) -> web.Response:
-        return web.Response(text=DASHBOARD_HTML, content_type="text/html", charset="utf-8")
+        index_path = os.path.join(STATIC_DIR, "index.html")
+        with open(index_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        return web.Response(
+            text=html,
+            content_type="text/html",
+            charset="utf-8",
+            headers={"Cache-Control": "no-cache"},
+        )
 
     async def handle_status(self, request: web.Request) -> web.Response:
         cameras_list = []
@@ -1126,7 +1219,15 @@ class CameraHubApp:
                 "auth_failed": auth_failed,
                 "auth_error": auth_error,
                 "last_packet_sec": last_drw_age,
-                "codec": sess.rtsp._codec if sess.rtsp else "h265",
+                "wan_relay_rtt_ms": getattr(cam, "wan_relay_rtt_ms", None),
+                "wan_cloud_status": getattr(cam, "wan_cloud_status", None),
+                "cmd_srtt_ms": (
+                    round(sess.protocol._cmd_srtt * 1000.0, 1)
+                    if (sess.protocol and getattr(sess.protocol, "_cmd_srtt", None) is not None)
+                    else None
+                ),
+                "cmd_retx_count": getattr(sess.protocol, "_cmd_retx_count", 0) if sess.protocol else 0,
+                "codec": (sess.rtsp._codec if (sess.rtsp and sess.rtsp._codec) else None),
                 "kbps": rec.current_kbps if rec else 0.0,
                 "fps": rec.current_fps if rec else 0.0,
                 "ram_buffer_kb": rec.ram_buffer_kb if rec else 0.0,
@@ -1191,7 +1292,9 @@ class CameraHubApp:
                 "pre_roll_sec": self.pre_roll_sec,
                 "post_roll_sec": self.post_roll_sec,
                 "pframe_sensitivity": self.pframe_sensitivity,
+                "pframe_cooldown_sec": self.pframe_cooldown_sec,
                 "enable_pframe_trigger": self.enable_pframe_trigger,
+                "auto_25fps": self.auto_25fps,
                 "max_storage_gb": self.max_storage_gb,
                 "min_free_gb": self.min_free_gb,
             },
@@ -1396,10 +1499,11 @@ class CameraHubApp:
         "hscan": 28, "hscan_stop": 29,      # left/right patrol
     }
     # camera_control.cgi fixed param/value pairs
+    # param=14 (IR-cut) verified on live VSTJ 48.82.230.12 & 48.82.230.19:
+    # 0=day/off, 1=auto (default), 2=forced night B&W / IR LEDs on.
     PARAM_ACTIONS = {
-        "ir_auto": (14, 0), "ir_on": (14, 1), "ir_off": (14, 2),
+        "ir_off": (14, 0), "ir_auto": (14, 1), "ir_on": (14, 2),
         "flip_normal": (5, 0), "flip_v": (5, 1), "flip_h": (5, 2), "flip_vh": (5, 3),
-        "osd_on": (18, 1), "osd_off": (18, 0),
         "hz_50": (3, 0), "hz_60": (3, 1),
     }
     # camera_control.cgi params taking a numeric value: action -> (param, min, max).
@@ -1420,18 +1524,37 @@ class CameraHubApp:
         "ptz_center_onstart": ("set_misc.cgi?ptz_center_onstart={v}", 0, 1),
         "motion_sensitivity": ("set_alarm.cgi?motion_armed=1&motion_sensitivity={v}&input_armed=0&iolinkage=0"
                                "&mail=0&upload_interval=0&record=1&snapshot=1&schedule_enable=1", 1, 10),
+        "human_sensitive": ("trans_cmd_string.cgi?cmd=2126&command=0&sensitive={v}", 0, 3),
+        "cry_detect": ("trans_cmd_string.cgi?cmd=2112&command=0&enable={v}", 0, 1),
+        "depart_detect_time": ("trans_cmd_string.cgi?cmd=2136&command=0&detectTime={v}", 0, 3600),
+        "ai_2137": ("trans_cmd_string.cgi?cmd=2137&command=0&enable={v}", 0, 1),
+        "rtsp_tls": ("trans_cmd_string.cgi?cmd=2122&command=0&tls_enable={v}", 0, 1),
+        "onvif_enable": ("set_onvif.cgi?onvifenable={v}", 0, 1),
+        "enc_keyframe": ("set_media.cgi?mainrate=0&enc_keyframe={v}", 1, 150),
+        "enc_ratemode": ("set_media.cgi?mainrate=0&enc_ratemode={v}", 0, 1),
     }
     # Fixed CGIs. The trans_cmd_string keys mirror what the camera itself reports
     # for command=1 (query): 2127 -> enable/track_status, 2126 -> bHumanoidFrame/sensitive.
+    # OSD requires set_misc.cgi?osdenable=0/1 (camera_control param=18=0 is ignored by firmware).
     CGI_ACTIONS = {
+        "osd_on": "set_misc.cgi?osdenable=1",
+        "osd_off": "set_misc.cgi?osdenable=0",
         "track_on": "trans_cmd_string.cgi?cmd=2127&command=0&enable=1",
         "track_off": "trans_cmd_string.cgi?cmd=2127&command=0&enable=0",
         "humanframe_on": "trans_cmd_string.cgi?cmd=2126&command=0&bHumanoidFrame=1",
         "humanframe_off": "trans_cmd_string.cgi?cmd=2126&command=0&bHumanoidFrame=0",
     }
+    # Firmware-optional trans_cmd_string actions echo their target key only when implemented.
+    _REQUIRED_REPLY_KEYS = {
+        "humanframe_on": ("bHumanoidFrame", "khung người (bHumanoidFrame)"),
+        "humanframe_off": ("bHumanoidFrame", "khung người (bHumanoidFrame)"),
+        "cry_detect": ("enable", "phát hiện tiếng khóc (cmd=2112)"),
+        "ai_2137": ("enable", "cảm biến/AI mở rộng (cmd=2137)"),
+        "depart_detect_time": ("detectTime", "phát hiện rời vị trí (cmd=2136)"),
+    }
     # CGIs the raw console refuses: they rewrite persistent factory data / firmware
     CGI_BLOCKLIST = ("set_factory_param", "upgrade_firmware", "upgrade_htmls", "restore_factory")
-    _SECRET_KEY_RE = re.compile(r"(pwd|pass|psk|wpa|loginpas|^key\d*$)", re.I)
+    _SECRET_KEY_RE = re.compile(r"(pwd|pass|psk|wpa|loginpas|^(?:wifi_)?key\d*$)", re.I)
 
     def _ptz_stop_codes(self, uid: str) -> list:
         """Stop codes for whatever direction this camera was last told to move."""
@@ -1453,12 +1576,24 @@ class CameraHubApp:
         if prev_stop and not prev_stop.done():
             prev_stop.cancel()
 
+    def _require_connected_proto(self, uid: str):
+        """Return (sess, proto, None) if connected, or (sess_or_none, None, error_response)."""
+        sess = self.sessions.get(uid)
+        if not sess:
+            return None, None, web.json_response({"ok": False, "error": "Không tìm thấy camera"}, status=404)
+        if not sess.protocol or not sess.protocol.enc_mode:
+            state = getattr(sess.camera, "state", "OFFLINE")
+            return sess, None, web.json_response(
+                {"ok": False, "error": f"Camera chưa kết nối ({state})", "state": state},
+                status=503,
+            )
+        return sess, sess.protocol, None
+
     async def handle_ptz(self, request: web.Request) -> web.Response:
         uid = request.match_info.get("uid", "")
-        sess = self.sessions.get(uid)
-        if not sess or not sess.protocol or not sess.protocol.enc_mode:
-            return web.json_response({"ok": False, "error": "Camera chưa kết nối"}, status=404)
-        proto = sess.protocol
+        sess, proto, err_resp = self._require_connected_proto(uid)
+        if err_resp:
+            return err_resp
 
         try:
             data = await request.json()
@@ -1469,13 +1604,40 @@ class CameraHubApp:
 
         def done(acked: bool, **extra):
             body = {"ok": bool(acked), "action": action, "connection_mode": conn_mode, **extra}
-            if not acked:
+            if not acked and "error" not in body:
                 body["error"] = self.CMD_NO_ACK_MSG
-            return web.json_response(body, status=200 if acked else 504)
+            return web.json_response(body, status=200 if acked else (extra.get("status_code") or 504))
 
         def int_arg(name, lo, hi):
             v = int(float(data.get(name)))
             return max(lo, min(hi, v))
+
+        async def send_setting_cgi(cgi: str, **extra):
+            reply = await proto.query_cgi(cgi, timeout=4.5)
+            if reply is None:
+                return done(False, executed=False)
+            masked = self._mask_secrets(reply)
+            if reply.get("cgi") == "not support":
+                return web.json_response(
+                    {"ok": False, "action": action, "connection_mode": conn_mode,
+                     "error": "Firmware camera không hỗ trợ lệnh này", "values": masked},
+                    status=400,
+                )
+            res_val = str(reply.get("result", "")).lower()
+            if res_val in ("-1", "-2", "erro", "error"):
+                return web.json_response(
+                    {"ok": False, "action": action, "connection_mode": conn_mode,
+                     "error": f"Camera từ chối lệnh (result={reply.get('result')})", "values": masked},
+                    status=400,
+                )
+            req_key = self._REQUIRED_REPLY_KEYS.get(action)
+            if req_key and req_key[0] not in reply:
+                return web.json_response(
+                    {"ok": False, "action": action, "connection_mode": conn_mode,
+                     "error": f"Firmware camera này không hỗ trợ {req_key[1]}", "values": masked},
+                    status=400,
+                )
+            return done(True, executed=True, values=masked, **extra)
 
         try:
             # --- Directional movement ---
@@ -1512,27 +1674,58 @@ class CameraHubApp:
                 code = 30 + 2 * (int(m.group(1)) - 1) + (1 if m.group(2) == "go" else 0)
                 return done(await proto.send_ptz_command(code, onestep=0, wait_ack=3.0))
 
-            # --- Image / IR / OSD ---
+            # --- Image / IR / OSD / AI / Misc (wait for CGI execution reply) ---
             if action in self.PARAM_ACTIONS:
                 param, val = self.PARAM_ACTIONS[action]
-                return done(await proto.send_camera_param(param, val, wait_ack=3.0))
+                return await send_setting_cgi(f"camera_control.cgi?param={param}&value={val}")
 
             if action in self.PARAM_VALUE_ACTIONS:
                 param, lo, hi = self.PARAM_VALUE_ACTIONS[action]
                 val = int_arg("value", lo, hi)
-                return done(await proto.send_camera_param(param, val, wait_ack=3.0), value=val)
+                return await send_setting_cgi(f"camera_control.cgi?param={param}&value={val}", value=val)
 
             if action == "param":      # raw camera_control.cgi?param=&value=
                 param, val = int_arg("param", 0, 255), int_arg("value", -65535, 65535)
-                return done(await proto.send_camera_param(param, val, wait_ack=3.0), param=param, value=val)
+                return await send_setting_cgi(f"camera_control.cgi?param={param}&value={val}", param=param, value=val)
 
             if action in self.CGI_ACTIONS:
-                return done(await proto.send_cgi(self.CGI_ACTIONS[action], wait_ack=3.0))
+                cgi = self.CGI_ACTIONS[action]
+                extra = {}
+                if action == "humanframe_on" and data.get("sensitive") is not None:
+                    sens = int_arg("sensitive", 0, 3)
+                    cgi = f"{cgi}&sensitive={sens}"
+                    extra["sensitive"] = sens
+                return await send_setting_cgi(cgi, **extra)
+
+            if action == "rtsp_enable":
+                val = int_arg("value", 0, 1)
+                cur_port = data.get("port") or proto.cgi_state.get("rtspport") or "10554"
+                port = max(1, min(65535, int(cur_port)))
+                return await send_setting_cgi(f"set_rtsp.cgi?rtspenable={val}&rtspport={port}", value=val, port=port)
+
+            if action == "enc_framerate":
+                val = int_arg("value", 1, 30)
+                kf = max(val, min(150, val * 2))
+                resp = await send_setting_cgi(
+                    f"set_media.cgi?mainrate=0&enc_framerate={val}&enc_keyframe={kf}",
+                    value=val,
+                    enc_keyframe=kf,
+                )
+                if resp.status == 200:
+                    cams_cfg = self.config.setdefault("cameras", {})
+                    cur_cfg = cams_cfg.get(uid)
+                    if not isinstance(cur_cfg, dict):
+                        cur_cfg = {"port": int(cur_cfg)} if isinstance(cur_cfg, int) else {}
+                        cams_cfg[uid] = cur_cfg
+                    cur_cfg["target_fps"] = val
+                    self._fps_checked_protos[uid] = id(proto)
+                    self._save_hub_config()
+                return resp
 
             if action in self.CGI_VALUE_ACTIONS:
                 tmpl, lo, hi = self.CGI_VALUE_ACTIONS[action]
                 val = int_arg("value", lo, hi)
-                return done(await proto.send_cgi(tmpl.format(v=val), wait_ack=3.0), value=val)
+                return await send_setting_cgi(tmpl.format(v=val), value=val)
         except (TypeError, ValueError):
             return web.json_response({"ok": False, "error": "Giá trị không hợp lệ"}, status=400)
 
@@ -1566,10 +1759,9 @@ class CameraHubApp:
     async def handle_camera_params(self, request: web.Request) -> web.Response:
         """Read the camera's live settings + capability flags over the command channel."""
         uid = request.match_info.get("uid", "")
-        sess = self.sessions.get(uid)
-        if not sess or not sess.protocol or not sess.protocol.enc_mode:
-            return web.json_response({"ok": False, "error": "Camera chưa kết nối"}, status=404)
-        proto = sess.protocol
+        sess, proto, err_resp = self._require_connected_proto(uid)
+        if err_resp:
+            return err_resp
         try:
             timeout = max(3.0, min(60.0, float(request.query.get("timeout", 12))))
         except ValueError:
@@ -1595,12 +1787,119 @@ class CameraHubApp:
             },
         }, status=200 if answered else 504)
 
+    # Full reverse-engineered catalog, chunked into small reliable batches of (group, cgi, title).
+    SETTINGS_QUERY_BATCHES = (
+        (
+            ("system", "get_status.cgi", "Trạng thái hệ thống, phần cứng & năng lực (have*/support_*)"),
+            ("image", "get_camera_params.cgi", "Cảm biến hình ảnh, âm lượng & luồng camera"),
+            ("ptz", "get_misc.cgi", "Động cơ PTZ, tốc độ xoay, giới hạn mềm & đèn báo"),
+            ("record", "get_record.cgi", "Bộ mã hóa Video (Main/Sub/Sub2) & thẻ nhớ SD"),
+            ("network", "get_rtsp.cgi", "Cấu hình RTSP Server (Port/Auth)"),
+            ("network", "get_onvif.cgi", "Giao thức ONVIF"),
+            ("system", "get_login.cgi", "Tài khoản đang đăng nhập & quyền hạn"),
+            ("system", "check_user.cgi", "Số phiên người dùng đồng thời"),
+        ),
+        (
+            ("params", "get_params.cgi", "Toàn bộ cấu hình lõi (Mạng, Wi-Fi, NTP, Báo động, Lịch trình, Dịch vụ)"),
+            ("cloud", "get_factory_param.cgi", "Tham số Nhà sản xuất, Push Server, Cloud & Đơn hàng"),
+            ("network", "get_wifi_scan_result.cgi", "Bộ đệm kết quả quét Wi-Fi xung quanh"),
+            ("record", "get_record_file.cgi", "Danh sách file ghi trên thẻ nhớ SD"),
+            ("system", "get_log.cgi", "Nhật ký hệ thống trên camera"),
+        ),
+        (
+            ("record", "trans_cmd_string.cgi?cmd=2105&command=1", "Chuẩn mã hóa Video H.264 / H.265 (cmd=2105)"),
+            ("network", "trans_cmd_string.cgi?cmd=2122&command=1", "Bảo mật RTSP qua TLS (cmd=2122)"),
+            ("ai", "trans_cmd_string.cgi?cmd=2127&command=1", "AI: Tự động bám theo người (cmd=2127)"),
+            ("ai", "trans_cmd_string.cgi?cmd=2126&command=1", "AI: Độ nhạy phát hiện người & Khung người (cmd=2126)"),
+            ("ai", "trans_cmd_string.cgi?cmd=2112&command=1", "AI: Phát hiện tiếng khóc (cmd=2112)"),
+        ),
+        (
+            ("ai", "trans_cmd_string.cgi?cmd=2136&command=1", "AI: Thời gian phát hiện rời vị trí (cmd=2136)"),
+            ("ai", "trans_cmd_string.cgi?cmd=2137&command=1", "AI: Cảnh báo khói / mở rộng (cmd=2137)"),
+            ("ai", "trans_cmd_string.cgi?cmd=2123&command=1", "AI: Lưới vùng phát hiện chuyển động 18×22 (cmd=2123)"),
+            ("image", "trans_cmd_string.cgi?cmd=2016&command=1", "Ống kính / Tỉ lệ khung (cmd=2016)"),
+        ),
+        (
+            ("schedule", "trans_cmd_string.cgi?cmd=2017&command=11&mark=123456&type=1", "Lịch trình: Ghi hình chuyển động (cmd=2017 type=1)"),
+            ("schedule", "trans_cmd_string.cgi?cmd=2017&command=11&mark=123456&type=2", "Lịch trình: Đẩy cảnh báo chuyển động [v.19] (cmd=2017 type=2)"),
+            ("schedule", "trans_cmd_string.cgi?cmd=2017&command=11&mark=123456&type=4", "Lịch trình: Ghi hẹn giờ [v.19] / Đẩy CĐ [v.12] (cmd=2017 type=4)"),
+            ("schedule", "trans_cmd_string.cgi?cmd=2017&command=11&mark=123456&type=5", "Lịch trình: Chế độ Chăm sóc / Y tá [nurse_plan] (cmd=2017 type=5)"),
+            ("schedule", "trans_cmd_string.cgi?cmd=2017&command=11&mark=123456&type=7", "Lịch trình: Phát hiện rời vị trí [v.19] (cmd=2017 type=7)"),
+        ),
+    )
+
+    async def handle_camera_settings(self, request: web.Request) -> web.Response:
+        """Query all reverse-engineered camera CGIs and return structured per-CGI settings."""
+        uid = request.match_info.get("uid", "")
+        sess, proto, err_resp = self._require_connected_proto(uid)
+        if err_resp:
+            return err_resp
+        try:
+            timeout = max(5.0, min(90.0, float(request.query.get("timeout", 25))))
+        except ValueError:
+            timeout = 25.0
+
+        t0 = asyncio.get_event_loop().time()
+        all_replies = {}
+        per_batch_timeout = max(6.0, timeout / 2.5)
+        for batch in self.SETTINGS_QUERY_BATCHES:
+            remaining = timeout - (asyncio.get_event_loop().time() - t0)
+            if remaining <= 1.0:
+                break
+            cgis = [cgi for _, cgi, _ in batch]
+            batch_replies = await proto.query_cgis(cgis, timeout=min(per_batch_timeout, remaining))
+            all_replies.update(batch_replies)
+
+        sections = []
+        total_keys = 0
+        supported_cgis = 0
+        meta_keys = {"result", "cmd", "command", "uid", "mask", "type", "status"}
+        for batch in self.SETTINGS_QUERY_BATCHES:
+            for group, cgi, title in batch:
+                vals = all_replies.get(cgi)
+                masked = None if vals is None else self._mask_secrets(vals)
+                is_supported = masked is not None and masked.get("cgi") != "not support"
+                if is_supported:
+                    supported_cgis += 1
+                    total_keys += len(masked)
+                has_payload = bool(is_supported and any(k not in meta_keys for k in masked))
+                sections.append({
+                    "group": group,
+                    "cgi": cgi,
+                    "title": title,
+                    "supported": is_supported,
+                    "has_payload": has_payload,
+                    "key_count": len(masked) if masked else 0,
+                    "values": masked,
+                })
+
+        elapsed_ms = int((asyncio.get_event_loop().time() - t0) * 1000)
+        rec = self.recorders.get(uid)
+        return web.json_response({
+            "ok": supported_cgis > 0,
+            "partial": 0 < supported_cgis < len(sections),
+            "error": None if supported_cgis else self.CMD_BUSY_MSG,
+            "uid": uid,
+            "room_name": rec.room_name if rec else getattr(sess.camera, "label", uid),
+            "did": getattr(sess.camera, "formatted_did", None) or getattr(sess.camera, "hw_deviceid", ""),
+            "connection_mode": getattr(sess.camera, "connection_mode", "P2P"),
+            "elapsed_ms": elapsed_ms,
+            "answered_count": supported_cgis,
+            "total_count": len(sections),
+            "total_keys": total_keys,
+            "sections": sections,
+            "channel": {
+                "unacked": len(proto._cmd_unacked),
+                "retransmits": proto._cmd_retx_count,
+            },
+        }, status=200 if supported_cgis else 504)
+
     async def handle_camera_cgi(self, request: web.Request) -> web.Response:
         """Raw CGI console: send any CGI (login params are appended) and return the reply."""
         uid = request.match_info.get("uid", "")
-        sess = self.sessions.get(uid)
-        if not sess or not sess.protocol or not sess.protocol.enc_mode:
-            return web.json_response({"ok": False, "error": "Camera chưa kết nối"}, status=404)
+        sess, proto, err_resp = self._require_connected_proto(uid)
+        if err_resp:
+            return err_resp
         try:
             data = await request.json()
         except Exception:
@@ -1637,6 +1936,24 @@ class CameraHubApp:
             return web.json_response({
                 "ok": True,
                 "message": f"Đã gửi lệnh khởi động lại camera ({conn_mode})!",
+            })
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def handle_camera_reconnect(self, request: web.Request) -> web.Response:
+        """Force a fresh P2P hole-punch and lowest-RTT Cloud Relay selection for this camera."""
+        uid = request.match_info.get("uid", "")
+        sess = self.sessions.get(uid)
+        if not sess:
+            return web.json_response({"ok": False, "error": "Không tìm thấy session camera"}, status=404)
+        try:
+            started = await sess.force_reconnect()
+            if not started:
+                return web.json_response({"ok": False, "error": "Camera đang trong quá trình kết nối lại..."})
+            room_name = self._get_room_name(sess.camera)
+            return web.json_response({
+                "ok": True,
+                "message": f"Đang thử đục lỗ WAN P2P / chọn lại Relay nhanh nhất cho {room_name}...",
             })
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
@@ -1982,6 +2299,7 @@ class CameraHubApp:
             qr_text = ""
             duration_sec = 0.0
             requested_mode = str(data.get("sonic_mode") or data.get("mode") or ("mac" if wifi_bssid else "ssid")).strip()
+            sonic_mode = requested_mode
             if wifi_ssid:
                 sonic_res = await asyncio.get_event_loop().run_in_executor(
                     None, generate_vstarcam_sonic_wav, wifi_ssid, wifi_password, wifi_bssid, requested_mode
@@ -2199,511 +2517,27 @@ class CameraHubApp:
         qs = urllib.parse.urlencode({"ssid": ssid or "WiFi", "password": password, "bssid": bssid, "mode": mode})
         wav_url = f"/api/wifi/sonic.wav?{qs}"
 
-        html = f"""<!DOCTYPE html>
-<html lang="vi">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>🚀 Liên Kết & Nạp Wi-Fi Camera C22S</title>
-<style>
-  body {{ background:#0d1117; color:#e6edf3; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; padding:14px; margin:0; }}
-  .card {{ background:#161b22; border:1px solid #30363d; border-radius:14px; padding:18px; max-width:480px; margin:0 auto; box-shadow:0 8px 28px rgba(0,0,0,0.45); }}
-  .nav-tabs {{ display:flex; gap:6px; margin-bottom:12px; background:#0b0f17; padding:4px; border-radius:10px; border:1px solid #30363d; }}
-  .nav-tab-btn {{ flex:1; padding:9px 6px; font-size:12px; font-weight:700; border:none; border-radius:8px; background:transparent; color:#8b949e; cursor:pointer; text-align:center; transition:0.15s; }}
-  .nav-tab-btn.active {{ background:#21262d; color:#58a6ff; box-shadow:0 2px 8px rgba(0,0,0,0.4); }}
-  .play-btn {{ width:100%; padding:15px; font-size:15px; font-weight:800; border:none; border-radius:12px; background:linear-gradient(135deg,#238636,#2ea043); color:#fff; cursor:pointer; margin-top:12px; box-shadow:0 4px 14px rgba(35,134,54,0.4); }}
-  .play-btn.link-btn {{ background:linear-gradient(135deg,#1f6feb,#238636); box-shadow:0 4px 14px rgba(31,111,235,0.4); }}
-  .play-btn:active {{ transform:scale(0.98); }}
-  .stop-btn {{ width:100%; padding:11px; font-size:14px; font-weight:700; border:1px solid #f85149; border-radius:10px; background:rgba(248,81,73,0.15); color:#f85149; cursor:pointer; margin-top:8px; }}
-  input, select {{ width:100%; padding:10px; border-radius:8px; border:1px solid #30363d; background:#0b0f17; color:#e6edf3; font-size:15px; margin-top:4px; box-sizing:border-box; }}
-  label {{ display:block; text-align:left; font-size:12px; color:#8b949e; margin-top:10px; font-weight:600; }}
-  .step-item {{ text-align:left; padding:9px 11px; border-radius:8px; background:#0b0f17; border:1px solid #30363d; margin-top:7px; font-size:13px; line-height:1.4; transition:0.2s; }}
-  .step-item.active {{ border-color:#2f81f7; background:rgba(47,129,247,0.12); color:#58a6ff; }}
-  .step-item.done {{ border-color:#3fb950; background:rgba(63,185,80,0.14); color:#3fb950; }}
-  .step-item.warn {{ border-color:#d29922; background:rgba(210,153,34,0.14); color:#f0883e; }}
-</style>
-</head>
-<body>
-  <div class="card">
-    <div style="display:flex; justify-content:space-between; align-items:center;">
-      <span style="font-size:26px;">🚀📷</span>
-      <a href="/" style="color:#58a6ff; font-size:13px; text-decoration:none; font-weight:600;">← Về Bảng Điều Khiển Live</a>
-    </div>
-
-    <!-- 2 TABS / BRANCHES -->
-    <div class="nav-tabs" style="margin-top:10px;">
-      <button class="nav-tab-btn active" id="tab-btn-link" onclick="switchMobileTab('link')">
-        🔗 Camera Đã Có Wi-Fi<br><span style="font-size:10.5px; font-weight:normal;">Chỉ liên kết Server</span>
-      </button>
-      <button class="nav-tab-btn" id="tab-btn-unbox" onclick="switchMobileTab('unbox')">
-        📦 Khui Hộp Mới<br><span style="font-size:10.5px; font-weight:normal;">Nạp Wi-Fi qua loa</span>
-      </button>
-    </div>
-
-    <div id="m-desc-link" style="color:#8b949e; font-size:12px; line-height:1.45; text-align:left; margin-bottom:10px;">
-      ⚡ <b>Chỉ Liên Kết Server:</b> Camera đang sử dụng hoặc đã vào Wi-Fi / cắm mạng LAN. Server sẽ kết nối trực tiếp qua Internet (WAN P2P / LAN) mà <b>không cần nạp Wi-Fi</b> hay phát âm thanh!
-    </div>
-    <div id="m-desc-unbox" style="color:#8b949e; font-size:12px; line-height:1.45; text-align:left; margin-bottom:10px; display:none;">
-      🔊 <b>Khui Hộp &amp; Nạp Wi-Fi:</b> Phát sóng âm từ loa điện thoại nạp Wi-Fi cho Camera mới khui. Ngay khi Camera vào mạng, Server sẽ bắt tay và <b>tự động tắt sóng âm</b>!
-    </div>
-
-    <!-- COMMON: QR IMAGE / UID -->
-    <div style="background:#0b0f17; border:1px dashed #30363d; border-radius:10px; padding:10px; text-align:center; cursor:pointer;" onclick="document.getElementById('m-qr-file').click()">
-      <input type="file" id="m-qr-file" accept="image/*" style="display:none" onchange="decodeQrPhoto(this.files[0])">
-      <div style="font-size:13px; font-weight:700; color:#58a6ff;">📷 Chụp / Tải ảnh Tem QR dưới đáy Camera</div>
-      <div id="m-qr-msg" style="font-size:11px; color:#8b949e; margin-top:3px;">Hoặc bấm nút "📷 Quét / Chụp" cạnh ô UID bên dưới</div>
-    </div>
-
-    <div style="display:grid; grid-template-columns:1.3fr 1fr; gap:8px;">
-      <div>
-        <label>Mã UID Camera (trên tem đáy) (*):</label>
-        <div style="display:flex; gap:6px;">
-          <input id="m-uid" value="{uid_q}" placeholder="VD: VSTJ082299RLSXK" style="font-family:monospace; flex:1;">
-          <button class="btn" type="button" onclick="document.getElementById('m-qr-file').click()" style="padding:0 8px; font-weight:700; background:#21262d; border-color:#58a6ff; color:#58a6ff; font-size:11px; white-space:nowrap;">📷 Quét / Chụp</button>
-        </div>
-      </div>
-      <div>
-        <label>Tên Phòng / Vị trí:</label>
-        <input id="m-room" value="{room_q}" placeholder="VD: C22S_1">
-      </div>
-    </div>
-
-    <div>
-      <label>Mật khẩu Camera:</label>
-      <input id="m-campwd" value="888888" placeholder="Mặc định: 888888 (hoặc mật khẩu riêng bạn đã đổi)" style="font-family:monospace;">
-    </div>
-
-    <!-- BRANCH 2: WIFI INPUTS (ONLY FOR UNBOX MODE) -->
-    <div id="m-unbox-wifi-section" style="display:none; margin-top:8px; padding-top:8px; border-top:1px solid #30363d;">
-      <label>Tên mạng Wi-Fi 2.4GHz tại nơi lắp Camera (*):</label>
-      <input id="m-ssid" value="{ssid}" placeholder="Nhập đúng tên Wi-Fi 2.4GHz..." oninput="updateWavUrl()">
-      <label>Mật khẩu Wi-Fi (*):</label>
-      <input id="m-pwd" value="{password}" placeholder="Nhập mật khẩu Wi-Fi..." oninput="updateWavUrl()">
-
-      <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-        <div>
-          <label>Chế độ Sóng âm:</label>
-          <select id="m-mode" onchange="updateWavUrl()">
-            <option value="combo" {"selected" if mode=="combo" else ""}>Siêu nhạy: Kết hợp MAC + SSID</option>
-            <option value="mac" {"selected" if mode=="mac" else ""}>Siêu tốc: MAC Router (Như Eye4)</option>
-            <option value="ssid" {"selected" if mode=="ssid" else ""}>Chuẩn: Full SSID (Mọi mạng)</option>
-          </select>
-        </div>
-        <div>
-          <label>MAC Router / BSSID (Khuyên dùng):</label>
-          <input id="m-bssid" value="{bssid}" placeholder="VD: 001e hoặc xem đáy router" autocapitalize="off" autocomplete="off" oninput="syncModeFromBssid(); updateWavUrl()">
-        </div>
-      </div>
-
-      <div style="display:flex; gap:8px; margin-top:8px;">
-        <button class="stop-btn" onclick="stopPlay()" style="flex:1;">⏹ Dừng phát âm thanh</button>
-        <button class="stop-btn" onclick="toggleOpticalQr()" style="flex:1; border-color:#58a6ff; color:#58a6ff; background:rgba(47,129,247,0.12);">📱 Hiện Mã QR Quang Học</button>
-      </div>
-
-      <div id="m-opt-qr-wrap" style="display:none; margin-top:10px; background:#fff; padding:10px; border-radius:10px; color:#111; text-align:center;">
-        <img id="m-opt-qr-img" style="width:200px; height:200px; display:block; margin:0 auto;" alt="Optical WiFi QR">
-        <div style="font-size:12px; font-weight:700; margin-top:6px;">Đưa màn hình ĐT cách mắt ống kính Camera 15–20 cm</div>
-      </div>
-      <audio id="m-audio" src="{wav_url}" loop style="width:100%; margin-top:10px;" controls></audio>
-    </div>
-
-    <!-- ACTION BUTTONS -->
-    <div id="m-action-link">
-      <button class="play-btn link-btn" id="m-btn-link" onclick="startMobileLinkOnly()">🔗 Liên Kết Server Ngay (Không Cần Nạp Wi-Fi)</button>
-    </div>
-    <div id="m-action-unbox" style="display:none;">
-      <button class="play-btn" id="m-btn-onboard" onclick="startOneClickMobile()">🔊 Nạp Wi-Fi &amp; Tự Động Liên Kết Server</button>
-    </div>
-
-    <!-- PROGRESS STEPS -->
-    <div id="m-steps" style="margin-top:12px; display:none;">
-      <div id="m-step-1" class="step-item"><b>Bước 1:</b> 📋 Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P...</div>
-      <div id="m-step-2" class="step-item"><b>Bước 2:</b> 🌐 Chờ Camera báo danh lên P2P Cloud...</div>
-      <div id="m-step-3" class="step-item"><b>Bước 3:</b> 🔗 Server đục lỗ UDP &amp; xác thực (<code>CONNECTED</code>)...</div>
-    </div>
-
-    <div id="m-status" style="margin-top:12px; font-size:13px; color:#58a6ff; line-height:1.45; text-align:left;"></div>
-  </div>
-<script>
-let onboardPollTimer = null;
-let targetUidHex = null;
-let currentMobileTab = 'link';
-
-function switchMobileTab(mode) {{
-  currentMobileTab = mode;
-  stopPlay();
-  const btnLink = document.getElementById('tab-btn-link');
-  const btnUnbox = document.getElementById('tab-btn-unbox');
-  const descLink = document.getElementById('m-desc-link');
-  const descUnbox = document.getElementById('m-desc-unbox');
-  const wifiSec = document.getElementById('m-unbox-wifi-section');
-  const actLink = document.getElementById('m-action-link');
-  const actUnbox = document.getElementById('m-action-unbox');
-  const statusEl = document.getElementById('m-status');
-  document.getElementById('m-steps').style.display = 'none';
-
-  if (mode === 'link') {{
-    btnLink.className = 'nav-tab-btn active';
-    btnUnbox.className = 'nav-tab-btn';
-    descLink.style.display = 'block';
-    descUnbox.style.display = 'none';
-    wifiSec.style.display = 'none';
-    actLink.style.display = 'block';
-    actUnbox.style.display = 'none';
-    statusEl.innerHTML = '';
-  }} else {{
-    btnLink.className = 'nav-tab-btn';
-    btnUnbox.className = 'nav-tab-btn active';
-    descLink.style.display = 'none';
-    descUnbox.style.display = 'block';
-    wifiSec.style.display = 'block';
-    actLink.style.display = 'none';
-    actUnbox.style.display = 'block';
-    statusEl.innerHTML = '👉 Bật <b>Max Volume (100% âm lượng)</b> trên điện thoại và đặt loa sát lỗ Mic của Camera (cách 2–5 cm).';
-    updateWavUrl();
-  }}
-}}
-
-function downscaleImageFile(file, maxDim = 1600, quality = 0.85) {{
-  return new Promise((resolve) => {{
-    if (!file || !file.type || !file.type.startsWith('image/')) {{
-      return resolve(file);
-    }}
-    const img = new Image();
-    const url = URL.createObjectURL(file);
-    img.onload = () => {{
-      URL.revokeObjectURL(url);
-      let w = img.width;
-      let h = img.height;
-      if (w <= maxDim && h <= maxDim) {{
-        return resolve(file);
-      }}
-      if (w > h) {{
-        h = Math.round((h * maxDim) / w);
-        w = maxDim;
-      }} else {{
-        w = Math.round((w * maxDim) / h);
-        h = maxDim;
-      }}
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0, w, h);
-      canvas.toBlob((blob) => {{
-        if (blob) {{
-          resolve(blob);
-        }} else {{
-          resolve(file);
-        }}
-      }}, 'image/jpeg', quality);
-    }};
-    img.onerror = () => {{
-      URL.revokeObjectURL(url);
-      resolve(file);
-    }};
-    img.src = url;
-  }});
-}}
-
-async function decodeQrPhoto(file) {{
-  if (!file) return;
-  const msg = document.getElementById('m-qr-msg');
-  msg.textContent = '⏳ Đang tối ưu dung lượng ảnh & giải mã tem QR...';
-  try {{
-    const uploadBlob = await downscaleImageFile(file, 1600, 0.85);
-    const fd = new FormData();
-    fd.append('file', uploadBlob, 'qr.jpg');
-    const res = await fetch('/api/camera/decode-qr', {{ method: 'POST', body: fd }});
-    if (res.status === 413) {{
-      msg.innerHTML = '<span style="color:#f85149;">❌ Ảnh quá lớn (413 Request Entity Too Large). Vui lòng thử lại với ảnh nhỏ hơn hoặc gõ UID.</span>';
-      return;
-    }}
-    const d = await res.json();
-    if (res.ok && d.ok) {{
-      document.getElementById('m-uid').value = d.formatted_did;
-      if (d.suggested_name && !document.getElementById('m-room').value) {{
-        document.getElementById('m-room').value = d.suggested_name;
-      }}
-      msg.innerHTML = `<span style="color:#3fb950;">✅ Đã nhận UID: <b>${{d.formatted_did}}</b></span>`;
-    }} else {{
-      msg.innerHTML = `<span style="color:#f85149;">❌ ${{d.error || 'Không nhận diện được tem QR'}}</span>`;
-    }}
-  }} catch (e) {{
-    msg.textContent = 'Lỗi giải mã QR: ' + e;
-  }}
-}}
-
-// Eye4 only ever plays the MAC variant, so pick it as soon as a usable MAC is typed.
-function syncModeFromBssid() {{
-  const hex = ((document.getElementById('m-bssid') || {{}}).value || '').replace(/[^0-9a-fA-F]/g, '');
-  document.getElementById('m-mode').value = hex.length >= 4 ? 'mac' : 'ssid';
-}}
-
-function updateWavUrl() {{
-  const s = document.getElementById('m-ssid').value.trim();
-  const p = document.getElementById('m-pwd').value;
-  const m = document.getElementById('m-mode').value;
-  const b = (document.getElementById('m-bssid') || {{}}).value.trim();
-  if (!s) return;
-  const u = `/api/wifi/sonic.wav?ssid=${{encodeURIComponent(s)}}&password=${{encodeURIComponent(p)}}&bssid=${{encodeURIComponent(b)}}&mode=${{encodeURIComponent(m)}}`;
-  const a = document.getElementById('m-audio');
-  if (a.paused) a.src = u;
-}}
-
-async function startMobileLinkOnly() {{
-  const uid = document.getElementById('m-uid').value.trim();
-  const room = document.getElementById('m-room').value.trim();
-  const camPwd = document.getElementById('m-campwd').value.trim() || '888888';
-
-  if (!uid) {{
-    alert('Vui lòng chụp/tải ảnh tem QR hoặc nhập Mã UID trên thân Camera (VD: VSTJ082299RLSXK)!');
-    document.getElementById('m-uid').focus();
-    return;
-  }}
-
-  const btn = document.getElementById('m-btn-link');
-  btn.disabled = true;
-  btn.textContent = '⏳ Đang đăng ký & Kết nối WAN P2P...';
-
-  const sBox = document.getElementById('m-steps');
-  const s1 = document.getElementById('m-step-1');
-  const s2 = document.getElementById('m-step-2');
-  const s3 = document.getElementById('m-step-3');
-  sBox.style.display = 'block';
-  s1.className = 'step-item active';
-  s1.innerHTML = '<b>Bước 1:</b> 📋 Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P (180s fast-poll)...';
-  s2.className = 'step-item';
-  s2.innerHTML = '<b>Bước 2:</b> 🌐 Bắt tay P2P Cloud (<code>WAITING_FOR_WIFI</code> → <code>ONLINE_PUNCHING</code>)...';
-  s3.className = 'step-item';
-  s3.innerHTML = '<b>Bước 3:</b> 🔗 Server đục lỗ UDP &amp; xác thực (<code>CONNECTED</code>)...';
-
-  try {{
-    const res = await fetch('/api/camera/onboard', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{
-        uid: uid,
-        room_name: room,
-        cam_password: camPwd,
-        wifi_ssid: ""
-      }})
-    }});
-    const d = await res.json();
-    if (!d.ok) {{
-      alert('Lỗi: ' + d.error);
-      return;
-    }}
-    targetUidHex = d.uid;
-    document.getElementById('m-status').innerHTML =
-      `🌐 <b>Đã đăng ký Camera <code>${{d.formatted_did}}</code> (${{d.room_name}})!</b><br>` +
-      `Server đang tự động dò tìm và đục lỗ UDP qua WAN P2P &amp; LAN mỗi 1.5s...`;
-
-    if (onboardPollTimer) clearInterval(onboardPollTimer);
-    onboardPollTimer = setInterval(pollMobileOnboardStatus, 1200);
-  }} catch (e) {{
-    document.getElementById('m-status').innerHTML = '❌ Lỗi kết nối: ' + e;
-  }} finally {{
-    btn.disabled = false;
-    btn.textContent = '🔗 Liên Kết Server Ngay (Không Cần Nạp Wi-Fi)';
-  }}
-}}
-
-async function startOneClickMobile() {{
-  const uid = document.getElementById('m-uid').value.trim();
-  const room = document.getElementById('m-room').value.trim();
-  const ssid = document.getElementById('m-ssid').value.trim();
-  const pwd = document.getElementById('m-pwd').value;
-  const camPwd = document.getElementById('m-campwd').value.trim() || '888888';
-
-  if (!ssid) {{
-    alert('Vui lòng nhập Tên mạng Wi-Fi (2.4GHz) tại nơi đặt camera!');
-    document.getElementById('m-ssid').focus();
-    return;
-  }}
-
-  const a = document.getElementById('m-audio');
-  if (!uid) {{
-    updateWavUrl();
-    a.currentTime = 0;
-    a.play();
-    document.getElementById('m-status').innerHTML = '🟢 <b>Đang phát sóng âm 6.5–10.1 kHz (Lặp liên tục)...</b><br>Hãy nhập thêm Mã UID Camera ở trên để Server tự động liên kết và tự ngắt sóng âm khi hoàn tất!';
-    return;
-  }}
-
-  document.getElementById('m-steps').style.display = 'block';
-  const s1 = document.getElementById('m-step-1');
-  const s2 = document.getElementById('m-step-2');
-  const s3 = document.getElementById('m-step-3');
-  s1.className = 'step-item active';
-  s1.innerHTML = `<b>Bước 1:</b> 🔊 Đang phát sóng âm nạp Wi-Fi <b>"${{ssid}}"</b> từ điện thoại sang Camera...`;
-  s2.className = 'step-item';
-  s2.innerHTML = '<b>Bước 2:</b> 🌐 Chờ Camera vào mạng Wi-Fi &amp; báo danh lên P2P Cloud (<code>WAITING_FOR_WIFI</code> → <code>ONLINE_PUNCHING</code>)...';
-  s3.className = 'step-item';
-  s3.innerHTML = '<b>Bước 3:</b> 🔗 Server đục lỗ UDP &amp; xác thực (<code>CONNECTED</code>)...';
-
-  try {{
-    const bssid = (document.getElementById('m-bssid') || {{}}).value.trim();
-    const mode = (document.getElementById('m-mode') || {{}}).value || 'combo';
-    const res = await fetch('/api/camera/onboard', {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{
-        uid: uid,
-        room_name: room,
-        cam_password: camPwd,
-        wifi_ssid: ssid,
-        wifi_password: pwd,
-        wifi_bssid: bssid,
-        sonic_mode: mode
-      }})
-    }});
-    const d = await res.json();
-    if (!d.ok) {{
-      alert('Lỗi: ' + d.error);
-      return;
-    }}
-    targetUidHex = d.uid;
-    if (d.wav_data_url) {{
-      a.src = d.wav_data_url;
-      a.currentTime = 0;
-      await a.play();
-    }}
-    if (d.qr_data_url) {{
-      document.getElementById('m-opt-qr-img').src = d.qr_data_url;
-    }}
-    document.getElementById('m-status').innerHTML =
-      `🔊 <b>Đang phát sóng âm nạp Wi-Fi "${{ssid}}" cho Camera <code>${{d.formatted_did}}</code>!</b><br>` +
-      `Giữ loa điện thoại sát lỗ Mic của Camera (2–5 cm). Server đang dò tìm Camera liên tục mỗi 1.5s...`;
-
-    if (onboardPollTimer) clearInterval(onboardPollTimer);
-    onboardPollTimer = setInterval(pollMobileOnboardStatus, 1200);
-  }} catch (e) {{
-    document.getElementById('m-status').innerHTML = '❌ Lỗi: ' + e;
-  }}
-}}
-
-async function pollMobileOnboardStatus() {{
-  if (!targetUidHex) return;
-  try {{
-    const res = await fetch('/api/status');
-    const data = await res.json();
-    const cam = (data.cameras || []).find(c => c.uid === targetUidHex);
-    if (!cam) return;
-
-    const s1 = document.getElementById('m-step-1');
-    const s2 = document.getElementById('m-step-2');
-    const s3 = document.getElementById('m-step-3');
-    const cloudSt = cam.wan_cloud_status || 'WAITING_FOR_WIFI';
-
-    // 1. Fully connected
-    if (cam.state === 'CONNECTED' && !cam.auth_failed) {{
-      stopPlay();
-      if (onboardPollTimer) {{ clearInterval(onboardPollTimer); onboardPollTimer = null; }}
-      s1.className = 'step-item done';
-      s1.innerHTML = (currentMobileTab === 'unbox')
-        ? '<b>Bước 1:</b> ✅ Đã nạp Wi-Fi thành công (Đã tự động tắt sóng âm)'
-        : '<b>Bước 1:</b> ✅ Đã lưu UID &amp; kích hoạt kết nối';
-      s2.className = 'step-item done';
-      s2.innerHTML = '<b>Bước 2:</b> ✅ Camera đã vào mạng &amp; báo danh P2P Cloud (<code>CONNECTED</code>)';
-      s3.className = 'step-item done';
-      s3.innerHTML = `<b>Bước 3:</b> ✅ Server đã đục lỗ UDP (<code>${{cam.connection_mode}}</code>) &amp; nhận luồng Live 25 FPS!`;
-      document.getElementById('m-status').innerHTML =
-        `<div style="padding:12px; border-radius:10px; background:rgba(63,185,80,0.2); border:1px solid #3fb950; color:#3fb950; font-weight:700;">` +
-        `✅ Liên kết hoàn tất! Camera <b>${{cam.room_name}} (${{cam.formatted_did}})</b> đã kết nối trực tiếp với Server qua Internet.<br>` +
-        `<a href="/" style="display:inline-block; margin-top:8px; padding:8px 14px; background:#238636; color:#fff; border-radius:6px; text-decoration:none;">📹 Xem Live Stream Ngay</a></div>`;
-      return;
-    }}
-
-    // 2. Auth failed (wrong camera password)
-    if (cam.auth_failed) {{
-      stopPlay();
-      s1.className = 'step-item done';
-      s2.className = 'step-item done';
-      s3.className = 'step-item warn';
-      s3.innerHTML = '<b>Bước 3:</b> ⚠️ Đã đục lỗ UDP nhưng sai Mật khẩu Camera (hãy nhập đúng mật khẩu Camera vào ô Mật khẩu rồi bấm lại)!';
-      return;
-    }}
-
-    // 3. Camera is online on P2P Cloud -> Hole punching actively in progress!
-    if (cloudSt === 'ONLINE_PUNCHING') {{
-      s1.className = 'step-item done';
-      s1.innerHTML = (currentMobileTab === 'unbox')
-        ? '<b>Bước 1:</b> ✅ Camera đã nhận sóng âm Wi-Fi'
-        : '<b>Bước 1:</b> ✅ Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P';
-      s2.className = 'step-item done';
-      s2.innerHTML = '<b>Bước 2:</b> 🟢 Camera đã ONLINE trên P2P Cloud (Đã bắt được IP &amp; Port công khai)!';
-      s3.className = 'step-item active';
-      s3.innerHTML = `<b>Bước 3:</b> 🔄 Server đang đục lỗ UDP &amp; bắt tay trực tiếp với Camera (<code>${{cam.state}}</code>)...`;
-      return;
-    }}
-
-    // 4. Camera is OFFLINE on Cloud (WAITING_FOR_WIFI or IDLE)
-    if (cloudSt === 'WAITING_FOR_WIFI' || cloudSt === 'IDLE') {{
-      if (currentMobileTab === 'unbox') {{
-        s1.className = 'step-item active';
-        s1.innerHTML = '<b>Bước 1:</b> 🔊 Đang phát sóng âm nạp Wi-Fi từ điện thoại sang Camera...';
-        s2.className = 'step-item warn';
-        s2.innerHTML = '<b>Bước 2:</b> ⏳ Đang phát sóng âm... Chờ Camera nhận sóng âm và online trên P2P Cloud (<code>WAITING_FOR_WIFI</code>)...';
-      }} else {{
-        s1.className = 'step-item done';
-        s1.innerHTML = '<b>Bước 1:</b> 📋 Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P / LAN';
-        s2.className = 'step-item warn';
-        s2.innerHTML = '<b>Bước 2:</b> ⏳ Chờ Camera vào mạng &amp; báo danh lên P2P Cloud (Hiện Camera đang <b>OFFLINE</b> — Hãy chắc chắn Camera đã cắm nguồn và có mạng Wi-Fi/LAN, hoặc chuyển sang tab <b>Khui Hộp Mới</b> để nạp Wi-Fi!)';
-      }}
-      s3.className = 'step-item';
-      s3.innerHTML = '<b>Bước 3:</b> ⏸ Chờ Bước 2 (Camera phải Online trên P2P Cloud trước khi Server có thể đục lỗ UDP)...';
-      return;
-    }}
-
-    // 5. Invalid UID
-    if (cloudSt === 'INVALID_UID') {{
-      stopPlay();
-      s2.className = 'step-item warn';
-      s2.innerHTML = '<b>Bước 2:</b> ❌ Mã UID không hợp lệ hoặc không tồn tại trên hệ thống P2P Cloud!';
-      s3.className = 'step-item';
-      s3.innerHTML = '<b>Bước 3:</b> ⏸ Đã dừng kết nối.';
-      return;
-    }}
-
-    // 6. Fallback
-    s2.className = 'step-item active';
-    s2.innerHTML = `<b>Bước 2:</b> 🌐 Chờ Camera báo danh lên P2P Cloud (Trạng thái: <code>${{cloudSt}}</code>)...`;
-    s3.className = 'step-item';
-    s3.innerHTML = '<b>Bước 3:</b> ⏸ Chờ Bước 2...';
-  }} catch (e) {{}}
-}}
-
-function toggleOpticalQr() {{
-  const w = document.getElementById('m-opt-qr-wrap');
-  const s = document.getElementById('m-ssid').value.trim();
-  const p = document.getElementById('m-pwd').value;
-  if (w.style.display === 'none') {{
-    w.style.display = 'block';
-    if (s && !document.getElementById('m-opt-qr-img').src) {{
-      fetch('/api/wifi/qr', {{
-        method: 'POST', headers: {{'Content-Type': 'application/json'}},
-        body: JSON.stringify({{ssid: s, password: p, format: 'eye4'}})
-      }}).then(r => r.json()).then(d => {{
-        if (d.ok) document.getElementById('m-opt-qr-img').src = d.data_url;
-      }});
-    }}
-  }} else {{
-    w.style.display = 'none';
-  }}
-}}
-
-function stopPlay() {{
-  const a = document.getElementById('m-audio');
-  if (a) {{
-    a.pause();
-    a.currentTime = 0;
-  }}
-}}
-</script>
-</body>
-</html>"""
-        return web.Response(text=html, content_type="text/html")
+        sonic_path = os.path.join(STATIC_DIR, "sonic.html")
+        with open(sonic_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        init_payload = json.dumps({
+            "ssid": ssid,
+            "password": password,
+            "bssid": bssid,
+            "uid": uid_q,
+            "room": room_q,
+            "mode": mode,
+            "wav_url": wav_url,
+        }).replace("</", "<\\/")
+        init_tag = f'<script id="sonic-init" type="application/json">{init_payload}</script>'
+        assert "<!--SONIC_INIT_JSON-->" in html, "sonic.html missing <!--SONIC_INIT_JSON-->"
+        html = html.replace("<!--SONIC_INIT_JSON-->", init_tag, 1)
+        return web.Response(
+            text=html,
+            content_type="text/html",
+            charset="utf-8",
+            headers={"Cache-Control": "no-cache"},
+        )
 
     async def handle_wifi_qr(self, request: web.Request) -> web.Response:
         """Generate optical Wi-Fi provisioning QR code for the camera lens to scan."""
@@ -2821,8 +2655,63 @@ function stopPlay() {{
     async def handle_list_events(self, request: web.Request) -> web.Response:
         room = request.query.get("room", "ALL")
         date = request.query.get("date", "ALL")
-        events = self.storage.list_events(room_filter=room, date_filter=date, limit=300)
-        return web.json_response({"events": events})
+        trigger = request.query.get("trigger", "ALL")
+        try:
+            offset = max(0, int(request.query.get("offset", 0)))
+        except ValueError:
+            offset = 0
+        try:
+            limit = max(1, min(100, int(request.query.get("limit", 24))))
+        except ValueError:
+            limit = 24
+        payload = self.storage.query_events(
+            room_filter=room,
+            date_filter=date,
+            trigger_filter=trigger,
+            offset=offset,
+            limit=limit,
+        )
+        resp = web.json_response(payload)
+        resp.enable_compression()
+        return resp
+
+    async def handle_event_thumb(self, request: web.Request) -> web.Response:
+        """Serve lightweight resized event thumbnails with immutable browser/CDN caching."""
+        rel = (request.query.get("rel") or "").strip().lstrip("/")
+        if not rel or ".." in rel or not rel.lower().endswith((".jpg", ".jpeg")):
+            return web.Response(status=400, text="Invalid thumbnail path")
+
+        rec_root = os.path.realpath(self.recordings_dir)
+        fpath = os.path.realpath(os.path.join(rec_root, rel))
+        if not fpath.startswith(rec_root + os.sep) or not os.path.isfile(fpath):
+            return web.Response(status=404, text="Thumbnail not found")
+
+        try:
+            width = max(240, min(960, int(request.query.get("w", 480))))
+        except ValueError:
+            width = 480
+
+        try:
+            st = os.stat(fpath)
+            cache_key = (rel, st.st_mtime_ns, width)
+            body = self._thumb_cache.get(cache_key)
+            if body is None:
+                with open(fpath, "rb") as f:
+                    raw = f.read()
+                body = make_compact_jpeg_thumb(raw, max_width=width, quality=74)
+                self._thumb_cache[cache_key] = body
+                if len(self._thumb_cache) > 300:
+                    self._thumb_cache.popitem(last=False)
+            else:
+                self._thumb_cache.move_to_end(cache_key)
+        except OSError:
+            return web.Response(status=404, text="Thumbnail unreadable")
+
+        return web.Response(
+            body=body,
+            content_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=604800, immutable"},
+        )
 
     async def handle_delete_event(self, request: web.Request) -> web.Response:
         data = await request.json()
@@ -2837,9 +2726,15 @@ function stopPlay() {{
         if "post_roll_sec" in data:
             self.post_roll_sec = max(3.0, min(60.0, float(data["post_roll_sec"])))
         if "pframe_sensitivity" in data:
-            self.pframe_sensitivity = max(1.2, min(4.0, float(data["pframe_sensitivity"])))
+            self.pframe_sensitivity = max(1.2, min(10.0, float(data["pframe_sensitivity"])))
+        if "pframe_cooldown_sec" in data:
+            self.pframe_cooldown_sec = max(0.0, min(300.0, float(data["pframe_cooldown_sec"])))
         if "enable_pframe_trigger" in data:
             self.enable_pframe_trigger = bool(data["enable_pframe_trigger"])
+        if "auto_25fps" in data:
+            self.auto_25fps = bool(data["auto_25fps"])
+            if self.auto_25fps:
+                self._fps_checked_protos.clear()
         if "max_storage_gb" in data:
             self.max_storage_gb = max(1.0, float(data["max_storage_gb"]))
             self.storage.max_storage_gb = self.max_storage_gb
@@ -2851,6 +2746,7 @@ function stopPlay() {{
             rec.pre_roll_sec = self.pre_roll_sec
             rec.post_roll_sec = self.post_roll_sec
             rec.pframe_sensitivity = self.pframe_sensitivity
+            rec.pframe_cooldown_sec = self.pframe_cooldown_sec
             rec.enable_pframe_trigger = self.enable_pframe_trigger
 
         self._save_hub_config()
@@ -2861,2220 +2757,6 @@ function stopPlay() {{
 # Embedded Single-Page Web Dashboard (Real-Time 25 FPS Binary WebSocket)
 # =============================================================================
 
-DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="vi">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>C22S Multi-Camera Hub & Smart Motion NVR (25 FPS Live)</title>
-<style>
-  :root {
-    --bg: #0d1117;
-    --panel: #161b22;
-    --border: #30363d;
-    --text: #e6edf3;
-    --muted: #8b949e;
-    --accent: #2f81f7;
-    --danger: #f85149;
-    --success: #3fb950;
-    --warn: #d29922;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-  }
-  header {
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-    padding: 10px 18px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 12px;
-  }
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-weight: 700;
-    font-size: 16px;
-  }
-  .badge {
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 99px;
-    font-weight: 600;
-    background: #1f2937;
-    border: 1px solid var(--border);
-  }
-  .badge.ok { color: var(--success); border-color: rgba(63,185,80,0.4); }
-  .badge.rec { color: #fff; background: var(--danger); border-color: var(--danger); animation: pulse 1s infinite; }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
-  .tabs {
-    display: flex;
-    gap: 6px;
-  }
-  .tab-btn {
-    background: transparent;
-    color: var(--muted);
-    border: 1px solid transparent;
-    padding: 6px 14px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-weight: 600;
-    font-size: 13px;
-  }
-  .tab-btn.active {
-    background: #21262d;
-    color: var(--text);
-    border-color: var(--border);
-  }
-  .toolbar {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-size: 12px;
-    color: var(--muted);
-  }
-  select, input, button.btn {
-    background: #21262d;
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 5px 10px;
-    font-size: 12px;
-  }
-  button.btn { cursor: pointer; font-weight: 600; }
-  button.btn:hover { border-color: var(--muted); }
-  button.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button.btn.danger { background: rgba(248,81,73,0.18); border-color: var(--danger); color: var(--danger); }
-  main { flex: 1; padding: 14px; }
-  .view-section { display: none; }
-  .view-section.active { display: block; }
-
-  /* Camera Grid */
-  .cam-grid {
-    display: grid;
-    gap: 10px;
-    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-  }
-  .cam-grid.cols-2 { grid-template-columns: repeat(2, 1fr); }
-  .cam-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
-  .cam-grid.cols-4 { grid-template-columns: repeat(4, 1fr); }
-
-  .cam-card {
-    background: var(--panel);
-    border: 2px solid var(--border);
-    border-radius: 8px;
-    overflow: hidden;
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    transition: border-color 0.2s;
-  }
-  .cam-card.recording {
-    border-color: var(--danger);
-    box-shadow: 0 0 12px rgba(248,81,73,0.35);
-  }
-  .cam-video-wrap {
-    position: relative;
-    width: 100%;
-    aspect-ratio: 16 / 9;
-    background: #000;
-    cursor: pointer;
-    overflow: hidden;
-  }
-  .cam-video-wrap img {
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
-    display: block;
-  }
-  .cam-overlay-top {
-    position: absolute;
-    top: 6px; left: 8px; right: 8px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    pointer-events: none;
-  }
-  .room-pill {
-    background: rgba(0,0,0,0.72);
-    padding: 3px 9px;
-    border-radius: 4px;
-    font-size: 12px;
-    font-weight: 700;
-  }
-  .cam-footer {
-    padding: 7px 10px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-size: 11px;
-    color: var(--muted);
-    background: var(--panel);
-    border-top: 1px solid var(--border);
-  }
-  .cam-actions { display: flex; gap: 5px; }
-
-  /* Focus Modal */
-  .modal-backdrop {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.84);
-    z-index: 100;
-    align-items: center;
-    justify-content: center;
-    padding: 18px;
-  }
-  .modal-backdrop.open { display: flex; }
-  .modal-box {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    width: 100%;
-    max-width: 1180px;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-  }
-  .modal-header {
-    padding: 10px 16px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-  .modal-body {
-    display: grid;
-    grid-template-columns: 1fr 270px;
-    gap: 0;
-  }
-  @media (max-width: 860px) { .modal-body { grid-template-columns: 1fr; } }
-  .focus-stage {
-    background: #000;
-    aspect-ratio: 16 / 9;
-    width: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .focus-stage img, .focus-stage video {
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
-  }
-  .ptz-sidebar {
-    padding: 14px;
-    border-left: 1px solid var(--border);
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    font-size: 12px;
-    max-height: 82vh;
-    overflow-y: auto;
-  }
-  .ptz-sidebar .row { display:flex; gap:5px; flex-wrap:wrap; margin-top:6px; align-items:center; }
-  .ptz-sidebar input[type=range] { flex:1; min-width:90px; }
-  .ptz-sidebar label.sl { display:flex; align-items:center; gap:6px; margin-top:6px; }
-  .ptz-sidebar label.sl span { width:74px; color:var(--muted); }
-  .dpad button { touch-action: none; user-select: none; }
-  .cam-params { max-height:220px; overflow:auto; margin-top:6px; border:1px solid var(--border); border-radius:4px; }
-  .cam-params table { width:100%; border-collapse:collapse; font-size:11px; }
-  .cam-params td { padding:2px 6px; border-bottom:1px solid var(--border); word-break:break-all; }
-  .cam-params td:first-child { color:var(--muted); white-space:nowrap; }
-  .cam-params tr.sec td { color:var(--text, inherit); font-weight:600; background:rgba(127,127,127,0.12); }
-  .dpad {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 6px;
-    width: 150px;
-    margin: 0 auto;
-  }
-  .dpad button {
-    height: 40px;
-    font-size: 15px;
-  }
-
-  /* Events Grid */
-  .events-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
-    gap: 12px;
-    margin-top: 12px;
-  }
-  .event-card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    overflow: hidden;
-    display: flex;
-    flex-direction: column;
-  }
-  .event-thumb {
-    aspect-ratio: 16 / 9;
-    background: #000;
-    position: relative;
-    cursor: pointer;
-  }
-  .event-thumb img { width: 100%; height: 100%; object-fit: cover; }
-  .event-meta { padding: 10px; font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
-
-  /* Settings Table */
-  .settings-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-    gap: 16px;
-  }
-  .card-panel {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 16px;
-  }
-  .form-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 8px 0;
-    border-bottom: 1px solid rgba(48,54,61,0.5);
-    font-size: 13px;
-  }
-</style>
-</head>
-<body>
-
-<header>
-  <div class="brand">
-    <span>📹 C22S Camera Hub & Smart Motion NVR</span>
-    <span class="badge ok" id="hdr-cam-count">0 Camera</span>
-    <span class="badge ok" id="hdr-ws-status">⚡ Live 25 FPS</span>
-    <span class="badge" id="hdr-storage">RAM Buffer: 0 KB</span>
-  </div>
-  <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('live', this)">Chế độ Lưới (Live Grid)</button>
-    <button class="tab-btn" onclick="switchTab('events', this)">Lịch sử Chuyển động (Events)</button>
-    <button class="tab-btn" onclick="switchTab('settings', this)">Cài đặt & Quản lý Phòng</button>
-  </div>
-  <div class="toolbar">
-    <button class="btn primary" onclick="openQrModal()" style="font-weight:700; background:linear-gradient(135deg,#238636,#2ea043); border-color:#2ea043;">🚀 Khui Camera Mới / Thêm QR (1-Click)</button>
-    <a class="btn" href="/sonic" target="_blank" style="text-decoration:none; border-color:#58a6ff; color:#58a6ff;" title="Trang nạp Wi-Fi rút gọn tối ưu cho màn hình Điện thoại">📱 Chế độ ĐT (/sonic)</a>
-    <button class="btn" id="btn-scan-lan" onclick="scanLanNow()" title="Quét toàn bộ 254 IP trong mạng LAN để bắt camera mới">🔍 Quét LAN</button>
-    <label>Bố cục:</label>
-    <select id="grid-cols" onchange="updateGridCols()">
-      <option value="auto">Tự động</option>
-      <option value="cols-2">Lưới 2×2</option>
-      <option value="cols-3">Lưới 3×3</option>
-      <option value="cols-4">Lưới 4×4 (15-16 Phòng)</option>
-    </select>
-    <label>Độ mượt Lưới:</label>
-    <select id="grid-fps" onchange="syncWsConfig()">
-      <option value="25" selected>⚡ 25 FPS (Real-time Siêu mượt)</option>
-      <option value="15">⚖️ 15 FPS (Cân bằng)</option>
-      <option value="6">🍃 6 FPS (Tiết kiệm CPU cho i3-6100)</option>
-      <option value="0">⏸ Tắt hình Lưới (0% Decode CPU)</option>
-    </select>
-  </div>
-</header>
-
-<main>
-  <!-- TAB 1: LIVE GRID -->
-  <section id="tab-live" class="view-section active">
-    <div id="cam-grid" class="cam-grid"></div>
-  </section>
-
-  <!-- TAB 2: EVENTS PLAYBACK -->
-  <section id="tab-events" class="view-section">
-    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-      <label>Lọc theo phòng:</label>
-      <select id="ev-room-filter" onchange="loadEvents()"><option value="ALL">Tất cả phòng</option></select>
-      <button class="btn primary" onclick="loadEvents()">🔄 Làm mới danh sách</button>
-      <span id="ev-summary" style="color:var(--muted); font-size:12px;"></span>
-    </div>
-    <div id="events-grid" class="events-grid"></div>
-  </section>
-
-  <!-- TAB 3: SETTINGS & STORAGE -->
-  <section id="tab-settings" class="view-section">
-    <div class="settings-grid">
-      <div class="card-panel">
-        <h3 style="margin-bottom:12px; font-size:15px;">⚙️ Cấu hình Bộ đệm RAM & Ghi hình Chuyển động</h3>
-        <div class="form-row">
-          <span>Ghi trước chuyển động (RAM Pre-roll):</span>
-          <div><input type="number" id="set-preroll" value="10" min="2" max="25" style="width:70px"> giây</div>
-        </div>
-        <div class="form-row">
-          <span>Ghi sau chuyển động (Post-roll):</span>
-          <div><input type="number" id="set-postroll" value="10" min="3" max="60" style="width:70px"> giây</div>
-        </div>
-        <div class="form-row">
-          <span>Độ nhạy đột biến P-Frame H.265 (1.5 = nhạy, 2.5 = chuẩn):</span>
-          <div><input type="number" id="set-sens" value="2.25" step="0.05" min="1.2" max="3.5" style="width:70px">x</div>
-        </div>
-        <div class="form-row">
-          <span>Kích hoạt P-Frame Spike Trigger (kết hợp cùng AI/Alarm phần cứng):</span>
-          <input type="checkbox" id="set-pframe-en" checked>
-        </div>
-        <div class="form-row">
-          <span>Giới hạn dung lượng thư mục Recordings tối đa:</span>
-          <div><input type="number" id="set-maxgb" value="50" min="1" max="2000" style="width:70px"> GB</div>
-        </div>
-        <div class="form-row">
-          <span>Dung lượng ổ cứng trống tối thiểu (tự xóa xoay vòng):</span>
-          <div><input type="number" id="set-freegb" value="10" min="1" max="500" style="width:70px"> GB</div>
-        </div>
-        <div style="margin-top:14px; text-align:right;">
-          <button class="btn primary" onclick="saveSettings()">💾 Lưu Cấu Hình</button>
-        </div>
-      </div>
-
-      <div class="card-panel">
-        <h3 style="margin-bottom:12px; font-size:15px;">🏷️ Quản lý Danh sách Phòng & Đổi tên OSD</h3>
-        <div id="room-Rename-list"></div>
-      </div>
-    </div>
-  </section>
-</main>
-
-<!-- FOCUS & PTZ MODAL -->
-<div class="modal-backdrop" id="focus-modal">
-  <div class="modal-box">
-    <div class="modal-header">
-      <div style="display:flex; align-items:center; gap:10px;">
-        <strong id="focus-title">Phòng</strong>
-        <span class="badge ok" id="focus-fps-badge">25 FPS</span>
-      </div>
-      <div style="display:flex; gap:8px;">
-        <button class="btn" onclick="triggerMotionManual(focusUid, 'trigger')">⚡ Ghi thử 20s (Pre+Post)</button>
-        <button class="btn danger" onclick="closeFocusModal()">✖ Đóng</button>
-      </div>
-    </div>
-    <div class="modal-body">
-      <div class="focus-stage" id="focus-stage">
-        <img id="focus-img" alt="Focus Live Stream">
-      </div>
-      <div class="ptz-sidebar">
-        <div>
-          <strong>🕹️ Điều khiển Xoay PTZ 360°</strong>
-          <div style="color:var(--muted); margin-top:2px;">Chạm = nhích 1 bước · Giữ = xoay liên tục</div>
-          <div class="dpad" style="margin-top:8px;">
-            <button class="btn" data-ptz="leftup">◤</button>
-            <button class="btn" data-ptz="up">▲</button>
-            <button class="btn" data-ptz="rightup">◥</button>
-            <button class="btn" data-ptz="left">◀</button>
-            <button class="btn" onclick="sendPtz('center')" title="Về giữa">●</button>
-            <button class="btn" data-ptz="right">▶</button>
-            <button class="btn" data-ptz="leftdown">◣</button>
-            <button class="btn" data-ptz="down">▼</button>
-            <button class="btn" data-ptz="rightdown">◢</button>
-          </div>
-          <div class="row">
-            <button class="btn" onclick="sendPtz('hscan')">↔ Quét ngang</button>
-            <button class="btn" onclick="sendPtz('vscan')">↕ Quét dọc</button>
-            <button class="btn danger" onclick="sendPtz('hscan_stop'); sendPtz('vscan_stop'); sendPtz('stop');">■ Dừng</button>
-          </div>
-          <label class="sl"><span>Tốc độ xoay</span>
-            <input type="range" min="1" max="10" value="10" id="sl-ptzspeed" onchange="sendPtz('ptz_speed', {value: this.value})">
-          </label>
-        </div>
-        <div>
-          <strong>📍 Vị trí nhớ (Presets)</strong>
-          <div class="row">
-            <select id="ptz-preset" style="flex:1;">
-              <option value="1">Góc 1</option><option value="2">Góc 2</option><option value="3">Góc 3</option>
-              <option value="4">Góc 4</option><option value="5">Góc 5</option><option value="6">Góc 6</option>
-              <option value="7">Góc 7</option><option value="8">Góc 8</option><option value="9">Góc 9</option>
-              <option value="10">Góc 10</option><option value="11">Góc 11</option><option value="12">Góc 12</option>
-              <option value="13">Góc 13</option><option value="14">Góc 14</option><option value="15">Góc 15</option>
-              <option value="16">Góc 16</option>
-            </select>
-            <button class="btn primary" onclick="sendPtz('preset' + document.getElementById('ptz-preset').value + '_go')">Gọi</button>
-            <button class="btn" onclick="if(confirm('Lưu vị trí hiện tại vào góc ' + document.getElementById('ptz-preset').value + '?')) sendPtz('preset' + document.getElementById('ptz-preset').value + '_set')">Lưu</button>
-          </div>
-        </div>
-        <div>
-          <strong>🌙 Hồng ngoại & Hình ảnh</strong>
-          <div class="row">
-            <button class="btn" onclick="sendPtz('ir_auto')">IR Tự động</button>
-            <button class="btn" onclick="sendPtz('ir_on')">Bật IR</button>
-            <button class="btn" onclick="sendPtz('ir_off')">Tắt IR</button>
-          </div>
-          <div class="row">
-            <button class="btn" onclick="sendPtz('flip_normal')">Hình chuẩn</button>
-            <button class="btn" onclick="sendPtz('flip_vh')">Lật 180°</button>
-            <button class="btn" onclick="sendPtz('flip_v')">Lật dọc</button>
-            <button class="btn" onclick="sendPtz('flip_h')">Gương</button>
-          </div>
-          <label class="sl"><span>Độ sáng</span>
-            <input type="range" min="0" max="255" value="128" id="sl-brightness" onchange="sendPtz('brightness', {value: this.value})">
-          </label>
-          <label class="sl"><span>Tương phản</span>
-            <input type="range" min="0" max="255" value="128" id="sl-contrast" onchange="sendPtz('contrast', {value: this.value})">
-          </label>
-          <label class="sl"><span>Bão hoà</span>
-            <input type="range" min="0" max="255" value="128" id="sl-saturation" onchange="sendPtz('saturation', {value: this.value})">
-          </label>
-          <label class="sl"><span>Âm lượng mic</span>
-            <input type="range" min="0" max="31" value="31" id="sl-mic" onchange="sendPtz('mic_volume', {value: this.value})">
-          </label>
-          <label class="sl"><span>Âm lượng loa</span>
-            <input type="range" min="0" max="31" value="31" id="sl-speaker" onchange="sendPtz('speaker_volume', {value: this.value})">
-          </label>
-          <div class="row">
-            <button class="btn" onclick="sendPtz('osd_on')">Hiện OSD</button>
-            <button class="btn" onclick="sendPtz('osd_off')">Ẩn OSD</button>
-            <button class="btn" onclick="sendPtz('hz_50')">50Hz</button>
-            <button class="btn" onclick="sendPtz('hz_60')">60Hz</button>
-          </div>
-        </div>
-        <div>
-          <strong>🔔 Cảnh báo & Đèn</strong>
-          <label class="sl"><span>Độ nhạy CĐ</span>
-            <input type="range" min="1" max="10" value="5" id="sl-motion" onchange="sendPtz('motion_sensitivity', {value: this.value})">
-          </label>
-          <div class="row">
-            <button class="btn" onclick="sendPtz('led_mode', {value: 1})">Bật đèn báo</button>
-            <button class="btn" onclick="sendPtz('led_mode', {value: 0})">Tắt đèn báo</button>
-          </div>
-          <div class="row">
-            <button class="btn" onclick="sendPtz('track_on')">Bám theo người: Bật</button>
-            <button class="btn" onclick="sendPtz('track_off')">Tắt</button>
-          </div>
-          <div class="row">
-            <button class="btn" onclick="sendPtz('humanframe_on')">Khung người: Bật</button>
-            <button class="btn" onclick="sendPtz('humanframe_off')">Tắt</button>
-          </div>
-          <div style="color:var(--muted); margin-top:4px;">Bấm “Đọc từ camera” bên dưới để xem trạng thái thực sau khi đổi.</div>
-        </div>
-        <div>
-          <strong>⚙️ Thiết Lập Camera Từ Xa (Internet/LAN)</strong>
-          <div style="display:flex; gap:5px; flex-wrap:wrap; margin-top:6px;">
-            <button class="btn" onclick="rebootCamera(focusUid, 'Camera')">🔄 Khởi động lại</button>
-            <button class="btn" onclick="changeCameraPassword(focusUid, 'Camera')">🔑 Đổi mật khẩu</button>
-            <button class="btn" onclick="pushWifiToCamera(focusUid, 'Camera')">📡 Đổi Wi-Fi</button>
-          </div>
-        </div>
-        <div id="ptz-status" style="min-height:22px; font-size:12px; margin-top:4px; padding:6px 10px; border-radius:4px; display:none;"></div>
-        <div>
-          <strong>📋 Thông số & tính năng camera</strong>
-          <div class="row">
-            <button class="btn" onclick="loadCamParams()">Đọc từ camera</button>
-            <input type="text" id="cam-params-filter" placeholder="lọc..." oninput="renderCamParams()" style="flex:1; min-width:60px;">
-          </div>
-          <div id="cam-caps" style="display:none; margin-top:6px;"></div>
-          <div class="cam-params" id="cam-params" style="display:none;"></div>
-        </div>
-        <details>
-          <summary style="cursor:pointer;"><strong>🧪 Gửi CGI thủ công (nâng cao)</strong></summary>
-          <div class="row">
-            <input type="text" id="raw-cgi" placeholder="get_misc.cgi  hoặc  camera_control.cgi?param=1&value=128" style="flex:1; min-width:120px;" onkeydown="if(event.key==='Enter')sendRawCgi()">
-            <button class="btn" onclick="sendRawCgi()">Gửi</button>
-          </div>
-          <pre id="raw-cgi-out" style="display:none; white-space:pre-wrap; word-break:break-all; font-size:11px; max-height:160px; overflow:auto; margin:6px 0 0; padding:6px; border:1px solid var(--border); border-radius:4px;"></pre>
-        </details>
-        <div id="focus-info" style="color:var(--muted); line-height:1.5;"></div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- ADD CAMERA BY QR & WIFI PROVISIONING MODAL -->
-<div class="modal-backdrop" id="qr-modal">
-  <div class="modal-box" style="max-width:820px; max-height:94vh; overflow-y:auto;">
-    <div class="modal-header">
-      <strong>🚀 Thêm Camera (QR &amp; UID) / Khui Hộp Nạp Wi-Fi 1-Click</strong>
-      <button class="btn danger" onclick="closeQrModal()">✖ Đóng</button>
-    </div>
-    <div style="padding:16px; display:flex; flex-direction:column; gap:14px; font-size:13px;">
-
-      <!-- 2-TAB SEGMENTED CONTROL -->
-      <div style="display:flex; border-bottom:2px solid var(--border); gap:8px;">
-        <button id="modal-tab-link" type="button" onclick="switchModalTab('link')"
-                style="padding:10px 18px; font-size:13px; font-weight:700; border:none; background:none; cursor:pointer; color:#58a6ff; border-bottom:3px solid #1f6feb; margin-bottom:-2px; display:flex; align-items:center; gap:6px;">
-          🔗 Camera Đã Có Wi-Fi (Chỉ Liên Kết Server)
-        </button>
-        <button id="modal-tab-unbox" type="button" onclick="switchModalTab('unbox')"
-                style="padding:10px 18px; font-size:13px; font-weight:700; border:none; background:none; cursor:pointer; color:var(--muted); border-bottom:3px solid transparent; margin-bottom:-2px; display:flex; align-items:center; gap:6px;">
-          📦 Khui Hộp Mới (Nạp Wi-Fi Bằng Sóng Âm &amp; Liên Kết Tự Động)
-        </button>
-      </div>
-
-      <!-- DESCRIPTIONS -->
-      <div id="modal-desc-link" style="color:var(--muted); font-size:12.5px; line-height:1.45; background:#161b22; padding:10px 12px; border-radius:6px; border:1px solid var(--border);">
-        💡 <b>Camera đã có mạng Wi-Fi hoặc cắm dây LAN:</b> Chỉ cần quét/nhập UID. Server từ xa sẽ kích hoạt tìm kiếm WAN P2P &amp; quét LAN, đục lỗ UDP trực tiếp qua Internet mà không cần nạp lại Wi-Fi.
-      </div>
-      <div id="modal-desc-unbox" style="display:none; color:var(--muted); font-size:12.5px; line-height:1.45; background:#161b22; padding:10px 12px; border-radius:6px; border:1px solid #238636;">
-        📦 <b>Camera mới khui hộp (Mật khẩu mặc định <code>888888</code>):</b> Nhập UID + Tên &amp; Mật khẩu Wi-Fi tại nơi lắp. Loa điện thoại/PC sẽ phát sóng âm nạp Wi-Fi vào Camera và Server sẽ tự động đục lỗ UDP bắt tay, rồi <b>tự động tắt sóng âm</b> ngay khi kết nối thành công ("Một lần và mãi mãi")!
-      </div>
-
-      <!-- STEP 1: QR IMAGE UPLOAD & UID -->
-      <div style="background:#0b0f17; border:1px solid var(--border); border-radius:8px; padding:12px;">
-        <div style="font-weight:700; margin-bottom:8px; color:#58a6ff;">Bước 1: Quét/Tải ảnh Tem QR hoặc Nhập mã UID — Hỗ trợ kết nối Camera ở BẤT KỲ MẠNG NÀO qua Internet (🌐 WAN P2P / Cloud Relay) &amp; LAN</div>
-        <div id="qr-dropzone"
-             onclick="document.getElementById('qr-file-input').click()"
-             ondragover="event.preventDefault(); this.style.borderColor='#2f81f7';"
-             ondragleave="this.style.borderColor='var(--border)';"
-             ondrop="handleQrDrop(event)"
-             style="border:2px dashed var(--border); border-radius:8px; padding:14px; text-align:center; cursor:pointer; background:#161b22; transition:0.15s;">
-          <input type="file" id="qr-file-input" accept="image/*" style="display:none" onchange="handleQrFileSelect(this.files[0])">
-          <div id="qr-preview-wrap" style="display:none; margin-bottom:8px;">
-            <img id="qr-preview-img" style="max-height:130px; border-radius:6px; border:1px solid var(--border);">
-          </div>
-          <div style="font-size:13px; font-weight:600; color:var(--text);">📤 Chụp/Chọn ảnh tem QR dưới đáy Camera, Kéo thả ảnh, hoặc bấm <kbd style="background:#21262d; padding:2px 6px; border-radius:4px;">Ctrl + V</kbd></div>
-          <div style="color:var(--muted); font-size:11px; margin-top:3px;">Camera ở mạng khác / từ xa qua Internet (WAN P2P) có thể thêm trực tiếp bằng mã UID (VD: <code>VSTJ082299RLSXK</code> hoặc <code>VSTJ-082299-RLSXK</code>)</div>
-        </div>
-
-        <div id="qr-decode-result" style="display:none; margin-top:10px; padding:8px 12px; border-radius:6px; background:rgba(35,134,54,0.15); border:1px solid var(--accent); line-height:1.5; font-size:12px;"></div>
-
-        <div style="display:grid; grid-template-columns:1.2fr 1fr 1fr 90px; gap:10px; margin-top:10px;">
-          <div>
-            <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Mã UID trên tem Camera (*):</label>
-            <input type="text" id="qr-did-input" placeholder="VD: VSTJ082299RLSXK" style="width:100%; font-family:monospace;">
-          </div>
-          <div>
-            <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Tên Phòng / Vị trí hiển thị (*):</label>
-            <input type="text" id="qr-room-input" placeholder="VD: C22S_1" style="width:100%;">
-          </div>
-          <div>
-            <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Mật khẩu Camera:</label>
-            <input type="text" id="qr-pwd-input" value="888888" placeholder="Mặc định: 888888" style="width:100%; font-family:monospace;">
-          </div>
-          <div>
-            <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Model:</label>
-            <input type="text" id="qr-model-input" value="CS22S" style="width:100%;">
-          </div>
-        </div>
-        <input type="hidden" id="qr-ip-input" value="">
-
-        <!-- ACTION IN STEP 1 WHEN IN LINK-ONLY MODE -->
-        <div id="modal-action-link" style="margin-top:12px; display:flex; gap:10px; align-items:center;">
-          <button class="btn primary" type="button" id="btn-modal-link-only" onclick="startOneClickOnboarding(false)"
-                  style="flex:1; background:linear-gradient(135deg,#1f6feb,#238636); border-color:#388bfd; font-size:14px; font-weight:800; padding:11px 18px; border-radius:8px; box-shadow:0 4px 14px rgba(31,111,235,0.35);">
-            🔗 Liên Kết Server Ngay (Không Cần Nạp Wi-Fi)
-          </button>
-        </div>
-      </div>
-
-      <!-- STEP 2: 1-CLICK UNBOXING & WIFI PROVISIONING (ONLY IN UNBOX MODE) -->
-      <div id="modal-unbox-step-2" style="display:none; background:#0b0f17; border:1px solid #238636; border-radius:8px; padding:14px;">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:6px;">
-          <span style="font-weight:700; color:#3fb950; font-size:14px;">Bước 2: Nạp Wi-Fi cho Camera mới khui hộp (Qua loa Điện thoại / PC)</span>
-          <div style="display:flex; gap:6px;">
-            <a class="btn" href="/sonic" target="_blank" style="font-size:11px; padding:3px 8px; text-decoration:none; color:#58a6ff; border-color:#58a6ff;">📱 Mở trang Mobile /sonic</a>
-            <button class="btn" onclick="loadHostWifiInfo(true)" style="font-size:11px; padding:3px 8px;">🔄 Gợi ý Wi-Fi</button>
-          </div>
-        </div>
-        <div style="color:var(--muted); font-size:12px; margin-bottom:10px; line-height:1.45;">
-          <b>"Một lần và mãi mãi":</b> Điện thoại chỉ làm cầu nối tạm thời để phát sóng âm nạp Wi-Fi tại nơi lắp đặt. Ngay khi Camera vào Wi-Fi và báo danh lên P2P Cloud, Server từ xa sẽ tự động đục lỗ UDP bắt tay trực tiếp và <b>tự động ngắt sóng âm</b>!
-        </div>
-
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
-          <div>
-            <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Tên Wi-Fi (2.4GHz) tại nơi đặt Camera (*):</label>
-            <div style="display:flex; gap:6px;">
-              <input type="text" id="wifi-ssid-input" list="wifi-ssid-list" placeholder="Nhập tên mạng Wi-Fi 2.4GHz tại nơi lắp..." style="width:100%; font-weight:600;" oninput="onWifiSsidInput()">
-              <datalist id="wifi-ssid-list"></datalist>
-            </div>
-          </div>
-          <div>
-            <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">Mật khẩu Wi-Fi tại nơi đặt Camera (*):</label>
-            <div style="display:flex; gap:6px;">
-              <input type="password" id="wifi-pwd-input" placeholder="Nhập mật khẩu Wi-Fi..." style="width:100%;" oninput="refreshWifiQrPreview()">
-              <button class="btn" type="button" onclick="toggleWifiPwdVis()" title="Hiện/Ẩn mật khẩu" style="padding:5px 8px;">👁️</button>
-            </div>
-          </div>
-        </div>
-        <div style="margin-top:8px;">
-          <label style="display:block; color:var(--muted); margin-bottom:4px; font-size:12px;">4 số cuối MAC router, in trên tem đáy router (VD: <code>001e</code>) — nên nhập, đây là cách app Eye4 nạp Wi-Fi:</label>
-          <input type="text" id="wifi-bssid-input" value="" placeholder="VD: 001e (để trống = phát Full SSID, chưa kiểm chứng trên C22S)" style="width:100%;" autocapitalize="off" autocomplete="off" oninput="syncSonicModeFromBssid(); refreshWifiQrPreview()">
-        </div>
-
-        <div id="wifi-scan-status" style="color:var(--muted); font-size:11px; margin-top:6px;"></div>
-
-        <!-- 1-CLICK ONBOARD BUTTON & LIVE 3-STEP TRACKER -->
-        <div id="modal-action-unbox" style="margin-top:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-          <button class="btn primary" type="button" id="btn-oneclick-onboard" onclick="startOneClickOnboarding(true)"
-                  style="flex:1; min-width:260px; background:linear-gradient(135deg,#238636,#2ea043); border-color:#3fb950; font-size:15px; font-weight:800; padding:12px 18px; border-radius:8px; box-shadow:0 4px 14px rgba(35,134,54,0.35);">
-            🔊 Nạp Wi-Fi &amp; Tự Động Liên Kết Server
-          </button>
-          <button class="btn" type="button" onclick="toggleOpticalWifiQrModal()" style="border-color:#58a6ff; color:#58a6ff; padding:11px 12px; font-size:12px;">
-            👁️ Hiện QR Quang Học (Quét bằng mắt Cam)
-          </button>
-          <button class="btn danger" type="button" onclick="stopSonicWave()" style="padding:11px 12px; font-size:12px;">
-            ⏹ Dừng phát âm
-          </button>
-        </div>
-
-        <!-- OPTICAL WIFI QR CODE BOX (FOR CAMERA LENS SCANNING) -->
-        <div id="optical-wifi-qr-box" style="display:none; margin-top:12px; padding:12px; background:#fff; color:#111; border-radius:8px; text-align:center;">
-          <img id="optical-wifi-qr-img" style="width:210px; height:210px; display:block; margin:0 auto;" alt="Optical Wi-Fi QR">
-          <div style="font-size:12px; font-weight:700; margin-top:6px;">📷 Đưa màn hình mã QR này ra trước ống kính Camera (cách 15–20 cm) nếu muốn quét bằng mắt Camera</div>
-        </div>
-
-        <!-- VStarcam Sonic Wave Audio Provisioning + Phone Speaker Helper QR -->
-        <div id="wifi-qr-box" style="display:grid; margin-top:12px; padding:12px; background:#161b22; border:1px solid var(--border); border-radius:8px; grid-template-columns:175px 1fr; gap:14px; align-items:center;">
-          <div style="text-align:center; background:#fff; padding:8px; border-radius:8px; color:#0d1117;">
-            <img id="wifi-qr-img" style="width:155px; height:155px; display:block; margin:0 auto;" alt="Phone Sonic QR">
-            <div style="font-size:10px; font-weight:700; margin-top:4px; color:#111;">📱 Quét mở trên Điện thoại</div>
-          </div>
-          <div style="display:flex; flex-direction:column; gap:8px;">
-            <div style="font-weight:700; color:#3fb950; font-size:13px;">🔊 Bộ phát Sóng Âm VStarcam Sonic Wave (6.5–10.1 kHz)</div>
-            <div style="color:var(--muted); font-size:11.5px; line-height:1.45;">
-              Hãy bật <b>Max Volume (80–100% âm lượng)</b> và đặt loa Điện thoại sát lỗ Mic của Camera (cách 2–5 cm) khi Camera đang kêu <i>"Please use the App for Wi-Fi configuration"</i>.<br>
-              • Mạng mục tiêu: <code id="wifi-target-label">Chưa nhập</code> (Mã hóa: <code id="sonic-bssid-badge">Full SSID</code>)
-            </div>
-
-            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-              <audio id="sonic-audio-player" controls loop style="height:30px; width:240px;"></audio>
-              <select id="wifi-qr-fmt" onchange="refreshWifiQrPreview()" style="font-size:11px; padding:4px 6px;">
-                <option value="ssid" selected>Chế độ: Chuẩn VStarcam Full SSID (Mọi mạng Internet/Từ xa)</option>
-                <option value="combo">Chế độ: Kết hợp BSSID 2.4GHz + Tên SSID</option>
-                <option value="mac">Chế độ: Chuẩn VStarcam MAC 2.4GHz (1.8s/gói)</option>
-              </select>
-              <button class="btn" type="button" onclick="playSonicWavePcSpeaker()" style="border-color:#58a6ff; color:#58a6ff; font-size:11px; padding:4px 8px;">
-                🖥️ Loa PC
-              </button>
-              <button class="btn" type="button" onclick="pushWifiDirectCgi()" style="font-size:11px; padding:4px 8px;">📡 Bắn set_wifi.cgi</button>
-            </div>
-
-            <div id="sonic-mobile-link-box" style="font-size:11px; color:var(--muted);">
-              📱 Đang ngồi trên PC? Dùng ĐT quét mã QR bên trái hoặc mở <a id="sonic-mobile-link" href="/sonic" target="_blank" style="color:#58a6ff;">trang Mobile /sonic</a> để mang ĐT ra chỗ lắp Camera!
-            </div>
-
-            <div id="wifi-Wait-banner" style="padding:6px 10px; border-radius:6px; background:rgba(47,129,247,0.15); border:1px solid #2f81f7; color:#58a6ff; font-size:12px;">
-              🔄 Nhập UID + Wi-Fi rồi bấm <b>"🔊 Nạp Wi-Fi &amp; Tự Động Liên Kết Server"</b> để bắt đầu!
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- 3-STEP LIVE PROGRESS TRACKER (COMMON TO BOTH MODES) -->
-      <div id="onboard-progress-box" style="display:none; padding:12px; background:#161b22; border:1px solid #2f81f7; border-radius:8px;">
-        <div style="font-weight:700; font-size:13px; color:#e6edf3; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
-          <span id="onboard-progress-title">🚀 Tiến trình Liên Kết WAN P2P &amp; LAN (Fast-Poll 1.2s)</span>
-          <span class="badge" id="onboard-cloud-badge" style="color:#58a6ff; border-color:#2f81f7;">WAITING_FOR_WIFI</span>
-        </div>
-        <div style="display:flex; flex-direction:column; gap:7px; font-size:12.5px;">
-          <div id="onboard-step-1" style="padding:8px 11px; border-radius:6px; background:rgba(47,129,247,0.14); border:1px solid #2f81f7; color:#58a6ff;">
-            <b>Bước 1:</b> 📋 Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P / LAN...
-          </div>
-          <div id="onboard-step-2" style="padding:8px 11px; border-radius:6px; background:#0b0f17; border:1px solid var(--border); color:var(--muted);">
-            <b>Bước 2:</b> 🌐 Chờ Camera vào mạng &amp; báo danh lên P2P Cloud (<code>WAITING_FOR_WIFI</code> → <code>ONLINE_PUNCHING</code>)...
-          </div>
-          <div id="onboard-step-3" style="padding:8px 11px; border-radius:6px; background:#0b0f17; border:1px solid var(--border); color:var(--muted);">
-            <b>Bước 3:</b> 🔗 Server đục lỗ UDP &amp; xác thực (<code>CONNECTED</code>)...
-          </div>
-        </div>
-        <div id="onboard-final-banner" style="display:none; margin-top:10px; padding:10px 12px; border-radius:6px; background:rgba(63,185,80,0.2); border:1px solid #3fb950; color:#3fb950; font-weight:700; font-size:13px;"></div>
-      </div>
-
-      <!-- MODAL FOOTER BUTTONS -->
-      <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; border-top:1px solid var(--border); padding-top:10px;">
-        <button class="btn danger" onclick="closeQrModal()">✖ Đóng</button>
-        <div style="display:flex; gap:8px;">
-          <button class="btn primary" id="modal-bottom-link-btn" onclick="startOneClickOnboarding(false)" style="font-weight:700;">
-            🔗 Liên Kết Server Ngay
-          </button>
-          <button class="btn primary" id="modal-bottom-unbox-btn" onclick="startOneClickOnboarding(true)" style="display:none; background:linear-gradient(135deg,#238636,#2ea043); border-color:#3fb950; font-weight:700;">
-            🔊 Nạp Wi-Fi &amp; Liên Kết Ngay
-          </button>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-    </div>
-  </div>
-</div>
-
-<!-- VIDEO PLAYBACK MODAL -->
-<div class="modal-backdrop" id="play-modal">
-  <div class="modal-box" style="max-width:960px;">
-    <div class="modal-header">
-      <strong id="play-title">Xem lại Sự kiện</strong>
-      <div style="display:flex; gap:6px; align-items:center;">
-        <button class="btn" onclick="setPlaySpeed(1)">1x</button>
-        <button class="btn" onclick="setPlaySpeed(2)">2x</button>
-        <button class="btn" onclick="setPlaySpeed(4)">4x</button>
-        <a id="play-download" class="btn primary" download style="text-decoration:none;">⬇ Tải MP4</a>
-        <button class="btn danger" onclick="closePlayModal()">✖ Đóng</button>
-      </div>
-    </div>
-    <div class="focus-stage">
-      <video id="play-video" controls autoplay playsinline></video>
-    </div>
-  </div>
-</div>
-
-<script>
-let camerasData = [];
-let focusUid = null;
-let currentTab = 'live';
-let settingsLoaded = false;
-let ws = null;
-const prevBlobUrls = {};
-const fpsCounters = {}; // uid -> { count, lastTs, fps }
-
-function switchTab(tab, btn) {
-  currentTab = tab;
-  document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
-  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
-  document.getElementById('tab-' + tab).classList.add('active');
-  btn.classList.add('active');
-  if (tab === 'events') loadEvents();
-  syncWsConfig();
-}
-
-function updateGridCols() {
-  const val = document.getElementById('grid-cols').value;
-  const grid = document.getElementById('cam-grid');
-  grid.className = 'cam-grid ' + (val === 'auto' ? '' : val);
-}
-
-// =========================================================================
-// Multiplexed Real-Time 25 FPS Binary WebSocket Stream
-// =========================================================================
-
-function connectStreamWs() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${proto}//${location.host}/ws/streams`);
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => {
-    const b = document.getElementById('hdr-ws-status');
-    b.textContent = '⚡ Live Stream Connected';
-    b.className = 'badge ok';
-    syncWsConfig();
-  };
-
-  ws.onmessage = (ev) => {
-    if (!(ev.data instanceof ArrayBuffer)) return;
-    const u8 = new Uint8Array(ev.data);
-    if (u8.length < 4) return;
-    const ulen = u8[0];
-    if (u8.length <= 1 + ulen) return;
-
-    let uid = '';
-    for (let i = 1; i <= ulen; i++) uid += String.fromCharCode(u8[i]);
-
-    const jpegSlice = u8.subarray(1 + ulen);
-    const blob = new Blob([jpegSlice], { type: 'image/jpeg' });
-    const url = URL.createObjectURL(blob);
-
-    // Update grid card image
-    const gridImg = document.getElementById('img-' + uid);
-    if (gridImg) gridImg.src = url;
-
-    // Update focus modal image if focused on this camera
-    if (focusUid === uid) {
-      const focusImg = document.getElementById('focus-img');
-      if (focusImg) focusImg.src = url;
-    }
-
-    // Revoke previous Blob URL to prevent memory leak
-    if (prevBlobUrls[uid]) URL.revokeObjectURL(prevBlobUrls[uid]);
-    prevBlobUrls[uid] = url;
-
-    // Calculate live rendered FPS
-    const now = performance.now();
-    if (!fpsCounters[uid]) fpsCounters[uid] = { count: 0, lastTs: now, fps: 0 };
-    const fc = fpsCounters[uid];
-    fc.count++;
-    if (now - fc.lastTs >= 1000) {
-      fc.fps = Math.round((fc.count * 1000) / (now - fc.lastTs));
-      fc.count = 0;
-      fc.lastTs = now;
-      if (focusUid === uid) {
-        document.getElementById('focus-fps-badge').textContent = `⚡ ${fc.fps} FPS Real-Time`;
-      }
-    }
-  };
-
-  ws.onclose = () => {
-    const b = document.getElementById('hdr-ws-status');
-    b.textContent = '🔄 Reconnecting...';
-    b.className = 'badge';
-    setTimeout(connectStreamWs, 1000);
-  };
-}
-
-function syncWsConfig() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const gridFps = parseFloat(document.getElementById('grid-fps').value || '25');
-  const paused = document.hidden || (currentTab !== 'live' && !focusUid);
-  ws.send(JSON.stringify({
-    grid_fps: gridFps,
-    focus_uid: focusUid,
-    paused: paused,
-  }));
-}
-
-document.addEventListener('visibilitychange', syncWsConfig);
-
-async function pollStatus() {
-  try {
-    const res = await fetch('/api/status');
-    const data = await res.json();
-    camerasData = data.cameras || [];
-    const st = data.storage || {};
-    const totalRamKb = camerasData.reduce((acc, c) => acc + (c.ram_buffer_kb || 0), 0).toFixed(0);
-    const recCount = camerasData.filter(c => c.is_recording).length;
-
-    const camBadge = document.getElementById('hdr-cam-count');
-    camBadge.textContent = `${camerasData.length} Camera Online` + (recCount > 0 ? ` (${recCount} ĐANG GHI)` : '');
-    camBadge.className = 'badge ' + (recCount > 0 ? 'rec' : 'ok');
-
-    document.getElementById('hdr-storage').textContent =
-      `RAM Pre-roll: ${totalRamKb} KB | Đã lưu: ${st.clip_count || 0} clip (${st.used_mb || 0} MB / Trống ${st.disk_free_gb || 0} GB)`;
-
-    if (!settingsLoaded && data.settings) {
-      settingsLoaded = true;
-      document.getElementById('set-preroll').value = data.settings.pre_roll_sec;
-      document.getElementById('set-postroll').value = data.settings.post_roll_sec;
-      document.getElementById('set-sens').value = data.settings.pframe_sensitivity;
-      document.getElementById('set-pframe-en').checked = data.settings.enable_pframe_trigger;
-      document.getElementById('set-maxgb').value = data.settings.max_storage_gb;
-      document.getElementById('set-freegb').value = data.settings.min_free_gb;
-    }
-
-    renderCameraCards();
-    renderRoomRenameList();
-  } catch (e) {}
-}
-
-function renderCameraCards() {
-  const grid = document.getElementById('cam-grid');
-  const existingUids = new Set(Array.from(grid.children).map(el => el.dataset.uid));
-  const currentUids = new Set(camerasData.map(c => c.uid));
-
-  if (existingUids.size !== currentUids.size || [...existingUids].some(u => !currentUids.has(u))) {
-    grid.innerHTML = '';
-    for (const c of camerasData) {
-      const card = document.createElement('div');
-      card.className = 'cam-card';
-      card.dataset.uid = c.uid;
-      card.id = 'card-' + c.uid;
-      card.innerHTML = `
-        <div class="cam-video-wrap" onclick="openFocusModal('${c.uid}')">
-          <img id="img-${c.uid}" src="/api/camera/${c.uid}/snapshot.jpg?t=${Date.now()}" alt="${c.room_name}">
-          <div class="cam-overlay-top">
-            <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-              <span class="room-pill" id="title-${c.uid}">${c.room_name}</span>
-              <span class="badge" id="mode-${c.uid}">🌐 WAN P2P</span>
-            </div>
-            <span class="badge" id="badge-${c.uid}">IDLE</span>
-          </div>
-        </div>
-        <div class="cam-footer">
-          <span id="stat-${c.uid}"></span>
-          <div class="cam-actions">
-            <button class="btn" onclick="triggerMotionManual('${c.uid}', 'trigger')" title="Ghi ngay đoạn 10s trước + 10s sau">⚡ Ghi 20s</button>
-            <button class="btn" id="mbtn-${c.uid}" onclick="toggleManualRecord('${c.uid}')">⏺ Ghi tay</button>
-            <button class="btn primary" onclick="openFocusModal('${c.uid}')">🔍 Phóng to / PTZ</button>
-          </div>
-        </div>
-      `;
-      grid.appendChild(card);
-    }
-
-    const sel = document.getElementById('ev-room-filter');
-    const curVal = sel.value;
-    sel.innerHTML = '<option value="ALL">Tất cả phòng</option>' +
-      camerasData.map(c => `<option value="${c.room_name}">${c.room_name} (${c.did || c.formatted_did || c.ip})</option>`).join('');
-    sel.value = curVal || 'ALL';
-  }
-
-  for (const c of camerasData) {
-    const card = document.getElementById('card-' + c.uid);
-    if (!card) continue;
-    card.className = 'cam-card' + (c.is_recording ? ' recording' : '');
-    const isWaiting = (c.state === 'WAITING_LAN' || c.state === 'CONNECTING' || c.state === 'DISCONNECTED');
-    const liveFps = (fpsCounters[c.uid] && fpsCounters[c.uid].fps) ? fpsCounters[c.uid].fps : c.fps;
-    const didStr = c.did || c.formatted_did || c.hw_deviceid || c.short_uid;
-    const ipPort = (c.ip && c.ip !== '0.0.0.0' && c.ip !== 'Chờ Wi-Fi LAN')
-      ? (c.port ? `${c.ip}:${c.port}` : c.ip)
-      : '0.0.0.0:32108';
-    const connMode = (c.connection_mode || 'LAN').toUpperCase();
-
-    const modeBadge = document.getElementById('mode-' + c.uid);
-    if (modeBadge) {
-      if (connMode.includes('RELAY')) {
-        modeBadge.textContent = `☁️ WAN RELAY • ${didStr}`;
-        modeBadge.style.background = 'rgba(163,113,247,0.22)';
-        modeBadge.style.borderColor = 'rgba(163,113,247,0.55)';
-        modeBadge.style.color = '#d2a8ff';
-      } else if (connMode.includes('WAN')) {
-        modeBadge.textContent = `🌐 WAN P2P • ${didStr}`;
-        modeBadge.style.background = 'rgba(47,129,247,0.22)';
-        modeBadge.style.borderColor = 'rgba(47,129,247,0.55)';
-        modeBadge.style.color = '#58a6ff';
-      } else {
-        modeBadge.textContent = `🏠 LAN • ${didStr}`;
-        modeBadge.style.background = 'rgba(63,185,80,0.20)';
-        modeBadge.style.borderColor = 'rgba(63,185,80,0.50)';
-        modeBadge.style.color = '#3fb950';
-      }
-    }
-
-    document.getElementById('title-' + c.uid).textContent = isWaiting
-      ? `${c.room_name} (${ipPort})`
-      : `${c.room_name} (${ipPort}) • ${liveFps} FPS`;
-
-    const badge = document.getElementById('badge-' + c.uid);
-    if (isWaiting) {
-      badge.className = 'badge';
-      const cloudSt = c.wan_cloud_status || 'IDLE';
-      if (c.onboarding_active) {
-        badge.style.background = 'rgba(47,129,247,0.28)';
-        badge.style.color = '#58a6ff';
-        badge.style.borderColor = '#2f81f7';
-        badge.textContent = `🚀 KHUI HỘP • ${cloudSt} (${didStr})`;
-      } else {
-        badge.style.background = 'rgba(210,153,34,0.25)';
-        badge.style.color = '#f59e0b';
-        badge.textContent = `⏳ KẾT NỐI ${connMode.replace('_', ' ')} • ${cloudSt}`;
-      }
-    } else if (c.is_recording) {
-      badge.style.background = '';
-      badge.style.color = '';
-      badge.className = 'badge rec';
-      badge.textContent = `● REC (${c.last_trigger || 'MOTION'} | +${c.post_roll_remaining}s)`;
-    } else {
-      badge.style.background = '';
-      badge.style.color = '';
-      badge.className = 'badge ok';
-      badge.textContent = `RAM Pre-roll (${c.ram_buffer_kb} KB)`;
-    }
-
-    document.getElementById('stat-' + c.uid).textContent = isWaiting
-      ? `UID: ${didStr} | ${ipPort} | RTSP :${c.rtsp_port} | Đang bắt tay ${connMode.replace('_', ' ')}`
-      : `${didStr} (${ipPort}) | ${c.codec.toUpperCase()} | ${c.kbps} KB/s | Cam ${c.fps}fps | RTSP :${c.rtsp_port} | Clips: ${c.clips_saved}`;
-
-    const mbtn = document.getElementById('mbtn-' + c.uid);
-    if (mbtn) {
-      mbtn.className = 'btn' + (c.manual_record ? ' danger' : '');
-      mbtn.textContent = c.manual_record ? '⏹ Dừng ghi' : '⏺ Ghi tay';
-    }
-
-    if (focusUid === c.uid) {
-      document.getElementById('focus-info').innerHTML =
-        `<b>UID (DID):</b> <code>${didStr}</code><br>` +
-        `<b>Chế độ:</b> ${connMode} (<code>${ipPort}</code>)<br>` +
-        `<b>RTSP:</b> <code>${c.rtsp_url}</code><br>` +
-        `<b>Bitrate:</b> ${c.kbps} KB/s (${c.fps} fps)<br>` +
-        `<b>Bộ đệm RAM:</b> ${c.ram_buffer_kb} KB<br>` +
-        `<b>Trạng thái:</b> ${c.is_recording ? '🔴 Đang ghi chuyển động' : '🟢 Đang chờ trên RAM (0 ghi đĩa)'}`;
-    }
-  }
-}
-
-function openFocusModal(uid) {
-  const cam = camerasData.find(c => c.uid === uid);
-  if (cam && cam.state === 'WAITING_LAN') {
-    lastAddedUid = uid;
-    openQrModal(cam.formatted_did || '', cam.room_name || '');
-    setTimeout(() => refreshWifiQrPreview(true), 250);
-    return;
-  }
-  focusUid = uid;
-  document.getElementById('focus-title').textContent = cam ? `📹 ${cam.room_name} (${cam.ip})` : uid;
-  if (prevBlobUrls[uid]) {
-    document.getElementById('focus-img').src = prevBlobUrls[uid];
-  } else {
-    document.getElementById('focus-img').src = `/api/camera/${uid}/snapshot.jpg?t=${Date.now()}`;
-  }
-  document.getElementById('focus-modal').classList.add('open');
-  syncWsConfig();
-}
-
-function closeFocusModal() {
-  ptzHoldEnd();
-  focusUid = null;
-  camParamsData = null;
-  for (const id of ['cam-params', 'cam-caps']) {
-    const cp = document.getElementById(id);
-    if (cp) { cp.style.display = 'none'; cp.innerHTML = ''; }
-  }
-  document.getElementById('focus-modal').classList.remove('open');
-  syncWsConfig();
-}
-
-let ptzToastTimer = null;
-function showPtzToast(msg, isOk = true) {
-  const el = document.getElementById('ptz-status');
-  if (!el) return;
-  el.style.display = 'block';
-  el.style.background = isOk ? 'rgba(46, 204, 113, 0.15)' : 'rgba(231, 76, 60, 0.15)';
-  el.style.color = isOk ? '#2ecc71' : '#e74c3c';
-  el.style.border = isOk ? '1px solid rgba(46, 204, 113, 0.4)' : '1px solid rgba(231, 76, 60, 0.4)';
-  el.textContent = msg;
-  if (ptzToastTimer) clearTimeout(ptzToastTimer);
-  ptzToastTimer = setTimeout(() => {
-    el.style.display = 'none';
-  }, 2500);
-}
-
-async function sendPtz(action, extra, quiet) {
-  if (!focusUid) return null;
-  if (!quiet) showPtzToast('⏳ Đang gửi lệnh ' + action + '...', true);
-  try {
-    const res = await fetch(`/api/camera/${focusUid}/ptz`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(Object.assign({action}, extra || {}))
-    });
-    const d = await res.json();
-    if (d.ok) {
-      if (!quiet) showPtzToast(`✅ Camera đã nhận lệnh "${action}" (${d.connection_mode || 'P2P'})`, true);
-    } else {
-      showPtzToast(`❌ ${d.error || 'Thao tác thất bại'}`, false);
-    }
-    return d;
-  } catch (err) {
-    showPtzToast(`❌ Lỗi mạng: ${err.message}`, false);
-    return null;
-  }
-}
-
-// D-pad: tap = one step, press-and-hold = continuous move until release.
-let ptzHold = null;   // {action, timer, holding, started}
-function ptzHoldStart(action) {
-  ptzHoldEnd();
-  const st = {action, holding: false, started: null, timer: null};
-  st.timer = setTimeout(() => {
-    st.holding = true;
-    st.started = sendPtz(action, {hold: true});
-  }, 280);
-  ptzHold = st;
-}
-function ptzHoldEnd() {
-  const st = ptzHold;
-  if (!st) return;
-  ptzHold = null;
-  clearTimeout(st.timer);
-  if (st.holding) {
-    // Make sure the stop is sent after the move request has gone out
-    Promise.resolve(st.started).then(() => sendPtz('stop', null, true));
-  } else {
-    sendPtz(st.action);
-  }
-}
-document.addEventListener('DOMContentLoaded', () => {
-  document.querySelectorAll('.dpad [data-ptz]').forEach(btn => {
-    btn.addEventListener('pointerdown', ev => {
-      ev.preventDefault();
-      try { btn.setPointerCapture(ev.pointerId); } catch (e) {}
-      ptzHoldStart(btn.dataset.ptz);
-    });
-    ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(t =>
-      btn.addEventListener(t, () => ptzHoldEnd()));
-    btn.addEventListener('contextmenu', ev => ev.preventDefault());
-  });
-});
-window.addEventListener('blur', () => ptzHoldEnd());
-
-let camParamsData = null;   // [{cgi, title, values|null}]
-
-function escHtml(v) {
-  return String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
-function renderCamParams() {
-  const box = document.getElementById('cam-params');
-  if (!box || !camParamsData) return;
-  const filter = (document.getElementById('cam-params-filter').value || '').toLowerCase();
-  let html = '<table>';
-  const seen = new Set();
-  for (const sec of camParamsData) {
-    const vals = sec.values;
-    html += `<tr class="sec"><td colspan="2">${escHtml(sec.title)}</td></tr>`;
-    if (vals === null) {
-      html += '<tr><td colspan="2">⏳ Camera chưa trả lời mục này (đang bận) — bấm đọc lại</td></tr>';
-      continue;
-    }
-    if (vals.cgi === 'not support') {
-      html += '<tr><td colspan="2" style="color:var(--muted);">Firmware không hỗ trợ</td></tr>';
-      continue;
-    }
-    let shown = 0;
-    for (const k of Object.keys(vals).sort()) {
-      if (seen.has(k) || k === 'result' || k === 'command' || k === 'uid') continue;
-      seen.add(k);
-      if (filter && !k.toLowerCase().includes(filter) && !String(vals[k]).toLowerCase().includes(filter)) continue;
-      html += `<tr><td>${escHtml(k)}</td><td>${escHtml(vals[k])}</td></tr>`;
-      shown++;
-    }
-    if (!shown) html += '<tr><td colspan="2" style="color:var(--muted);">(không có mục khớp)</td></tr>';
-  }
-  box.innerHTML = html + '</table>';
-  box.style.display = 'block';
-}
-
-function syncCamControls() {
-  if (!camParamsData) return;
-  const all = Object.assign({}, ...camParamsData.map(s => s.values || {}));
-  const num = k => (all[k] !== undefined && all[k] !== '' && !isNaN(Number(all[k]))) ? Number(all[k]) : null;
-  const setv = (id, key) => { const el = document.getElementById(id); const v = num(key); if (el && v !== null) el.value = v; };
-  setv('sl-brightness', 'vbright');
-  setv('sl-contrast', 'vcontrast');
-  setv('sl-saturation', 'vsaturation');
-  setv('sl-mic', 'involume');
-  setv('sl-speaker', 'outvolume');
-  setv('sl-motion', 'alarm_motion_sensitivity');
-  setv('sl-ptzspeed', 'ptz_patrol_rate');
-  // Capability summary from the camera's own support_*/have* flags
-  const caps = [
-    ['haveMotor', 'Xoay PTZ'], ['haveMic', 'Micro'], ['haveHorn', 'Loa'], ['haveTf', 'Thẻ nhớ'],
-    ['support_humanDetect', 'Phát hiện người'], ['support_humanoidFrame', 'Khung người'],
-    ['support_motionArea', 'Vùng chuyển động'], ['support_cryDetect', 'Phát hiện tiếng khóc'],
-    ['support_smokeDetect', 'Báo khói'], ['support_departDetect', 'Phát hiện rời đi'],
-    ['support_pixel_shift', 'Đổi độ phân giải'], ['support_h264_h265_shift', 'Đổi H.264/H.265'],
-  ];
-  const el = document.getElementById('cam-caps');
-  if (el && all.sys_ver !== undefined) {
-    const chips = caps.filter(([k]) => all[k] !== undefined).map(([k, label]) =>
-      `<span class="badge ${all[k] === '1' ? 'ok' : ''}" style="font-size:10px; ${all[k] === '1' ? '' : 'opacity:.45; text-decoration:line-through;'}">${label}</span>`).join(' ');
-    const state = [];
-    if (all.enable !== undefined) state.push('Bám người: ' + (all.enable === '1' ? 'BẬT' : 'tắt'));
-    if (all.bHumanoidFrame !== undefined) state.push('Khung người: ' + (all.bHumanoidFrame === '1' ? 'BẬT' : 'tắt'));
-    if (all.led_mode !== undefined) state.push('Đèn báo: ' + (all.led_mode === '0' ? 'tắt' : 'BẬT'));
-    if (all.flip !== undefined) state.push('Lật: ' + ({'0':'chuẩn','1':'dọc','2':'gương','3':'180°'}[all.flip] || all.flip));
-    if (all.MainStreamWidth) state.push(`Luồng chính: ${all.MainStreamWidth}×${all.MainStreamHeight}`);
-    el.innerHTML = `<div style="color:var(--muted);">Firmware ${escHtml(all.sys_ver)}</div>`
-      + `<div style="display:flex; gap:4px; flex-wrap:wrap; margin-top:4px;">${chips}</div>`
-      + (state.length ? `<div style="margin-top:4px;">${escHtml(state.join(' · '))}</div>` : '');
-    el.style.display = 'block';
-  }
-}
-
-async function loadCamParams() {
-  if (!focusUid) return;
-  const uid = focusUid;
-  showPtzToast('⏳ Đang đọc thông số từ camera...', true);
-  try {
-    const res = await fetch(`/api/camera/${uid}/params`);
-    const d = await res.json();
-    if (uid !== focusUid) return;
-    camParamsData = d.sections || [];
-    renderCamParams();
-    if (!d.ok) { showPtzToast('❌ ' + (d.error || 'Không đọc được'), false); return; }
-    syncCamControls();
-    showPtzToast(d.partial
-      ? '⚠️ Camera mới trả lời một phần (đang bận) — bấm đọc lại sau ít giây'
-      : `✅ Đã đọc thông số (${d.connection_mode || 'P2P'})`, !d.partial);
-  } catch (err) {
-    showPtzToast('❌ Lỗi mạng: ' + err.message, false);
-  }
-}
-
-async function sendRawCgi() {
-  if (!focusUid) return;
-  const cgi = document.getElementById('raw-cgi').value.trim();
-  const out = document.getElementById('raw-cgi-out');
-  if (!cgi) return;
-  out.style.display = 'block';
-  out.textContent = '⏳ Đang gửi...';
-  try {
-    const res = await fetch(`/api/camera/${focusUid}/cgi`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({cgi})
-    });
-    const d = await res.json();
-    if (!d.ok) { out.textContent = '❌ ' + (d.error || 'Thất bại'); return; }
-    const keys = Object.keys(d.values || {}).sort();
-    out.textContent = keys.length
-      ? keys.map(k => `${k} = ${d.values[k]}`).join('\n')
-      : '✅ Camera đã nhận lệnh (không có dữ liệu trả về).';
-  } catch (err) {
-    out.textContent = '❌ Lỗi mạng: ' + err.message;
-  }
-}
-
-async function triggerMotionManual(uid, action) {
-  if (!uid) return;
-  await fetch(`/api/camera/${uid}/record`, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action})
-  });
-  pollStatus();
-}
-
-async function toggleManualRecord(uid) {
-  const cam = camerasData.find(c => c.uid === uid);
-  if (!cam) return;
-  const action = cam.manual_record ? 'manual_off' : 'manual_on';
-  await triggerMotionManual(uid, action);
-}
-
-async function loadEvents() {
-  const room = document.getElementById('ev-room-filter').value || 'ALL';
-  const res = await fetch(`/api/events?room=${encodeURIComponent(room)}`);
-  const data = await res.json();
-  const events = data.events || [];
-  document.getElementById('ev-summary').textContent = `Hiển thị ${events.length} video sự kiện`;
-
-  const grid = document.getElementById('events-grid');
-  if (events.length === 0) {
-    grid.innerHTML = `<div style="color:var(--muted); padding:20px;">Chưa có video chuyển động nào. Bạn có thể bấm nút "⚡ Ghi 20s" trên ô camera hoặc đi qua trước camera để test!</div>`;
-    return;
-  }
-  grid.innerHTML = events.map(ev => `
-    <div class="event-card">
-      <div class="event-thumb" onclick="playEvent('${ev.video_rel}', '${ev.room_name} | ${ev.start_time}')">
-        ${ev.thumb_rel ? `<img src="/recordings/${ev.thumb_rel}" loading="lazy">` : ''}
-        <div class="cam-overlay-top">
-          <span class="room-pill">${ev.room_name}</span>
-          <span class="badge">${ev.duration_sec}s | ${ev.size_mb} MB</span>
-        </div>
-      </div>
-      <div class="event-meta">
-        <div><strong>🕒 ${ev.start_time}</strong> → ${ev.end_time.split(' ')[1] || ''}</div>
-        <div style="color:var(--muted);">Trigger: <code>${ev.reason}</code> | ${ev.codec.toUpperCase()} ${ev.fps}fps</div>
-        <div style="display:flex; justify-content:space-between; margin-top:6px;">
-          <button class="btn primary" onclick="playEvent('${ev.video_rel}', '${ev.room_name} | ${ev.start_time}')">▶ Xem Video</button>
-          <a class="btn" href="/recordings/${ev.video_rel}" download style="text-decoration:none;">⬇ Tải về</a>
-          <button class="btn danger" onclick="deleteEvent('${ev.video_rel}')">🗑 Xóa</button>
-        </div>
-      </div>
-    </div>
-  `).join('');
-}
-
-function playEvent(videoRel, title) {
-  const v = document.getElementById('play-video');
-  document.getElementById('play-title').textContent = title;
-  document.getElementById('play-download').href = '/recordings/' + videoRel;
-  v.src = '/recordings/' + videoRel;
-  v.playbackRate = 1.0;
-  document.getElementById('play-modal').classList.add('open');
-  v.play().catch(() => {});
-}
-
-function setPlaySpeed(rate) {
-  const v = document.getElementById('play-video');
-  v.playbackRate = rate;
-}
-
-function closePlayModal() {
-  const v = document.getElementById('play-video');
-  v.pause();
-  v.src = '';
-  document.getElementById('play-modal').classList.remove('open');
-}
-
-async function deleteEvent(videoRel) {
-  if (!confirm('Xóa đoạn video sự kiện này?')) return;
-  await fetch('/api/events', {
-    method: 'DELETE',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({video_rel: videoRel})
-  });
-  loadEvents();
-  pollStatus();
-}
-
-function renderRoomRenameList() {
-  const container = document.getElementById('room-Rename-list');
-  if (container.dataset.count === String(camerasData.length)) return;
-  container.dataset.count = String(camerasData.length);
-  container.innerHTML = camerasData.map(c => `
-    <div class="form-row">
-      <div>
-        <strong>${c.ip}</strong> <span style="color:var(--muted); font-size:11px;">(${c.formatted_did || c.hw_deviceid || c.short_uid})</span>
-        <span class="badge ${c.connected ? 'ok' : 'danger'}" style="margin-left:6px; font-size:10px;">${c.connection_mode || (c.connected ? 'LAN' : 'OFFLINE')}</span>
-      </div>
-      <div style="display:flex; gap:6px; flex-wrap:wrap;">
-        <input type="text" id="rname-${c.uid}" value="${c.room_name}" style="width:130px;">
-        <button class="btn primary" onclick="renameRoom('${c.uid}')">Đổi tên + OSD</button>
-        <button class="btn" onclick="pushWifiToCamera('${c.uid}', '${c.room_name}')" title="Bắn cấu hình Wi-Fi mới từ xa qua mạng Internet/LAN">📡 Đổi Wi-Fi</button>
-        <button class="btn" onclick="changeCameraPassword('${c.uid}', '${c.room_name}')" title="Đổi mật khẩu camera">🔑 Mật khẩu</button>
-        <button class="btn" onclick="rebootCamera('${c.uid}', '${c.room_name}')" title="Khởi động lại camera từ xa">🔄 Reboot</button>
-        <button class="btn danger" onclick="deleteCamera('${c.uid}', '${c.room_name}')" title="Xóa camera này khỏi Hub">🗑️</button>
-      </div>
-    </div>
-  `).join('');
-}
-
-async function renameRoom(uid) {
-  const val = document.getElementById('rname-' + uid).value;
-  await fetch(`/api/camera/${uid}/rename`, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({room_name: val})
-  });
-  document.getElementById('room-Rename-list').dataset.count = '';
-  pollStatus();
-}
-
-async function saveSettings() {
-  const payload = {
-    pre_roll_sec: parseFloat(document.getElementById('set-preroll').value),
-    post_roll_sec: parseFloat(document.getElementById('set-postroll').value),
-    pframe_sensitivity: parseFloat(document.getElementById('set-sens').value),
-    enable_pframe_trigger: document.getElementById('set-pframe-en').checked,
-    max_storage_gb: parseFloat(document.getElementById('set-maxgb').value),
-    min_free_gb: parseFloat(document.getElementById('set-freegb').value),
-  };
-  await fetch('/api/settings', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload)
-  });
-  alert('Đã lưu cấu hình thành công!');
-}
-
-
-// =========================================================================
-// QR Image Upload, Clipboard Paste & Camera Registration
-// =========================================================================
-
-let wifiPollTimer = null;
-let onboardFastPollTimer = null;
-let lastAddedUid = null;
-let hostCurrentSsid = '';
-let hostCurrentBssid = '';
-let currentModalTab = 'link';
-
-function switchModalTab(mode) {
-  currentModalTab = mode;
-  stopSonicWave();
-  const btnLink = document.getElementById('modal-tab-link');
-  const btnUnbox = document.getElementById('modal-tab-unbox');
-  const descLink = document.getElementById('modal-desc-link');
-  const descUnbox = document.getElementById('modal-desc-unbox');
-  const step2 = document.getElementById('modal-unbox-step-2');
-  const actLink = document.getElementById('modal-action-link');
-  const bottomLink = document.getElementById('modal-bottom-link-btn');
-  const bottomUnbox = document.getElementById('modal-bottom-unbox-btn');
-  const pBox = document.getElementById('onboard-progress-box');
-  if (pBox) pBox.style.display = 'none';
-
-  if (mode === 'link') {
-    if (btnLink) {
-      btnLink.style.color = '#58a6ff';
-      btnLink.style.borderBottom = '3px solid #1f6feb';
-    }
-    if (btnUnbox) {
-      btnUnbox.style.color = 'var(--muted)';
-      btnUnbox.style.borderBottom = '3px solid transparent';
-    }
-    if (descLink) descLink.style.display = 'block';
-    if (descUnbox) descUnbox.style.display = 'none';
-    if (step2) step2.style.display = 'none';
-    if (actLink) actLink.style.display = 'flex';
-    if (bottomLink) bottomLink.style.display = 'inline-block';
-    if (bottomUnbox) bottomUnbox.style.display = 'none';
-  } else {
-    if (btnLink) {
-      btnLink.style.color = 'var(--muted)';
-      btnLink.style.borderBottom = '3px solid transparent';
-    }
-    if (btnUnbox) {
-      btnUnbox.style.color = '#3fb950';
-      btnUnbox.style.borderBottom = '3px solid #238636';
-    }
-    if (descLink) descLink.style.display = 'none';
-    if (descUnbox) descUnbox.style.display = 'block';
-    if (step2) step2.style.display = 'block';
-    if (actLink) actLink.style.display = 'none';
-    if (bottomLink) bottomLink.style.display = 'none';
-    if (bottomUnbox) bottomUnbox.style.display = 'inline-block';
-    loadHostWifiInfo(false);
-  }
-}
-
-function openQrModal(prefillDid = '', prefillRoom = '', defaultTab = 'link') {
-  document.getElementById('qr-modal').classList.add('open');
-  const nextIdx = (camerasData ? camerasData.length : 1) + 1;
-  const roomInp = document.getElementById('qr-room-input');
-  if (prefillDid) document.getElementById('qr-did-input').value = prefillDid;
-  if (prefillRoom) {
-    roomInp.value = prefillRoom;
-  } else if (!roomInp.value) {
-    roomInp.value = 'Phong_' + (100 + nextIdx);
-  }
-  switchModalTab(defaultTab);
-  startWifiWaitPolling();
-}
-
-function closeQrModal() {
-  stopSonicWave();
-  document.getElementById('qr-modal').classList.remove('open');
-  if (wifiPollTimer) {
-    clearInterval(wifiPollTimer);
-    wifiPollTimer = null;
-  }
-  if (onboardFastPollTimer) {
-    clearInterval(onboardFastPollTimer);
-    onboardFastPollTimer = null;
-  }
-}
-
-function onWifiSsidInput() {
-  const ssid = document.getElementById('wifi-ssid-input').value.trim();
-  const bssidInp = document.getElementById('wifi-bssid-input');
-  if (hostCurrentSsid && ssid !== hostCurrentSsid && bssidInp.value === hostCurrentBssid) {
-    bssidInp.value = '';
-  } else if (hostCurrentSsid && ssid === hostCurrentSsid && hostCurrentBssid) {
-    bssidInp.value = hostCurrentBssid;
-  }
-  refreshWifiQrPreview();
-}
-
-function toggleOpticalWifiQrModal() {
-  const box = document.getElementById('optical-wifi-qr-box');
-  const img = document.getElementById('optical-wifi-qr-img');
-  if (box.style.display === 'none') {
-    const ssid = document.getElementById('wifi-ssid-input').value.trim();
-    const pwd = document.getElementById('wifi-pwd-input').value;
-    const bssid = document.getElementById('wifi-bssid-input').value.trim();
-    if (!ssid) {
-      alert('Vui lòng nhập Tên Wi-Fi (2.4GHz) trước khi hiện mã QR quang học!');
-      return;
-    }
-    box.style.display = 'block';
-    fetch('/api/wifi/qr', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ ssid, password: pwd, bssid, format: 'eye4' })
-    }).then(r => r.json()).then(d => {
-      if (d.ok && d.data_url) img.src = d.data_url;
-    }).catch(() => {});
-  } else {
-    box.style.display = 'none';
-  }
-}
-
-async function startOneClickOnboarding(isUnbox = null) {
-  if (isUnbox === null) {
-    isUnbox = (currentModalTab === 'unbox');
-  }
-  const did = document.getElementById('qr-did-input').value.trim();
-  const room = document.getElementById('qr-room-input').value.trim();
-  const camPwd = ((document.getElementById('qr-pwd-input') || {}).value || '888888').trim() || '888888';
-  const ssid = document.getElementById('wifi-ssid-input').value.trim();
-  const wifiPwd = document.getElementById('wifi-pwd-input').value;
-  const wifiBssid = document.getElementById('wifi-bssid-input').value.trim();
-
-  if (!did) {
-    alert('Vui lòng chụp/tải ảnh tem QR hoặc nhập Mã UID trên thân Camera (VD: VSTJ082299RLSXK)!');
-    document.getElementById('qr-did-input').focus();
-    return;
-  }
-  if (isUnbox && !ssid) {
-    alert('Vui lòng nhập Tên mạng Wi-Fi (2.4GHz) tại nơi đặt Camera!');
-    document.getElementById('wifi-ssid-input').focus();
-    return;
-  }
-
-  const btnLink = document.getElementById('btn-modal-link-only');
-  const btnUnbox = document.getElementById('btn-oneclick-onboard');
-  const btmLink = document.getElementById('modal-bottom-link-btn');
-  const btmUnbox = document.getElementById('modal-bottom-unbox-btn');
-  if (btnLink) btnLink.disabled = true;
-  if (btnUnbox) btnUnbox.disabled = true;
-  if (btmLink) btmLink.disabled = true;
-  if (btmUnbox) btmUnbox.disabled = true;
-
-  if (isUnbox) {
-    if (btnUnbox) btnUnbox.textContent = '⏳ Đang đăng ký UID & Tạo sóng âm nạp Wi-Fi...';
-  } else {
-    if (btnLink) btnLink.textContent = '⏳ Đang kích hoạt kết nối WAN P2P & LAN...';
-  }
-
-  const pBox = document.getElementById('onboard-progress-box');
-  const pTitle = document.getElementById('onboard-progress-title');
-  const s1 = document.getElementById('onboard-step-1');
-  const s2 = document.getElementById('onboard-step-2');
-  const s3 = document.getElementById('onboard-step-3');
-  const fBanner = document.getElementById('onboard-final-banner');
-  const cBadge = document.getElementById('onboard-cloud-badge');
-
-  pBox.style.display = 'block';
-  fBanner.style.display = 'none';
-  if (pTitle) {
-    pTitle.textContent = isUnbox
-      ? '🚀 Tiến trình Khui Hộp & Nạp Wi-Fi (Fast-Poll 1.2s)'
-      : '🚀 Tiến trình Liên Kết WAN P2P & LAN (Fast-Poll 1.2s)';
-  }
-  s1.style.cssText = 'padding:8px 11px; border-radius:6px; background:rgba(47,129,247,0.16); border:1px solid #2f81f7; color:#58a6ff;';
-  if (isUnbox) {
-    s1.innerHTML = `<b>Bước 1:</b> 🔊 Đang phát sóng âm nạp Wi-Fi <b>"${ssid}"</b> từ điện thoại/loa sang Camera...`;
-  } else {
-    s1.innerHTML = `<b>Bước 1:</b> 📋 Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P / LAN (180s fast-poll)...`;
-  }
-  s2.style.cssText = 'padding:8px 11px; border-radius:6px; background:#0b0f17; border:1px solid var(--border); color:var(--muted);';
-  s2.innerHTML = '<b>Bước 2:</b> 🌐 Chờ Camera vào mạng &amp; báo danh lên P2P Cloud (<code>WAITING_FOR_WIFI</code> → <code>ONLINE_PUNCHING</code>)...';
-  s3.style.cssText = 'padding:8px 11px; border-radius:6px; background:#0b0f17; border:1px solid var(--border); color:var(--muted);';
-  s3.innerHTML = '<b>Bước 3:</b> 🔗 Server đục lỗ UDP &amp; xác thực (<code>CONNECTED</code>)...';
-
-  try {
-    const res = await fetch('/api/camera/onboard', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        uid: did,
-        room_name: room,
-        cam_password: camPwd,
-        wifi_ssid: isUnbox ? ssid : '',
-        wifi_password: isUnbox ? wifiPwd : '',
-        wifi_bssid: isUnbox ? wifiBssid : '',
-        sonic_mode: isUnbox ? (wifiBssid ? 'mac' : 'ssid') : 'ssid'
-      })
-    });
-    const data = await res.json();
-    if (!data.ok) {
-      alert('Lỗi: ' + data.error);
-      return;
-    }
-
-    lastAddedUid = data.uid;
-    document.getElementById('room-Rename-list').dataset.count = '';
-    if (cBadge) cBadge.textContent = data.wan_cloud_status || 'WAITING_FOR_WIFI';
-    let autoplayBlocked = false;
-
-    if (isUnbox && data.qr_data_url) {
-      document.getElementById('optical-wifi-qr-img').src = data.qr_data_url;
-    }
-
-    if (isUnbox && data.wav_data_url) {
-      const player = document.getElementById('sonic-audio-player');
-      player.src = data.wav_data_url;
-      player.currentTime = 0;
-      try {
-        await player.play();
-      } catch (playErr) {
-        console.warn('Autoplay blocked:', playErr);
-        autoplayBlocked = true;
-        const qrBox = document.getElementById('wifi-qr-box');
-        if (qrBox) qrBox.style.display = 'grid';
-      }
-    }
-
-    const banner = document.getElementById('wifi-Wait-banner');
-    if (banner) {
-      banner.style.borderColor = '#3fb950';
-      banner.style.color = '#3fb950';
-      if (isUnbox && autoplayBlocked) {
-        banner.style.borderColor = '#d29922';
-        banner.style.color = '#f0883e';
-        banner.innerHTML =
-          `⚠️ <b>Trình duyệt đã chặn tự phát âm thanh.</b> Hãy bấm nút ▶ trên thanh phát âm bên dưới để bắt đầu phát sóng âm (chế độ: <b>${data.mode || ''}</b>).`;
-      } else if (isUnbox) {
-        banner.innerHTML =
-          `🔊 <b>Đang phát Sóng Âm Nạp Wi-Fi "${ssid}" cho Camera <code>${data.formatted_did}</code> (${data.room_name})!</b> (chế độ: <b>${data.mode || ''}</b>)<br>` +
-          `👉 Hãy bật <b>Max Volume (80–100%)</b> và đặt loa Điện thoại sát lỗ Mic của Camera (2–5 cm). Sóng âm sẽ <b>tự động tắt</b> ngay khi Server bắt tay xong!`;
-      } else {
-        banner.innerHTML =
-          `🌐 <b>Đã đăng ký Camera <code>${data.formatted_did}</code> (${data.room_name})!</b><br>` +
-          `Server đang tích cực đục lỗ UDP qua WAN P2P &amp; quét LAN mỗi 1.2s...`;
-      }
-    }
-
-    await pollStatus();
-    if (onboardFastPollTimer) clearInterval(onboardFastPollTimer);
-    onboardFastPollTimer = setInterval(pollOnboardingProgress, 1200);
-  } catch (e) {
-    alert('Lỗi kết nối tới Server: ' + e);
-  } finally {
-    if (btnLink) {
-      btnLink.disabled = false;
-      btnLink.textContent = '🔗 Liên Kết Server Ngay (Không Cần Nạp Wi-Fi)';
-    }
-    if (btnUnbox) {
-      btnUnbox.disabled = false;
-      btnUnbox.textContent = '🔊 Nạp Wi-Fi & Tự Động Liên Kết Server';
-    }
-    if (btmLink) btmLink.disabled = false;
-    if (btmUnbox) btmUnbox.disabled = false;
-  }
-}
-
-async function pollOnboardingProgress() {
-  if (!lastAddedUid) return;
-  await pollStatus();
-  const cam = camerasData.find(c => c.uid === lastAddedUid);
-  if (!cam) return;
-
-  const s1 = document.getElementById('onboard-step-1');
-  const s2 = document.getElementById('onboard-step-2');
-  const s3 = document.getElementById('onboard-step-3');
-  const fBanner = document.getElementById('onboard-final-banner');
-  const cBadge = document.getElementById('onboard-cloud-badge');
-  const cloudSt = cam.wan_cloud_status || 'WAITING_FOR_WIFI';
-  if (cBadge) cBadge.textContent = cloudSt;
-
-  const doneStyle = 'padding:8px 11px; border-radius:6px; background:rgba(63,185,80,0.16); border:1px solid #3fb950; color:#3fb950;';
-  const activeStyle = 'padding:8px 11px; border-radius:6px; background:rgba(47,129,247,0.16); border:1px solid #2f81f7; color:#58a6ff;';
-  const warnStyle = 'padding:8px 11px; border-radius:6px; background:rgba(210,153,34,0.16); border:1px solid #d29922; color:#f0883e;';
-  const pendingStyle = 'padding:8px 11px; border-radius:6px; background:#0b0f17; border:1px solid var(--border); color:var(--muted);';
-
-  // 1. Fully connected
-  if (cam.state === 'CONNECTED' && !cam.auth_failed) {
-    stopSonicWave();
-    if (onboardFastPollTimer) {
-      clearInterval(onboardFastPollTimer);
-      onboardFastPollTimer = null;
-    }
-    if (cBadge) {
-      cBadge.textContent = 'CONNECTED';
-      cBadge.style.color = '#3fb950';
-      cBadge.style.borderColor = '#3fb950';
-    }
-    s1.style.cssText = doneStyle;
-    s1.innerHTML = (currentModalTab === 'unbox')
-      ? '<b>Bước 1:</b> ✅ Đã nạp Wi-Fi từ điện thoại sang Camera (Đã tự động ngắt sóng âm!)'
-      : '<b>Bước 1:</b> ✅ Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P / LAN';
-    s2.style.cssText = doneStyle;
-    s2.innerHTML = '<b>Bước 2:</b> ✅ Camera đã vào mạng &amp; báo danh lên P2P Cloud (<code>CONNECTED</code>)';
-    s3.style.cssText = doneStyle;
-    s3.innerHTML = `<b>Bước 3:</b> ✅ Server đã đục lỗ UDP (<code>${cam.connection_mode}</code>) &amp; xác thực thành công!`;
-
-    fBanner.style.display = 'block';
-    fBanner.innerHTML =
-      `✅ Liên kết hoàn tất! Camera <b>${cam.room_name} (${cam.formatted_did})</b> đã kết nối trực tiếp với Server qua Internet. Bạn có thể xem Live stream ngay!`;
-
-    const wBanner = document.getElementById('wifi-Wait-banner');
-    if (wBanner) {
-      wBanner.style.background = 'rgba(35,134,54,0.25)';
-      wBanner.style.borderColor = '#3fb950';
-      wBanner.style.color = '#3fb950';
-      wBanner.innerHTML = `✅ Liên kết hoàn tất! Camera đã kết nối trực tiếp với Server qua Internet.`;
-    }
-    return;
-  }
-
-  // 2. Auth failed
-  if (cam.auth_failed) {
-    stopSonicWave();
-    s1.style.cssText = doneStyle;
-    s2.style.cssText = doneStyle;
-    s3.style.cssText = warnStyle;
-    s3.innerHTML = '<b>Bước 3:</b> ⚠️ Đã đục lỗ UDP tới Camera nhưng sai Mật khẩu Camera (hãy nhập đúng mật khẩu Camera vào ô Mật khẩu rồi bấm lại)!';
-    return;
-  }
-
-  // 3. Camera is ONLINE on P2P Cloud -> Hole punching actively in progress!
-  if (cloudSt === 'ONLINE_PUNCHING') {
-    s1.style.cssText = doneStyle;
-    s1.innerHTML = (currentModalTab === 'unbox')
-      ? '<b>Bước 1:</b> ✅ Camera đã nhận sóng âm Wi-Fi'
-      : '<b>Bước 1:</b> ✅ Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P';
-    s2.style.cssText = doneStyle;
-    s2.innerHTML = `<b>Bước 2:</b> 🟢 Camera đã ONLINE trên P2P Cloud (Đã bắt được IP &amp; Port công khai)!`;
-    s3.style.cssText = activeStyle;
-    s3.innerHTML = `<b>Bước 3:</b> 🔄 Server đang đục lỗ UDP &amp; bắt tay trực tiếp với Camera (<code>${cam.state}</code>)...`;
-    return;
-  }
-
-  // 4. Camera is OFFLINE on Cloud (WAITING_FOR_WIFI or IDLE)
-  if (cloudSt === 'WAITING_FOR_WIFI' || cloudSt === 'IDLE') {
-    if (currentModalTab === 'unbox') {
-      s1.style.cssText = activeStyle;
-      s1.innerHTML = '<b>Bước 1:</b> 🔊 Đang phát sóng âm nạp Wi-Fi từ điện thoại/loa sang Camera...';
-      s2.style.cssText = warnStyle;
-      s2.innerHTML = '<b>Bước 2:</b> ⏳ Đang phát sóng âm... Chờ Camera nhận sóng âm và online trên P2P Cloud (<code>WAITING_FOR_WIFI</code>)...';
-    } else {
-      s1.style.cssText = doneStyle;
-      s1.innerHTML = '<b>Bước 1:</b> 📋 Đã lưu UID &amp; kích hoạt tìm kiếm WAN P2P / LAN';
-      s2.style.cssText = warnStyle;
-      s2.innerHTML = '<b>Bước 2:</b> ⏳ Chờ Camera kết nối Wi-Fi &amp; báo danh lên P2P Cloud (Hiện Camera đang <b>OFFLINE</b> — Hãy chắc chắn Camera đã cắm nguồn và có mạng Wi-Fi/LAN, hoặc chuyển sang tab <b>Khui Hộp Mới</b> để nạp Wi-Fi!)';
-    }
-    s3.style.cssText = pendingStyle;
-    s3.innerHTML = '<b>Bước 3:</b> ⏸ Chờ Bước 2 (Camera phải Online trên P2P Cloud trước khi Server có thể đục lỗ UDP)...';
-    return;
-  }
-
-  // 5. Invalid UID
-  if (cloudSt === 'INVALID_UID') {
-    stopSonicWave();
-    s2.style.cssText = warnStyle;
-    s2.innerHTML = '<b>Bước 2:</b> ❌ Mã UID không hợp lệ hoặc không tồn tại trên hệ thống P2P Cloud!';
-    s3.style.cssText = pendingStyle;
-    s3.innerHTML = '<b>Bước 3:</b> ⏸ Đã dừng kết nối.';
-    return;
-  }
-
-  // 6. Fallback
-  s2.style.cssText = activeStyle;
-  s2.innerHTML = `<b>Bước 2:</b> 🌐 Chờ Camera báo danh lên P2P Cloud (Trạng thái: <code>${cloudSt}</code>)...`;
-  s3.style.cssText = pendingStyle;
-  s3.innerHTML = '<b>Bước 3:</b> ⏸ Chờ Bước 2...';
-}
-
-function startWifiWaitPolling() {
-  if (wifiPollTimer) clearInterval(wifiPollTimer);
-  wifiPollTimer = setInterval(async () => {
-    if (!document.getElementById('qr-modal').classList.contains('open')) return;
-    await fetch('/api/camera/scan', { method: 'POST' });
-    await pollStatus();
-    if (lastAddedUid) {
-      const found = camerasData.find(c => c.uid === lastAddedUid && c.state === 'CONNECTED' && !c.auth_failed);
-      if (found) {
-        stopSonicWave();
-        const banner = document.getElementById('wifi-Wait-banner');
-        if (banner) {
-          banner.style.background = 'rgba(35,134,54,0.25)';
-          banner.style.borderColor = '#3fb950';
-          banner.style.color = '#3fb950';
-          banner.innerHTML = `🎉 <b>Thành công!</b> Camera <b>${found.room_name} (${found.ip})</b> đã kết nối Wi-Fi và đang phát <b>Live 25 FPS</b> trên Grid!`;
-        }
-      }
-    }
-  }, 4000);
-}
-
-async function loadHostWifiInfo(forceOverwrite = false) {
-  const statusEl = document.getElementById('wifi-scan-status');
-  statusEl.textContent = '⏳ Đang kiểm tra gợi ý Wi-Fi...';
-  try {
-    const res = await fetch('/api/wifi/info');
-    const data = await res.json();
-    if (!data.ok) return;
-
-    hostCurrentSsid = data.current_ssid || '';
-    hostCurrentBssid = data.current_bssid || '';
-
-    const ssidInp = document.getElementById('wifi-ssid-input');
-    const pwdInp = document.getElementById('wifi-pwd-input');
-    const bssidInp = document.getElementById('wifi-bssid-input');
-    const dlist = document.getElementById('wifi-ssid-list');
-
-    if (data.networks && data.networks.length) {
-      dlist.innerHTML = data.networks.map(n =>
-        `<option value="${n.ssid}">${n.ssid} (${n.band || 'Wi-Fi'} - ${n.signal || ''})</option>`
-      ).join('');
-    }
-
-    if ((forceOverwrite || !ssidInp.value) && data.current_ssid) {
-      ssidInp.value = data.current_ssid;
-    }
-    if (ssidInp.value === data.current_ssid && data.current_bssid) {
-      bssidInp.value = data.current_bssid;
-    } else if (hostCurrentBssid && bssidInp.value === hostCurrentBssid) {
-      // Only drop a value we auto-filled ourselves; never wipe a MAC the user typed.
-      bssidInp.value = '';
-    }
-    if ((forceOverwrite || !pwdInp.value) && data.saved_password && ssidInp.value === data.current_ssid) {
-      pwdInp.value = data.saved_password;
-    }
-
-    let msg = data.current_ssid
-      ? `✅ Gợi ý Wi-Fi: <b>${data.current_ssid}</b> (Nếu bạn đang mở trên Điện thoại ở nơi khác, hãy sửa thành <b>Tên Wi-Fi 2.4GHz</b> tại nơi lắp Camera).`
-      : 'ℹ️ Hãy nhập Tên mạng Wi-Fi (2.4GHz) và mật khẩu Wi-Fi tại nơi đặt Camera.';
-    if (data.camera_hotspots && data.camera_hotspots.length > 0) {
-      msg += `<br>📡 <b>Phát hiện Wi-Fi nội bộ của Camera gần đây:</b> <code>${data.camera_hotspots.join(', ')}</code>`;
-    }
-    statusEl.innerHTML = msg;
-    if (ssidInp.value) {
-      refreshWifiQrPreview(false);
-    }
-  } catch (e) {
-    statusEl.textContent = 'Hãy nhập Tên mạng Wi-Fi (2.4GHz) và mật khẩu Wi-Fi tại nơi đặt Camera.';
-  }
-}
-
-function toggleWifiPwdVis() {
-  const inp = document.getElementById('wifi-pwd-input');
-  inp.type = (inp.type === 'password') ? 'text' : 'password';
-}
-
-// Eye4 only ever plays the MAC variant, so pick it as soon as a usable MAC is typed.
-function syncSonicModeFromBssid() {
-  const hex = document.getElementById('wifi-bssid-input').value.replace(/[^0-9a-fA-F]/g, '');
-  const sel = document.getElementById('wifi-qr-fmt');
-  if (sel) sel.value = hex.length >= 4 ? 'mac' : 'ssid';
-}
-
-let qrDebounce = null;
-function refreshWifiQrPreview(forceShow = false) {
-  const ssid = document.getElementById('wifi-ssid-input').value.trim();
-  const pwd = document.getElementById('wifi-pwd-input').value;
-  const bssid = document.getElementById('wifi-bssid-input').value.trim();
-  const mode = document.getElementById('wifi-qr-fmt').value || 'combo';
-  const box = document.getElementById('wifi-qr-box');
-  if (forceShow) box.style.display = 'grid';
-  if (!ssid) return;
-
-  if (qrDebounce) clearTimeout(qrDebounce);
-  qrDebounce = setTimeout(async () => {
-    try {
-      const res = await fetch('/api/wifi/sonic', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ ssid, password: pwd, bssid, mode })
-      });
-      const data = await res.json();
-      if (data.ok) {
-        if (data.mobile_qr_data_url) {
-          document.getElementById('wifi-qr-img').src = data.mobile_qr_data_url;
-        }
-        document.getElementById('wifi-target-label').textContent = ssid;
-        const bBadge = document.getElementById('sonic-bssid-badge');
-        if (bBadge) bBadge.textContent = data.bssid_suffix || 'SSID';
-        const mLink = document.getElementById('sonic-mobile-link');
-        if (mLink && data.mobile_url) {
-          mLink.href = data.mobile_url;
-          mLink.textContent = data.mobile_url;
-        }
-        const player = document.getElementById('sonic-audio-player');
-        if (player && player.paused) {
-          player.src = data.wav_data_url;
-        }
-        box.style.display = 'grid';
-      }
-    } catch (e) {}
-  }, 180);
-}
-
-async function playSonicWaveBrowser() {
-  const ssid = document.getElementById('wifi-ssid-input').value.trim();
-  const pwd = document.getElementById('wifi-pwd-input').value;
-  const bssid = document.getElementById('wifi-bssid-input').value.trim();
-  const mode = document.getElementById('wifi-qr-fmt').value || 'combo';
-  if (!ssid) {
-    alert('Vui lòng nhập Tên mạng Wi-Fi (SSID)!');
-    return;
-  }
-  const banner = document.getElementById('wifi-Wait-banner');
-  banner.style.borderColor = '#3fb950';
-  banner.style.color = '#3fb950';
-  banner.innerHTML = `⏳ Đang tạo sóng âm VStarcam Sonic Wave (6.5–10.1 kHz) cho mạng <b>${ssid}</b>...`;
-  try {
-    const res = await fetch('/api/wifi/sonic', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ ssid, password: pwd, bssid, mode })
-    });
-    const data = await res.json();
-    if (!data.ok) {
-      banner.innerHTML = `❌ Lỗi: ${data.error}`;
-      return;
-    }
-    const player = document.getElementById('sonic-audio-player');
-    player.src = data.wav_data_url;
-    player.currentTime = 0;
-    await player.play();
-    banner.innerHTML =
-      `🔊 <b>Đang phát Sóng Âm Nạp Wi-Fi "${ssid}" (BSSID 2.4GHz: <code>${data.bssid_24 || 'SSID'}</code>)!</b><br>` +
-      `👉 Hãy vặn <b>Max Volume (80–100%)</b> và đặt loa sát lỗ Mic của Camera (cách 2–10 cm) cho đến khi nghe tiếng Camera báo <i>"Wi-Fi connecting"</i>!`;
-  } catch (e) {
-    banner.innerHTML = `❌ Không thể phát âm thanh trên trình duyệt: ${e}`;
-  }
-}
-
-async function playSonicWavePcSpeaker() {
-  const ssid = document.getElementById('wifi-ssid-input').value.trim();
-  const pwd = document.getElementById('wifi-pwd-input').value;
-  const bssid = document.getElementById('wifi-bssid-input').value.trim();
-  const mode = document.getElementById('wifi-qr-fmt').value || 'combo';
-  if (!ssid) {
-    alert('Vui lòng nhập Tên mạng Wi-Fi (SSID)!');
-    return;
-  }
-  // Stop browser player first so they don't overlap
-  stopSonicWave();
-  const banner = document.getElementById('wifi-Wait-banner');
-  banner.style.borderColor = '#58a6ff';
-  banner.style.color = '#58a6ff';
-  banner.innerHTML = `⏳ Đang phát sóng âm trực tiếp ra cổng âm thanh Windows PC...`;
-  try {
-    const res = await fetch('/api/wifi/play-pc-speaker', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ ssid, password: pwd, bssid, mode })
-    });
-    const data = await res.json();
-    if (data.ok) {
-      banner.innerHTML = `🖥️ <b>${data.message}</b> Đặt Camera lại gần loa máy tính (cách 2–10 cm)!`;
-    } else {
-      banner.innerHTML = `❌ ${data.error}`;
-    }
-  } catch (e) {
-    banner.innerHTML = `❌ Lỗi: ${e}`;
-  }
-}
-
-function stopSonicWave() {
-  const player = document.getElementById('sonic-audio-player');
-  if (player) {
-    player.pause();
-    player.currentTime = 0;
-  }
-}
-
-async function pushWifiDirectCgi() {
-  const ssid = document.getElementById('wifi-ssid-input').value.trim();
-  const pwd = document.getElementById('wifi-pwd-input').value;
-  if (!ssid) {
-    alert('Vui lòng nhập Tên mạng Wi-Fi (SSID)!');
-    return;
-  }
-  const banner = document.getElementById('wifi-Wait-banner');
-  banner.innerHTML = `⏳ Đang gửi lệnh <code>set_wifi.cgi</code> nạp mạng <b>${ssid}</b> tới camera...`;
-  try {
-    const res = await fetch('/api/camera/provision-wifi', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ ssid, password: pwd, uid: lastAddedUid || '' })
-    });
-    const data = await res.json();
-    if (data.ok) {
-      banner.style.borderColor = '#3fb950';
-      banner.style.color = '#3fb950';
-      banner.innerHTML = `✅ ${data.message}`;
-    } else {
-      banner.innerHTML = `ℹ️ ${data.error}`;
-    }
-  } catch (e) {
-    banner.innerHTML = `❌ Lỗi gửi lệnh Wi-Fi: ${e}`;
-  }
-}
-
-function handleQrDrop(ev) {
-  ev.preventDefault();
-  document.getElementById('qr-dropzone').style.borderColor = 'var(--border)';
-  if (ev.dataTransfer.files && ev.dataTransfer.files[0]) {
-    handleQrFileSelect(ev.dataTransfer.files[0]);
-  }
-}
-
-window.addEventListener('paste', (ev) => {
-  if (!document.getElementById('qr-modal').classList.contains('open')) return;
-  const items = (ev.clipboardData || ev.originalEvent.clipboardData).items;
-  for (const item of items) {
-    if (item.type.indexOf('image') === 0) {
-      const file = item.getAsFile();
-      if (file) handleQrFileSelect(file);
-      break;
-    }
-  }
-});
-
-function downscaleImageFile(file, maxDim = 1600, quality = 0.85) {
-  return new Promise((resolve) => {
-    if (!file || !file.type || !file.type.startsWith('image/')) {
-      return resolve(file);
-    }
-    const img = new Image();
-    const url = URL.createObjectURL(file);
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      let w = img.width;
-      let h = img.height;
-      if (w <= maxDim && h <= maxDim) {
-        return resolve(file);
-      }
-      if (w > h) {
-        h = Math.round((h * maxDim) / w);
-        w = maxDim;
-      } else {
-        w = Math.round((w * maxDim) / h);
-        h = maxDim;
-      }
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0, w, h);
-      canvas.toBlob((blob) => {
-        if (blob) {
-          resolve(blob);
-        } else {
-          resolve(file);
-        }
-      }, 'image/jpeg', quality);
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      resolve(file);
-    };
-    img.src = url;
-  });
-}
-
-async function handleQrFileSelect(file) {
-  if (!file) return;
-  const previewWrap = document.getElementById('qr-preview-wrap');
-  const previewImg = document.getElementById('qr-preview-img');
-  previewImg.src = URL.createObjectURL(file);
-  previewWrap.style.display = 'block';
-
-  const resBox = document.getElementById('qr-decode-result');
-  resBox.style.display = 'block';
-  resBox.style.borderColor = 'var(--border)';
-  resBox.innerHTML = '⏳ Đang tối ưu dung lượng ảnh & giải mã tem QR...';
-
-  try {
-    const uploadBlob = await downscaleImageFile(file, 1600, 0.85);
-    const fd = new FormData();
-    fd.append('file', uploadBlob, 'qr.jpg');
-
-    const res = await fetch('/api/camera/decode-qr', { method: 'POST', body: fd });
-    if (res.status === 413) {
-      resBox.style.background = 'rgba(218,54,51,0.15)';
-      resBox.style.borderColor = 'var(--danger)';
-      resBox.innerHTML = '❌ <b>Ảnh quá lớn (413 Request Entity Too Large). Vui lòng thử lại với ảnh nhỏ hơn hoặc nhập mã UID.</b>';
-      return;
-    }
-    const data = await res.json();
-    if (!res.ok || !data.ok) {
-      resBox.style.background = 'rgba(218,54,51,0.15)';
-      resBox.style.borderColor = 'var(--danger)';
-      resBox.innerHTML = `❌ <b>${data.error || 'Lỗi giải mã ảnh QR'}</b>`;
-      return;
-    }
-    document.getElementById('qr-did-input').value = data.formatted_did;
-    document.getElementById('qr-model-input').value = data.model || 'CS22S';
-    if (data.suggested_name) {
-      document.getElementById('qr-room-input').value = data.suggested_name;
-    }
-    lastAddedUid = data.uid_hex;
-    resBox.style.background = 'rgba(35,134,54,0.15)';
-    resBox.style.borderColor = 'var(--accent)';
-    resBox.innerHTML =
-      `✅ <b>Giải mã QR thành công!</b> ` +
-      `Mã UID: <code>${data.formatted_did}</code> | Model: <code>${data.model}</code> | ` +
-      `Mã PPPP LAN: <code style="font-size:11px;">${data.uid_hex}</code>`;
-    refreshWifiQrPreview(true);
-  } catch (e) {
-    resBox.style.background = 'rgba(218,54,51,0.15)';
-    resBox.style.borderColor = 'var(--danger)';
-    resBox.innerHTML = `❌ Lỗi kết nối khi giải mã QR: ${e}`;
-  }
-}
-
-async function submitAddCameraByQr() {
-  const did = document.getElementById('qr-did-input').value.trim();
-  const room = document.getElementById('qr-room-input').value.trim();
-  const pwd = (document.getElementById('qr-pwd-input') || {}).value || '888888';
-  const model = document.getElementById('qr-model-input').value.trim();
-  const ip = document.getElementById('qr-ip-input').value.trim();
-  if (!did) {
-    alert('Vui lòng tải ảnh chụp tem QR hoặc nhập mã UID trên thân camera (VD: VSTJ082299RLSXK)!');
-    return;
-  }
-  const btn = document.getElementById('btn-submit-qr');
-  btn.disabled = true;
-  btn.textContent = '⏳ Đang lưu & kết nối WAN P2P / LAN...';
-  try {
-    const res = await fetch('/api/camera/add', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        device_id: did,
-        uid: did,
-        room_name: room,
-        name: room,
-        password: pwd.trim(),
-        model: model,
-        ip: ip
-      })
-    });
-    const data = await res.json();
-    if (!data.ok) {
-      alert('Lỗi: ' + data.error);
-      return;
-    }
-    lastAddedUid = data.uid;
-    document.getElementById('room-Rename-list').dataset.count = '';
-    await pollStatus();
-    refreshWifiQrPreview(true);
-    const banner = document.getElementById('wifi-Wait-banner');
-    if (banner) {
-      banner.innerHTML = `✅ <b>Đã thêm ${data.room_name} (${data.formatted_did}) và bắt đầu kết nối WAN P2P (Internet) &amp; LAN!</b> Nếu camera chưa có Wi-Fi, bạn có thể phát sóng âm bên trên để nạp Wi-Fi.`;
-    }
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '➕ Lưu Camera vào Hub & Kết nối WAN P2P / Nạp Wi-Fi';
-  }
-}
-
-async function scanLanNow() {
-  const btn = document.getElementById('btn-scan-lan');
-  btn.disabled = true;
-  btn.textContent = '⏳ Đang quét 254 IP...';
-  try {
-    const res = await fetch('/api/camera/scan', { method: 'POST' });
-    const data = await res.json();
-    await pollStatus();
-    alert(`Đã quét toàn bộ dải mạng LAN! Phát hiện mới: ${data.found_new} camera (Đang kết nối: ${data.active_count} camera).`);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '🔍 Quét LAN';
-  }
-}
-
-async function pushWifiToCamera(uid, name) {
-  const ssid = prompt(`Tên Wi-Fi MỚI cho "${name}":`, (document.getElementById('wifi-ssid-input') || {}).value || '');
-  if (!ssid) return;
-  const pwd = prompt(`Mật khẩu Wi-Fi "${ssid}":`, (document.getElementById('wifi-pwd-input') || {}).value || '');
-  if (pwd === null) return;
-  const res = await fetch('/api/camera/provision-wifi', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ ssid, password: pwd, uid })
-  });
-  const d = await res.json();
-  alert(d.ok ? d.message : ('Lỗi: ' + d.error));
-}
-
-async function rebootCamera(uid, name) {
-  if (!confirm(`Khởi động lại camera "${name}" (${(uid||'').substring(0,8)}) từ xa qua mạng?`)) return;
-  showPtzToast('⏳ Đang gửi lệnh khởi động lại...', true);
-  try {
-    const res = await fetch(`/api/camera/${uid}/reboot`, { method: 'POST' });
-    const d = await res.json();
-    showPtzToast(d.ok ? ('✅ ' + d.message) : ('❌ ' + d.error), d.ok);
-    alert(d.ok ? d.message : ('Lỗi: ' + d.error));
-  } catch (err) {
-    showPtzToast('❌ Lỗi kết nối: ' + err.message, false);
-    alert('Lỗi kết nối: ' + err.message);
-  }
-}
-
-async function changeCameraPassword(uid, name) {
-  const newPwd = prompt(`Nhập mật khẩu mới cho camera "${name}":`);
-  if (!newPwd || !newPwd.trim()) return;
-  showPtzToast('⏳ Đang cập nhật mật khẩu camera...', true);
-  try {
-    const res = await fetch(`/api/camera/${uid}/password`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ password: newPwd.trim() })
-    });
-    const d = await res.json();
-    showPtzToast(d.ok ? ('✅ ' + d.message) : ('❌ ' + d.error), d.ok);
-    alert(d.ok ? d.message : ('Lỗi: ' + d.error));
-  } catch (err) {
-    showPtzToast('❌ Lỗi kết nối: ' + err.message, false);
-    alert('Lỗi kết nối: ' + err.message);
-  }
-}
-
-async function deleteCamera(uid, name) {
-  if (!confirm(`Bạn có chắc muốn xóa camera "${name}" khỏi danh sách Hub?`)) return;
-  await fetch(`/api/camera/${uid}`, { method: 'DELETE' });
-  document.getElementById('room-Rename-list').dataset.count = '';
-  pollStatus();
-}
-
-pollStatus();
-setInterval(pollStatus, 1500);
-connectStreamWs();
-</script>
-</body>
-</html>
-"""
 
 
 def build_web_app(hub: CameraHubApp) -> web.Application:
@@ -5103,17 +2785,33 @@ def build_web_app(hub: CameraHubApp) -> web.Application:
     app.router.add_delete("/api/camera/{uid}", hub.handle_delete_camera)
     app.router.add_post("/api/camera/{uid}/ptz", hub.handle_ptz)
     app.router.add_get("/api/camera/{uid}/params", hub.handle_camera_params)
+    app.router.add_get("/api/camera/{uid}/settings", hub.handle_camera_settings)
     app.router.add_post("/api/camera/{uid}/cgi", hub.handle_camera_cgi)
     app.router.add_post("/api/camera/{uid}/reboot", hub.handle_camera_reboot)
+    app.router.add_post("/api/camera/{uid}/reconnect", hub.handle_camera_reconnect)
     app.router.add_post("/api/camera/{uid}/password", hub.handle_change_password)
     app.router.add_post("/api/camera/{uid}/record", hub.handle_record_control)
     app.router.add_post("/api/camera/{uid}/rename", hub.handle_rename)
     app.router.add_get("/api/events", hub.handle_list_events)
+    app.router.add_get("/api/event-thumb", hub.handle_event_thumb)
     app.router.add_delete("/api/events", hub.handle_delete_event)
     app.router.add_post("/api/settings", hub.handle_update_settings)
 
+    os.makedirs(STATIC_DIR, exist_ok=True)
+    app.router.add_static(f"/static/{STATIC_ASSET_VER}/", path=STATIC_DIR, show_index=False)
+    app.router.add_static("/static/", path=STATIC_DIR, show_index=False)
     os.makedirs(hub.recordings_dir, exist_ok=True)
     app.router.add_static("/recordings/", path=hub.recordings_dir, show_index=False)
+
+    async def _apply_cache_headers(request: web.Request, response: web.StreamResponse):
+        # Prevent Cloudflare Edge & browsers from serving stale CSS/JS after UI deploys,
+        # while allowing immutable recorded clips & thumbnails to cache cleanly.
+        if request.path in ("/", "/sonic") or request.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        elif request.path.startswith("/recordings/") and response.status < 400:
+            response.headers.setdefault("Cache-Control", "public, max-age=604800, immutable")
+
+    app.on_response_prepare.append(_apply_cache_headers)
     return app
 
 
