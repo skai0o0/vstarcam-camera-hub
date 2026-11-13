@@ -856,6 +856,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self.auth_error: Optional[str] = None
         self._got_any_drw = asyncio.Event()  # Set when ANY DRW/ACK received
         self._drw_port: Optional[int] = None  # Locked port for DRW communication
+        self._drw_addr: Optional[tuple[str, int]] = None  # Locked endpoint (ip, port) for DRW communication
         self._seen_drw_indices: dict[int, set[int]] = {}  # channel -> set of seen indices
         self._drw_high_water: dict[int, int] = {}  # channel -> highest seen index
         self._cmd_index = 0
@@ -1250,13 +1251,17 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                       addr[0], addr[1], len(raw_data), plaintext[:8].hex())
             return
 
-        # Track DRW port — update to the port that sends us valid DRW data
+        # Track DRW endpoint — update to the endpoint that sends us valid DRW data
+        self._drw_addr = addr
+        self._drw_port = addr[1]
         if self._active_camera:
-            if self._active_camera.ip in ("0.0.0.0", "Chờ Wi-Fi LAN", ""):
+            if (self._active_camera.connection_mode in ("WAN_P2P", "WAN_RELAY")
+                    or self._used_wan_p2p
+                    or self._active_camera.ip in ("0.0.0.0", "Chờ Wi-Fi LAN", "")):
                 self._active_camera.ip = addr[0]
                 self._active_camera.port = addr[1]
                 self._active_camera.discovery_port = addr[1]
-            if addr[0] == self._active_camera.ip:
+            elif addr[0] == self._active_camera.ip:
                 if not self._drw_port:
                     self._drw_port = addr[1]
                     log.info("DRW port locked to %s:%d", addr[0], self._drw_port)
@@ -1354,15 +1359,20 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                      pkt_enc_mode, addr[0], addr[1])
             return
 
-        # Lock DRW port to the port that responds
-        if self._active_camera and addr[0] == self._active_camera.ip:
-            if not self._drw_port:
-                self._drw_port = addr[1]
-                log.info("DRW port locked to %s:%d (from ACK)", addr[0], self._drw_port)
-
         plaintext = self._decrypt_drw(raw_data, pkt_enc_mode)
         parsed = parse_drw_ack(plaintext)
         if parsed:
+            # Lock DRW endpoint from verified ACK
+            self._drw_addr = addr
+            self._drw_port = addr[1]
+            if self._active_camera:
+                if (self._active_camera.connection_mode in ("WAN_P2P", "WAN_RELAY")
+                        or self._used_wan_p2p
+                        or self._active_camera.ip in ("0.0.0.0", "Chờ Wi-Fi LAN", "")):
+                    self._active_camera.ip = addr[0]
+                    self._active_camera.port = addr[1]
+                elif addr[0] == self._active_camera.ip:
+                    self._drw_port = addr[1]
             log.info("DRW_ACK from %s:%d ch=%d", addr[0], addr[1], parsed["channel"])
         else:
             log.info("DRW_ACK from %s:%d (unparsed, %d bytes)",
@@ -2106,6 +2116,15 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         await self._send_cmd(cgi)
         self.password = new_password
 
+    async def send_reboot(self):
+        """Reboot camera via reboot.cgi over PPPP."""
+        cgi = (
+            f"GET /reboot.cgi?"
+            f"loginuse={self.username}&loginpas={self.password}"
+            f"&user={self.username}&pwd={self.password}&"
+        )
+        await self._send_cmd(cgi)
+
     async def _send_start_video(self):
         # Camera restarts video DRW indices from 0 on each fresh request, so
         # clear the dedup set and reorder buffer (otherwise new index-0
@@ -2216,10 +2235,16 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
 
     def _get_drw_addr(self) -> Optional[tuple[str, int]]:
         """Get the address to send DRW packets to.
-        Priority: locked DRW port > discovery port > latest punch port."""
+        Priority: live drw_addr > relay session port > locked DRW port > discovery port > camera ip:port"""
+        if self._drw_addr and self._drw_addr[0] not in ("0.0.0.0", "") and self._drw_addr[1] > 0:
+            return self._drw_addr
+        if self._wan_relay_session and self._wan_relay_session[0][0] not in ("0.0.0.0", "") and self._wan_relay_session[0][1] > 0:
+            return self._wan_relay_session[0]
         if not self._active_camera:
             return None
         port = self._drw_port or self._active_camera.discovery_port or self._active_camera.port
+        if not self._active_camera.ip or self._active_camera.ip in ("0.0.0.0", "Chờ Wi-Fi LAN"):
+            return None
         return (self._active_camera.ip, port)
 
     async def _send_cmd(self, cgi_text: str):
@@ -2240,6 +2265,22 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                     self.enc_mode, addr[0], addr[1],
                     self._cmd_index - 1, redact_credentials(cgi_text)[:80])
             self.transport.sendto(pkt, addr)
+
+            # Redundancy over WAN/Internet:
+            is_poll = "get_status.cgi" in cgi_text
+            is_wan = (
+                (self._active_camera and self._active_camera.connection_mode in ("WAN_P2P", "WAN_RELAY"))
+                or self._used_wan_p2p
+                or bool(self._wan_relay_session)
+                or (addr[0] not in ("127.0.0.1", "localhost") and not addr[0].startswith("192.168."))
+            )
+            if not is_poll and is_wan:
+                try:
+                    await asyncio.sleep(0.035)
+                    if self.transport and not self.transport.is_closing():
+                        self.transport.sendto(pkt, addr)
+                except Exception:
+                    pass
 
     # --- PSK auto-detection ---
 

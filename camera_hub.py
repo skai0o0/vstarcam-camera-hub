@@ -816,6 +816,7 @@ class CameraHubApp:
         self._running = False
         self._discovery_task: Optional[asyncio.Task] = None
         self._quota_task: Optional[asyncio.Task] = None
+        self._ptz_stop_tasks: Dict[str, asyncio.Task] = {}
 
     def _save_hub_config(self):
         self.config["hub"] = {
@@ -1382,27 +1383,58 @@ class CameraHubApp:
 
         data = await request.json()
         action = data.get("action", "")
+        req_onestep = data.get("onestep")
 
         ptz_map = {
             "up": (0, 1),
+            "up_stop": (1, 0),
             "down": (2, 1),
+            "down_stop": (3, 0),
             "left": (4, 1),
+            "left_stop": (5, 0),
             "right": (6, 1),
+            "right_stop": (7, 0),
+            "stop": (1, 0),
             "center": (25, 0),
+            "hscan": (26, 0),
+            "hscan_stop": (27, 0),
+            "vscan": (28, 0),
+            "vscan_stop": (29, 0),
             "preset1_set": (30, 0),
             "preset1_go": (31, 0),
             "preset2_set": (32, 0),
             "preset2_go": (33, 0),
             "preset3_set": (34, 0),
             "preset3_go": (35, 0),
+            "preset4_set": (36, 0),
+            "preset4_go": (37, 0),
+            "preset5_set": (38, 0),
+            "preset5_go": (39, 0),
         }
         if action in ptz_map:
-            cmd_code, onestep = ptz_map[action]
+            cmd_code, default_onestep = ptz_map[action]
+            onestep = int(req_onestep) if req_onestep is not None else default_onestep
+
+            # Cancel any pending stop task for this camera so multiple commands do not conflict
+            prev_stop = self._ptz_stop_tasks.get(uid)
+            if prev_stop and not prev_stop.done():
+                prev_stop.cancel()
+
             await sess.protocol.send_ptz_command(cmd_code, onestep=onestep)
-            if action in ("up", "down", "left", "right"):
+
+            # For directional step movement, schedule safety stop cutoff after 0.75s
+            if action in ("up", "down", "left", "right") and onestep == 1:
                 stop_code = cmd_code + 1
-                asyncio.create_task(self._delayed_ptz_stop(sess.protocol, stop_code, 0.45))
-            return web.json_response({"ok": True, "action": action})
+                self._ptz_stop_tasks[uid] = asyncio.create_task(
+                    self._delayed_ptz_stop(sess.protocol, stop_code, 0.75)
+                )
+
+            conn_mode = getattr(sess.camera, "connection_mode", "P2P")
+            return web.json_response({
+                "ok": True,
+                "action": action,
+                "connection_mode": conn_mode,
+            })
 
         param_map = {
             "ir_auto": (14, 0),
@@ -1413,20 +1445,69 @@ class CameraHubApp:
             "flip_h": (5, 2),
             "flip_vh": (5, 3),
             "osd_on": (18, 1),
+            "osd_off": (18, 0),
         }
         if action in param_map:
             param, val = param_map[action]
             await sess.protocol.send_camera_param(param, val)
-            return web.json_response({"ok": True, "action": action})
+            conn_mode = getattr(sess.camera, "connection_mode", "P2P")
+            return web.json_response({
+                "ok": True,
+                "action": action,
+                "connection_mode": conn_mode,
+            })
 
         return web.json_response({"ok": False, "error": f"Unknown action: {action}"}, status=400)
 
     async def _delayed_ptz_stop(self, proto: proxy.PPPPUnifiedProtocol, stop_code: int, delay: float):
-        await asyncio.sleep(delay)
         try:
+            await asyncio.sleep(delay)
             await proto.send_ptz_command(stop_code, onestep=0)
-        except Exception:
+        except (asyncio.CancelledError, Exception):
             pass
+
+    async def handle_camera_reboot(self, request: web.Request) -> web.Response:
+        """Send hardware reboot command to camera over active PPPP session (LAN or WAN)."""
+        uid = request.match_info.get("uid", "")
+        sess = self.sessions.get(uid)
+        if not sess or not sess.protocol:
+            return web.json_response({"ok": False, "error": "Camera chưa kết nối"}, status=404)
+        try:
+            await sess.protocol.send_reboot()
+            conn_mode = getattr(sess.camera, "connection_mode", "P2P")
+            return web.json_response({
+                "ok": True,
+                "message": f"Đã gửi lệnh khởi động lại camera ({conn_mode})!",
+            })
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def handle_change_password(self, request: web.Request) -> web.Response:
+        """Update camera password via set_user.cgi over active PPPP session (LAN or WAN)."""
+        uid = request.match_info.get("uid", "")
+        sess = self.sessions.get(uid)
+        if not sess or not sess.protocol:
+            return web.json_response({"ok": False, "error": "Camera chưa kết nối"}, status=404)
+        try:
+            data = await request.json()
+            new_pwd = str(data.get("password") or "").strip()
+            if not new_pwd:
+                return web.json_response({"ok": False, "error": "Vui lòng nhập mật khẩu mới"}, status=400)
+
+            await sess.protocol.send_set_password(new_pwd)
+            cam_cfg = self.config.setdefault("cameras", {}).get(uid)
+            if isinstance(cam_cfg, dict):
+                cam_cfg["password"] = new_pwd
+            else:
+                self.config["cameras"][uid] = {"port": sess.rtsp_port, "password": new_pwd}
+            self._save_hub_config()
+            conn_mode = getattr(sess.camera, "connection_mode", "P2P")
+            return web.json_response({
+                "ok": True,
+                "message": f"Đã cập nhật mật khẩu camera thành công qua {conn_mode}!",
+            })
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
 
     async def handle_record_control(self, request: web.Request) -> web.Response:
         uid = request.match_info.get("uid", "")
@@ -2500,10 +2581,11 @@ function stopPlay() {{
             # Case 1: Camera is already connected in self.sessions
             if uid and uid in self.sessions and self.sessions[uid].protocol:
                 await self.sessions[uid].protocol.send_set_wifi(ssid, password)
+                conn_mode = getattr(self.sessions[uid].camera, "connection_mode", "P2P")
                 return web.json_response({
                     "ok": True,
                     "method": "active_session",
-                    "message": f"Đã bắn lệnh nạp Wi-Fi '{ssid}' trực tiếp tới camera ({self.sessions[uid].camera.ip})!",
+                    "message": f"Đã bắn lệnh nạp Wi-Fi '{ssid}' trực tiếp tới camera qua {conn_mode}!",
                 })
 
             # Case 2: Probe AP hotspot gateways (192.168.169.1, 192.168.1.1, 192.168.43.1) or target_ip
@@ -3029,6 +3111,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <button class="btn" onclick="sendPtz('preset1_set')">Lưu góc 1</button>
             <button class="btn" onclick="sendPtz('preset2_go')">Gọi góc 2</button>
             <button class="btn" onclick="sendPtz('preset2_set')">Lưu góc 2</button>
+            <button class="btn" onclick="sendPtz('preset3_go')">Gọi góc 3</button>
+            <button class="btn" onclick="sendPtz('preset3_set')">Lưu góc 3</button>
           </div>
         </div>
         <div>
@@ -3041,6 +3125,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <button class="btn" onclick="sendPtz('flip_vh')">Lật 180°</button>
           </div>
         </div>
+        <div>
+          <strong>⚙️ Thiết Lập Camera Từ Xa (Internet/LAN)</strong>
+          <div style="display:flex; gap:5px; flex-wrap:wrap; margin-top:6px;">
+            <button class="btn" onclick="rebootCamera(focusUid, 'Camera')">🔄 Khởi động lại</button>
+            <button class="btn" onclick="changeCameraPassword(focusUid, 'Camera')">🔑 Đổi mật khẩu</button>
+            <button class="btn" onclick="pushWifiToCamera(focusUid, 'Camera')">📡 Đổi Wi-Fi</button>
+          </div>
+        </div>
+        <div id="ptz-status" style="min-height:22px; font-size:12px; margin-top:4px; padding:6px 10px; border-radius:4px; display:none;"></div>
         <div id="focus-info" style="color:var(--muted); line-height:1.5;"></div>
       </div>
     </div>
@@ -3563,13 +3656,39 @@ function closeFocusModal() {
   syncWsConfig();
 }
 
+let ptzToastTimer = null;
+function showPtzToast(msg, isOk = true) {
+  const el = document.getElementById('ptz-status');
+  if (!el) return;
+  el.style.display = 'block';
+  el.style.background = isOk ? 'rgba(46, 204, 113, 0.15)' : 'rgba(231, 76, 60, 0.15)';
+  el.style.color = isOk ? '#2ecc71' : '#e74c3c';
+  el.style.border = isOk ? '1px solid rgba(46, 204, 113, 0.4)' : '1px solid rgba(231, 76, 60, 0.4)';
+  el.textContent = msg;
+  if (ptzToastTimer) clearTimeout(ptzToastTimer);
+  ptzToastTimer = setTimeout(() => {
+    el.style.display = 'none';
+  }, 2500);
+}
+
 async function sendPtz(action) {
   if (!focusUid) return;
-  await fetch(`/api/camera/${focusUid}/ptz`, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action})
-  });
+  showPtzToast('⏳ Đang gửi lệnh ' + action + '...', true);
+  try {
+    const res = await fetch(`/api/camera/${focusUid}/ptz`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({action})
+    });
+    const d = await res.json();
+    if (d.ok) {
+      showPtzToast(`✅ Lệnh "${action}" thành công (${d.connection_mode || 'P2P'})!`, true);
+    } else {
+      showPtzToast(`❌ Lỗi: ${d.error || 'Thao tác thất bại'}`, false);
+    }
+  } catch (err) {
+    showPtzToast(`❌ Lỗi mạng: ${err.message}`, false);
+  }
 }
 
 async function triggerMotionManual(uid, action) {
@@ -3664,11 +3783,14 @@ function renderRoomRenameList() {
     <div class="form-row">
       <div>
         <strong>${c.ip}</strong> <span style="color:var(--muted); font-size:11px;">(${c.formatted_did || c.hw_deviceid || c.short_uid})</span>
+        <span class="badge ${c.connected ? 'ok' : 'danger'}" style="margin-left:6px; font-size:10px;">${c.connection_mode || (c.connected ? 'LAN' : 'OFFLINE')}</span>
       </div>
-      <div style="display:flex; gap:6px;">
-        <input type="text" id="rname-${c.uid}" value="${c.room_name}" style="width:150px;">
+      <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        <input type="text" id="rname-${c.uid}" value="${c.room_name}" style="width:130px;">
         <button class="btn primary" onclick="renameRoom('${c.uid}')">Đổi tên + OSD</button>
-        <button class="btn" onclick="pushWifiToCamera('${c.uid}', '${c.room_name}')" title="Bắn cấu hình Wi-Fi mới từ xa qua mạng">📡 Đổi Wi-Fi</button>
+        <button class="btn" onclick="pushWifiToCamera('${c.uid}', '${c.room_name}')" title="Bắn cấu hình Wi-Fi mới từ xa qua mạng Internet/LAN">📡 Đổi Wi-Fi</button>
+        <button class="btn" onclick="changeCameraPassword('${c.uid}', '${c.room_name}')" title="Đổi mật khẩu camera">🔑 Mật khẩu</button>
+        <button class="btn" onclick="rebootCamera('${c.uid}', '${c.room_name}')" title="Khởi động lại camera từ xa">🔄 Reboot</button>
         <button class="btn danger" onclick="deleteCamera('${c.uid}', '${c.room_name}')" title="Xóa camera này khỏi Hub">🗑️</button>
       </div>
     </div>
@@ -4498,6 +4620,39 @@ async function pushWifiToCamera(uid, name) {
   alert(d.ok ? d.message : ('Lỗi: ' + d.error));
 }
 
+async function rebootCamera(uid, name) {
+  if (!confirm(`Khởi động lại camera "${name}" (${(uid||'').substring(0,8)}) từ xa qua mạng?`)) return;
+  showPtzToast('⏳ Đang gửi lệnh khởi động lại...', true);
+  try {
+    const res = await fetch(`/api/camera/${uid}/reboot`, { method: 'POST' });
+    const d = await res.json();
+    showPtzToast(d.ok ? ('✅ ' + d.message) : ('❌ ' + d.error), d.ok);
+    alert(d.ok ? d.message : ('Lỗi: ' + d.error));
+  } catch (err) {
+    showPtzToast('❌ Lỗi kết nối: ' + err.message, false);
+    alert('Lỗi kết nối: ' + err.message);
+  }
+}
+
+async function changeCameraPassword(uid, name) {
+  const newPwd = prompt(`Nhập mật khẩu mới cho camera "${name}":`);
+  if (!newPwd || !newPwd.trim()) return;
+  showPtzToast('⏳ Đang cập nhật mật khẩu camera...', true);
+  try {
+    const res = await fetch(`/api/camera/${uid}/password`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ password: newPwd.trim() })
+    });
+    const d = await res.json();
+    showPtzToast(d.ok ? ('✅ ' + d.message) : ('❌ ' + d.error), d.ok);
+    alert(d.ok ? d.message : ('Lỗi: ' + d.error));
+  } catch (err) {
+    showPtzToast('❌ Lỗi kết nối: ' + err.message, false);
+    alert('Lỗi kết nối: ' + err.message);
+  }
+}
+
 async function deleteCamera(uid, name) {
   if (!confirm(`Bạn có chắc muốn xóa camera "${name}" khỏi danh sách Hub?`)) return;
   await fetch(`/api/camera/${uid}`, { method: 'DELETE' });
@@ -4539,6 +4694,8 @@ def build_web_app(hub: CameraHubApp) -> web.Application:
     app.router.add_post("/api/camera/scan", hub.handle_scan_lan)
     app.router.add_delete("/api/camera/{uid}", hub.handle_delete_camera)
     app.router.add_post("/api/camera/{uid}/ptz", hub.handle_ptz)
+    app.router.add_post("/api/camera/{uid}/reboot", hub.handle_camera_reboot)
+    app.router.add_post("/api/camera/{uid}/password", hub.handle_change_password)
     app.router.add_post("/api/camera/{uid}/record", hub.handle_record_control)
     app.router.add_post("/api/camera/{uid}/rename", hub.handle_rename)
     app.router.add_get("/api/events", hub.handle_list_events)
