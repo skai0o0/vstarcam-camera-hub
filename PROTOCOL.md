@@ -409,9 +409,33 @@ GET /audiostream.cgi?streamid=10&loginuse=admin&loginpas=888888&user=admin&pwd=8
 GET /set_factory_param.cgi?alarm_server=http://host:port&loginuse=admin&loginpas=888888&user=admin&pwd=888888&
 ```
 
+**Control and settings** (all verified against VSTJ firmware 48.82.230.19 unless marked):
+
+| CGI | Purpose |
+|-----|---------|
+| `decoder_control.cgi?command=N&onestep=0/1` | PTZ. 0/2/4/6 = up/down/left/right, +1 = stop; 90–93 = diagonals; 25 = center; 26/27 = vertical patrol start/stop; 28/29 = horizontal patrol start/stop; 30+2k / 31+2k = set / go to preset k (0-based, 16 presets) |
+| `camera_control.cgi?param=P&value=V` | 1 brightness, 2 contrast, 8 saturation, 9 hue (0–255); 24 mic volume, 25 speaker volume (0–31); 3 mains frequency; 5 flip (0 normal, 1 flip, 2 mirror, 3 both); 14 IR-cut; 18 OSD |
+| `get_camera_params.cgi` | Image state: `vbright`, `vcontrast`, `vhue`, `vsaturation`, `flip`, `mode`, `ircut`, `involume`, `outvolume`, `enc_*`, `MainStreamWidth/Height` |
+| `get_misc.cgi` / `set_misc.cgi` | `ptz_patrol_rate` (+ `_up/_down/_left/_right_rate`), `ptz_center_onstart`, `preset_onstart`, `ptruntimes`, `led_mode`, `osdenable` |
+| `get_params.cgi` | Everything else: network, Wi-Fi, users, NTP/timezone, `alarm_motion_armed`, `alarm_motion_sensitivity`, schedules |
+| `get_record.cgi` | Encoder + SD recording settings |
+| `trans_cmd_string.cgi?cmd=2127&command=1` | Human tracking state (`enable`, `track_status`); `command=0&enable=0/1` to set (set form not verified) |
+| `trans_cmd_string.cgi?cmd=2126&command=1` | Humanoid frame state (`bHumanoidFrame`, `sensitive`); `command=0&bHumanoidFrame=0/1` to set (set form not verified) |
+| `get_alarm.cgi` | **Not supported** on this firmware (`cgi="not support"`) |
+
+`get_status.cgi` also reports the model's capability flags: `haveMotor`, `haveMic`, `haveHorn`, `haveTf`, `support_AI`, `support_humanDetect`, `support_humanoidFrame`, `support_motionArea`, `support_cryDetect`, `support_smokeDetect`, `support_departDetect`, `support_pixel_shift`, `support_h264_h265_shift`.
+
 ### CGI Responses
 
-Camera responses arrive on channel 0 with the same `01 0A` preamble (or as raw continuation text). Responses contain key=value pairs like:
+Each reply is one message on channel 0, possibly spanning several DRW packets:
+
+```
+01 0A | id (LE16) | text length (LE16) | 00 01 | text ...
+```
+
+`id` identifies the CGI being answered: `0x6001` get_status, `0x6002` get_params, `0x6003` get_camera_params, `0x6005` get_misc, `0x6006` get_record, `0x6012` camera_control (`result= 0;` once executed), `0x60D1` trans_cmd_string, `0x0000` unsupported CGI. Continuation packets carry raw text with no header; the message is complete when `text length` bytes have arrived. Replies come back in command order.
+
+Responses contain key=value pairs like:
 ```
 result=0
 deviceid=VSTABCDEFGHIJKL
@@ -578,7 +602,27 @@ The camera may send a CLOSE (0x20) packet from subsidiary ports while DRW data i
 
 ### Keepalive
 
-The proxy sends PUNCH_PKT to all known camera ports (discovery, current, DRW) every 2 seconds to keep the session alive.
+The proxy sends `MSG_ALIVE` to all known camera ports (discovery, current, DRW) every 2 seconds and answers the camera's own `MSG_ALIVE` with `MSG_ALIVE_ACK`.
+
+The 4-byte "XOR" control packets are really P2P_Proprietary-encrypted messages whose type byte happens to map as `xor_type = real_type ^ 0xD0`: what this document calls PUNCH_TO (`0x30`) / PUNCH_PKT (`0x31`) are the standard PPPP `MSG_ALIVE` (`0xE0`) / `MSG_ALIVE_ACK` (`0xE1`), and CLOSE (`0x20`) is `MSG_CLOSE` (`0xF0`). The fixed XOR only gets the first two bytes right — `build_punch_pkt()` decrypts on the camera as `F1 E1 25 00` (bogus length). Live VSTJ cameras ignore such packets: with them as the only keepalive, a session whose DRW traffic pauses for ~10 s is dropped and every later command goes un-ACKed. Once the cipher key is known, session keepalives and CLOSE are therefore built with the real cipher (`_session_ctrl_pkt`). The handshake still uses the legacy packets.
+
+On shutdown/reconnect the proxy sends `MSG_CLOSE` so the camera frees the session immediately (see next section for why lingering sessions matter).
+
+### Command Channel Is an Ordered, Reliable Stream
+
+Verified on live firmware (VSTJ, 48.82.230.19) by deliberately skipping a command index:
+
+- The camera ACKs every command DRW it receives, in ~10 ms, **but only executes index N after it has received every index below N**. Commands after a hole are ACKed and then parked indefinitely; they all run, in order, the moment the missing index arrives.
+- The sender must therefore retransmit un-ACKed command packets. Fire-and-forget works on a LAN (no loss) and fails over WAN P2P / Cloud Relay: one lost packet — typically a 1 Hz `get_status` poll — silently kills PTZ and every other command for the rest of the session while video keeps flowing.
+- The proxy keeps each command packet until its index appears in a DRW_ACK and retransmits with backoff (250 ms → 1.5 s). If the oldest command stays un-ACKed for 30 s, `CameraSession` tears the session down and reconnects.
+- A command index must never be spent on a packet the camera cannot decrypt (e.g. a wrong-PSK trial during encryption auto-detection) — that is a self-inflicted hole.
+
+### One Command at a Time; Slow With Several Clients
+
+The camera executes commands strictly one after another. Alone on a camera, a command is executed as soon as it arrives. When a second client holds a session (the Eye4 app, another hub, a session that vanished without `MSG_CLOSE`), the camera was measured executing **one command roughly every 11 s** per session. Consequences:
+
+- Status polls are flow-controlled: a new `get_status` is not queued until the previous one was answered (15 s cap), so user commands are never stuck behind a backlog of polls.
+- "ACKed" means *received*, not *executed* — the reply arrives when the command actually runs.
 
 ### Video Keepalive
 

@@ -43,6 +43,9 @@ python3 test_verify.py
 
 # Decryption analysis against pcap (requires scapy)
 python3 test_decrypt.py
+
+# Command-channel reliability (no camera/pcap needed: fake lossy camera on localhost)
+python3 test_cmd_reliability.py
 ```
 
 Both test files use `eye4.pcap` (real 3-camera capture) as ground truth. No test framework — they're standalone scripts with assertions.
@@ -88,6 +91,8 @@ UDP:32108 (discovery) / dynamic (DRW)
 ### Critical Protocol Details
 
 - **DRW_ACK inner magic is `0xD1`** (same as DRW), not `0xD2`. Wrong byte kills video streaming.
+- **Command channel (ch 0) is an ordered, ACKed stream.** The camera ACKs every command but only executes index N after all lower indices arrived, so commands must be retransmitted until ACKed (`_send_cmd_payload` / `_cmd_retx_loop`) and an index must never be spent on a packet the camera can't decrypt. Never send commands with a bare `transport.sendto`.
+- Session keepalive/close must be real cipher-encrypted `MSG_ALIVE`/`MSG_ALIVE_ACK`/`MSG_CLOSE` (`_session_ctrl_pkt`); the legacy 4-byte XOR packets have a corrupt length and are ignored by the camera.
 - Camera tracks sessions by UDP source port — must create fresh socket to restart.
 - Video start CGI uses `streamid=10` (HEVC main stream); `streamid=0` does NOT work.
 - Audio must be requested separately from video (`/audiostream.cgi`).

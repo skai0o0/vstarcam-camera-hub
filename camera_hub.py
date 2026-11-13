@@ -817,6 +817,7 @@ class CameraHubApp:
         self._discovery_task: Optional[asyncio.Task] = None
         self._quota_task: Optional[asyncio.Task] = None
         self._ptz_stop_tasks: Dict[str, asyncio.Task] = {}
+        self._ptz_last_move: Dict[str, tuple] = {}   # uid -> (decoder_control code, started_at)
 
     def _save_hub_config(self):
         self.config["hub"] = {
@@ -1375,96 +1376,253 @@ class CameraHubApp:
             pass
         return resp
 
+    # --- Camera control (PTZ / image / settings) over the PPPP command channel ---
+    #
+    # Works identically on LAN, WAN P2P and Cloud Relay: every command is
+    # retransmitted until the camera ACKs it, and the API reports that ACK
+    # instead of blindly answering "ok".
+
+    CMD_NO_ACK_MSG = ("Camera chưa xác nhận lệnh (đường truyền chậm hoặc mất kết nối). "
+                      "Lệnh vẫn đang được gửi lại tự động.")
+
+    # decoder_control.cgi command codes (VStarcam/Eye4)
+    PTZ_MOVES = {
+        "up": 0, "down": 2, "left": 4, "right": 6,
+        "leftup": 90, "rightup": 91, "leftdown": 92, "rightdown": 93,
+    }
+    PTZ_SIMPLE = {
+        "center": 25,
+        "vscan": 26, "vscan_stop": 27,      # up/down patrol
+        "hscan": 28, "hscan_stop": 29,      # left/right patrol
+    }
+    # camera_control.cgi fixed param/value pairs
+    PARAM_ACTIONS = {
+        "ir_auto": (14, 0), "ir_on": (14, 1), "ir_off": (14, 2),
+        "flip_normal": (5, 0), "flip_v": (5, 1), "flip_h": (5, 2), "flip_vh": (5, 3),
+        "osd_on": (18, 1), "osd_off": (18, 0),
+        "hz_50": (3, 0), "hz_60": (3, 1),
+    }
+    # camera_control.cgi params taking a numeric value: action -> (param, min, max).
+    # Param numbers confirmed on a live camera by read-back through get_camera_params.cgi.
+    PARAM_VALUE_ACTIONS = {
+        "brightness": (1, 0, 255),
+        "contrast": (2, 0, 255),
+        "saturation": (8, 0, 255),
+        "hue": (9, 0, 255),
+        "mic_volume": (24, 0, 31),        # involume
+        "speaker_volume": (25, 0, 31),    # outvolume
+    }
+    # Other CGIs taking a numeric value: action -> (cgi template, min, max)
+    CGI_VALUE_ACTIONS = {
+        "led_mode": ("set_misc.cgi?led_mode={v}", 0, 2),
+        "ptz_speed": ("set_misc.cgi?ptz_patrol_rate={v}&ptz_patrol_up_rate={v}&ptz_patrol_down_rate={v}"
+                      "&ptz_patrol_left_rate={v}&ptz_patrol_right_rate={v}", 1, 10),
+        "ptz_center_onstart": ("set_misc.cgi?ptz_center_onstart={v}", 0, 1),
+        "motion_sensitivity": ("set_alarm.cgi?motion_armed=1&motion_sensitivity={v}&input_armed=0&iolinkage=0"
+                               "&mail=0&upload_interval=0&record=1&snapshot=1&schedule_enable=1", 1, 10),
+    }
+    # Fixed CGIs. The trans_cmd_string keys mirror what the camera itself reports
+    # for command=1 (query): 2127 -> enable/track_status, 2126 -> bHumanoidFrame/sensitive.
+    CGI_ACTIONS = {
+        "track_on": "trans_cmd_string.cgi?cmd=2127&command=0&enable=1",
+        "track_off": "trans_cmd_string.cgi?cmd=2127&command=0&enable=0",
+        "humanframe_on": "trans_cmd_string.cgi?cmd=2126&command=0&bHumanoidFrame=1",
+        "humanframe_off": "trans_cmd_string.cgi?cmd=2126&command=0&bHumanoidFrame=0",
+    }
+    # CGIs the raw console refuses: they rewrite persistent factory data / firmware
+    CGI_BLOCKLIST = ("set_factory_param", "upgrade_firmware", "upgrade_htmls", "restore_factory")
+    _SECRET_KEY_RE = re.compile(r"(pwd|pass|psk|wpa|loginpas|^key\d*$)", re.I)
+
+    def _ptz_stop_codes(self, uid: str) -> list:
+        """Stop codes for whatever direction this camera was last told to move."""
+        move = self._ptz_last_move.get(uid)
+        code = move[0] if move else 0
+        if code >= 90:
+            return [1, 5]        # diagonals: stop both tilt and pan motors
+        return [code + 1]
+
+    async def _ptz_send_stop(self, uid: str, proto, wait_ack: float = 0.0) -> bool:
+        ok = True
+        for code in self._ptz_stop_codes(uid):
+            ok = await proto.send_ptz_command(code, onestep=0, wait_ack=wait_ack) and ok
+        self._ptz_last_move.pop(uid, None)
+        return ok
+
+    def _cancel_ptz_stop(self, uid: str):
+        prev_stop = self._ptz_stop_tasks.pop(uid, None)
+        if prev_stop and not prev_stop.done():
+            prev_stop.cancel()
+
     async def handle_ptz(self, request: web.Request) -> web.Response:
         uid = request.match_info.get("uid", "")
         sess = self.sessions.get(uid)
-        if not sess or not sess.protocol:
-            return web.json_response({"ok": False, "error": "Camera not connected"}, status=404)
+        if not sess or not sess.protocol or not sess.protocol.enc_mode:
+            return web.json_response({"ok": False, "error": "Camera chưa kết nối"}, status=404)
+        proto = sess.protocol
 
-        data = await request.json()
-        action = data.get("action", "")
-        req_onestep = data.get("onestep")
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        action = str(data.get("action", ""))
+        conn_mode = getattr(sess.camera, "connection_mode", "P2P")
 
-        ptz_map = {
-            "up": (0, 1),
-            "up_stop": (1, 0),
-            "down": (2, 1),
-            "down_stop": (3, 0),
-            "left": (4, 1),
-            "left_stop": (5, 0),
-            "right": (6, 1),
-            "right_stop": (7, 0),
-            "stop": (1, 0),
-            "center": (25, 0),
-            "hscan": (26, 0),
-            "hscan_stop": (27, 0),
-            "vscan": (28, 0),
-            "vscan_stop": (29, 0),
-            "preset1_set": (30, 0),
-            "preset1_go": (31, 0),
-            "preset2_set": (32, 0),
-            "preset2_go": (33, 0),
-            "preset3_set": (34, 0),
-            "preset3_go": (35, 0),
-            "preset4_set": (36, 0),
-            "preset4_go": (37, 0),
-            "preset5_set": (38, 0),
-            "preset5_go": (39, 0),
-        }
-        if action in ptz_map:
-            cmd_code, default_onestep = ptz_map[action]
-            onestep = int(req_onestep) if req_onestep is not None else default_onestep
+        def done(acked: bool, **extra):
+            body = {"ok": bool(acked), "action": action, "connection_mode": conn_mode, **extra}
+            if not acked:
+                body["error"] = self.CMD_NO_ACK_MSG
+            return web.json_response(body, status=200 if acked else 504)
 
-            # Cancel any pending stop task for this camera so multiple commands do not conflict
-            prev_stop = self._ptz_stop_tasks.get(uid)
-            if prev_stop and not prev_stop.done():
-                prev_stop.cancel()
+        def int_arg(name, lo, hi):
+            v = int(float(data.get(name)))
+            return max(lo, min(hi, v))
 
-            await sess.protocol.send_ptz_command(cmd_code, onestep=onestep)
-
-            # For directional step movement, schedule safety stop cutoff after 0.75s
-            if action in ("up", "down", "left", "right") and onestep == 1:
-                stop_code = cmd_code + 1
+        try:
+            # --- Directional movement ---
+            if action in self.PTZ_MOVES:
+                code = self.PTZ_MOVES[action]
+                hold = bool(data.get("hold"))
+                self._cancel_ptz_stop(uid)
+                self._ptz_last_move[uid] = (code, asyncio.get_event_loop().time())
+                acked = await proto.send_ptz_command(code, onestep=0 if hold else 1, wait_ack=3.0)
+                # Step: stop after 0.75s. Hold: the browser sends "stop" on release;
+                # this is only the safety net if that request never arrives.
                 self._ptz_stop_tasks[uid] = asyncio.create_task(
-                    self._delayed_ptz_stop(sess.protocol, stop_code, 0.75)
-                )
+                    self._delayed_ptz_stop(uid, proto, 12.0 if hold else 0.75))
+                return done(acked)
 
-            conn_mode = getattr(sess.camera, "connection_mode", "P2P")
-            return web.json_response({
-                "ok": True,
-                "action": action,
-                "connection_mode": conn_mode,
-            })
+            if action == "stop" or action.endswith("_stop") and action[:-5] in self.PTZ_MOVES:
+                self._cancel_ptz_stop(uid)
+                move = self._ptz_last_move.get(uid)
+                if move:
+                    # Let a quick tap produce a visible nudge before stopping
+                    remaining = 0.35 - (asyncio.get_event_loop().time() - move[1])
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+                return done(await self._ptz_send_stop(uid, proto, wait_ack=3.0))
 
-        param_map = {
-            "ir_auto": (14, 0),
-            "ir_on": (14, 1),
-            "ir_off": (14, 2),
-            "flip_normal": (5, 0),
-            "flip_v": (5, 1),
-            "flip_h": (5, 2),
-            "flip_vh": (5, 3),
-            "osd_on": (18, 1),
-            "osd_off": (18, 0),
-        }
-        if action in param_map:
-            param, val = param_map[action]
-            await sess.protocol.send_camera_param(param, val)
-            conn_mode = getattr(sess.camera, "connection_mode", "P2P")
-            return web.json_response({
-                "ok": True,
-                "action": action,
-                "connection_mode": conn_mode,
-            })
+            if action in self.PTZ_SIMPLE:
+                self._cancel_ptz_stop(uid)
+                return done(await proto.send_ptz_command(self.PTZ_SIMPLE[action], onestep=0, wait_ack=3.0))
+
+            # --- Presets 1..16: presetN_set / presetN_go ---
+            m = re.match(r"^preset(\d{1,2})_(set|go)$", action)
+            if m and 1 <= int(m.group(1)) <= 16:
+                self._cancel_ptz_stop(uid)
+                code = 30 + 2 * (int(m.group(1)) - 1) + (1 if m.group(2) == "go" else 0)
+                return done(await proto.send_ptz_command(code, onestep=0, wait_ack=3.0))
+
+            # --- Image / IR / OSD ---
+            if action in self.PARAM_ACTIONS:
+                param, val = self.PARAM_ACTIONS[action]
+                return done(await proto.send_camera_param(param, val, wait_ack=3.0))
+
+            if action in self.PARAM_VALUE_ACTIONS:
+                param, lo, hi = self.PARAM_VALUE_ACTIONS[action]
+                val = int_arg("value", lo, hi)
+                return done(await proto.send_camera_param(param, val, wait_ack=3.0), value=val)
+
+            if action == "param":      # raw camera_control.cgi?param=&value=
+                param, val = int_arg("param", 0, 255), int_arg("value", -65535, 65535)
+                return done(await proto.send_camera_param(param, val, wait_ack=3.0), param=param, value=val)
+
+            if action in self.CGI_ACTIONS:
+                return done(await proto.send_cgi(self.CGI_ACTIONS[action], wait_ack=3.0))
+
+            if action in self.CGI_VALUE_ACTIONS:
+                tmpl, lo, hi = self.CGI_VALUE_ACTIONS[action]
+                val = int_arg("value", lo, hi)
+                return done(await proto.send_cgi(tmpl.format(v=val), wait_ack=3.0), value=val)
+        except (TypeError, ValueError):
+            return web.json_response({"ok": False, "error": "Giá trị không hợp lệ"}, status=400)
 
         return web.json_response({"ok": False, "error": f"Unknown action: {action}"}, status=400)
 
-    async def _delayed_ptz_stop(self, proto: proxy.PPPPUnifiedProtocol, stop_code: int, delay: float):
+    async def _delayed_ptz_stop(self, uid: str, proto: proxy.PPPPUnifiedProtocol, delay: float):
         try:
             await asyncio.sleep(delay)
-            await proto.send_ptz_command(stop_code, onestep=0)
+            await self._ptz_send_stop(uid, proto)
         except (asyncio.CancelledError, Exception):
             pass
+
+    def _mask_secrets(self, values: dict) -> dict:
+        return {k: ("***" if (v and self._SECRET_KEY_RE.search(k)) else v) for k, v in values.items()}
+
+    # Read-only queries shown in the dashboard, in display order. All verified to
+    # answer on VSTJ firmware 48.82.230.19 (get_alarm.cgi is "not support" there:
+    # alarm settings live in get_params.cgi as alarm_*).
+    PARAM_QUERIES = (
+        ("get_status.cgi", "Trạng thái & tính năng hỗ trợ"),
+        ("get_camera_params.cgi", "Hình ảnh / âm lượng"),
+        ("get_misc.cgi", "PTZ & đèn báo"),
+        ("trans_cmd_string.cgi?cmd=2127&command=1", "AI: bám theo người (2127)"),
+        ("trans_cmd_string.cgi?cmd=2126&command=1", "AI: khung người (2126)"),
+        ("get_record.cgi", "Mã hoá & ghi hình"),
+        ("get_params.cgi", "Toàn bộ cấu hình"),
+    )
+    CMD_BUSY_MSG = ("Camera chưa trả lời kịp. Camera này xử lý lệnh tuần tự và rất chậm khi có "
+                    "nhiều thiết bị cùng kết nối (app Eye4, hub khác...). Thử lại sau ít giây.")
+
+    async def handle_camera_params(self, request: web.Request) -> web.Response:
+        """Read the camera's live settings + capability flags over the command channel."""
+        uid = request.match_info.get("uid", "")
+        sess = self.sessions.get(uid)
+        if not sess or not sess.protocol or not sess.protocol.enc_mode:
+            return web.json_response({"ok": False, "error": "Camera chưa kết nối"}, status=404)
+        proto = sess.protocol
+        try:
+            timeout = max(3.0, min(60.0, float(request.query.get("timeout", 12))))
+        except ValueError:
+            timeout = 12.0
+        replies = await proto.query_cgis([q for q, _ in self.PARAM_QUERIES], timeout=timeout)
+        sections = []
+        for cgi, title in self.PARAM_QUERIES:
+            values = replies.get(cgi)
+            sections.append({
+                "cgi": cgi, "title": title,
+                "values": None if values is None else self._mask_secrets(values),
+            })
+        answered = sum(1 for sec in sections if sec["values"] is not None)
+        return web.json_response({
+            "ok": answered > 0,
+            "partial": 0 < answered < len(sections),
+            "error": None if answered else self.CMD_BUSY_MSG,
+            "connection_mode": getattr(sess.camera, "connection_mode", "P2P"),
+            "sections": sections,
+            "channel": {
+                "unacked": len(proto._cmd_unacked),
+                "retransmits": proto._cmd_retx_count,
+            },
+        }, status=200 if answered else 504)
+
+    async def handle_camera_cgi(self, request: web.Request) -> web.Response:
+        """Raw CGI console: send any CGI (login params are appended) and return the reply."""
+        uid = request.match_info.get("uid", "")
+        sess = self.sessions.get(uid)
+        if not sess or not sess.protocol or not sess.protocol.enc_mode:
+            return web.json_response({"ok": False, "error": "Camera chưa kết nối"}, status=404)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        cgi = str(data.get("cgi") or "").strip()
+        if cgi.upper().startswith("GET "):
+            cgi = cgi[4:].strip()
+        cgi = cgi.lstrip("/")
+        if not re.match(r"^[A-Za-z0-9_]+\.cgi(\?[\x21-\x7e]*)?$", cgi) or len(cgi) > 600:
+            return web.json_response(
+                {"ok": False, "error": "CGI không hợp lệ (dạng: ten_lenh.cgi?a=1&b=2)"}, status=400)
+        if any(b in cgi.lower() for b in self.CGI_BLOCKLIST):
+            return web.json_response(
+                {"ok": False, "error": "Lệnh này bị chặn vì ghi đè tham số gốc/firmware của camera"}, status=403)
+        values = await sess.protocol.query_cgi(cgi, timeout=12.0)
+        if values is None:
+            return web.json_response({"ok": False, "error": self.CMD_BUSY_MSG}, status=504)
+        return web.json_response({
+            "ok": True,
+            "connection_mode": getattr(sess.camera, "connection_mode", "P2P"),
+            "values": self._mask_secrets(values),
+        })
 
     async def handle_camera_reboot(self, request: web.Request) -> web.Response:
         """Send hardware reboot command to camera over active PPPP session (LAN or WAN)."""
@@ -1473,7 +1631,8 @@ class CameraHubApp:
         if not sess or not sess.protocol:
             return web.json_response({"ok": False, "error": "Camera chưa kết nối"}, status=404)
         try:
-            await sess.protocol.send_reboot()
+            if not await sess.protocol.send_reboot(wait_ack=5.0):
+                return web.json_response({"ok": False, "error": self.CMD_NO_ACK_MSG}, status=504)
             conn_mode = getattr(sess.camera, "connection_mode", "P2P")
             return web.json_response({
                 "ok": True,
@@ -2919,7 +3078,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     flex-direction: column;
     gap: 14px;
     font-size: 12px;
+    max-height: 82vh;
+    overflow-y: auto;
   }
+  .ptz-sidebar .row { display:flex; gap:5px; flex-wrap:wrap; margin-top:6px; align-items:center; }
+  .ptz-sidebar input[type=range] { flex:1; min-width:90px; }
+  .ptz-sidebar label.sl { display:flex; align-items:center; gap:6px; margin-top:6px; }
+  .ptz-sidebar label.sl span { width:74px; color:var(--muted); }
+  .dpad button { touch-action: none; user-select: none; }
+  .cam-params { max-height:220px; overflow:auto; margin-top:6px; border:1px solid var(--border); border-radius:4px; }
+  .cam-params table { width:100%; border-collapse:collapse; font-size:11px; }
+  .cam-params td { padding:2px 6px; border-bottom:1px solid var(--border); word-break:break-all; }
+  .cam-params td:first-child { color:var(--muted); white-space:nowrap; }
+  .cam-params tr.sec td { color:var(--text, inherit); font-weight:600; background:rgba(127,127,127,0.12); }
   .dpad {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
@@ -3092,38 +3263,95 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="ptz-sidebar">
         <div>
           <strong>🕹️ Điều khiển Xoay PTZ 360°</strong>
+          <div style="color:var(--muted); margin-top:2px;">Chạm = nhích 1 bước · Giữ = xoay liên tục</div>
           <div class="dpad" style="margin-top:8px;">
-            <div></div>
-            <button class="btn" onclick="sendPtz('up')">▲</button>
-            <div></div>
-            <button class="btn" onclick="sendPtz('left')">◀</button>
-            <button class="btn" onclick="sendPtz('center')">●</button>
-            <button class="btn" onclick="sendPtz('right')">▶</button>
-            <div></div>
-            <button class="btn" onclick="sendPtz('down')">▼</button>
-            <div></div>
+            <button class="btn" data-ptz="leftup">◤</button>
+            <button class="btn" data-ptz="up">▲</button>
+            <button class="btn" data-ptz="rightup">◥</button>
+            <button class="btn" data-ptz="left">◀</button>
+            <button class="btn" onclick="sendPtz('center')" title="Về giữa">●</button>
+            <button class="btn" data-ptz="right">▶</button>
+            <button class="btn" data-ptz="leftdown">◣</button>
+            <button class="btn" data-ptz="down">▼</button>
+            <button class="btn" data-ptz="rightdown">◢</button>
           </div>
+          <div class="row">
+            <button class="btn" onclick="sendPtz('hscan')">↔ Quét ngang</button>
+            <button class="btn" onclick="sendPtz('vscan')">↕ Quét dọc</button>
+            <button class="btn danger" onclick="sendPtz('hscan_stop'); sendPtz('vscan_stop'); sendPtz('stop');">■ Dừng</button>
+          </div>
+          <label class="sl"><span>Tốc độ xoay</span>
+            <input type="range" min="1" max="10" value="10" id="sl-ptzspeed" onchange="sendPtz('ptz_speed', {value: this.value})">
+          </label>
         </div>
         <div>
           <strong>📍 Vị trí nhớ (Presets)</strong>
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:5px; margin-top:6px;">
-            <button class="btn" onclick="sendPtz('preset1_go')">Gọi góc 1</button>
-            <button class="btn" onclick="sendPtz('preset1_set')">Lưu góc 1</button>
-            <button class="btn" onclick="sendPtz('preset2_go')">Gọi góc 2</button>
-            <button class="btn" onclick="sendPtz('preset2_set')">Lưu góc 2</button>
-            <button class="btn" onclick="sendPtz('preset3_go')">Gọi góc 3</button>
-            <button class="btn" onclick="sendPtz('preset3_set')">Lưu góc 3</button>
+          <div class="row">
+            <select id="ptz-preset" style="flex:1;">
+              <option value="1">Góc 1</option><option value="2">Góc 2</option><option value="3">Góc 3</option>
+              <option value="4">Góc 4</option><option value="5">Góc 5</option><option value="6">Góc 6</option>
+              <option value="7">Góc 7</option><option value="8">Góc 8</option><option value="9">Góc 9</option>
+              <option value="10">Góc 10</option><option value="11">Góc 11</option><option value="12">Góc 12</option>
+              <option value="13">Góc 13</option><option value="14">Góc 14</option><option value="15">Góc 15</option>
+              <option value="16">Góc 16</option>
+            </select>
+            <button class="btn primary" onclick="sendPtz('preset' + document.getElementById('ptz-preset').value + '_go')">Gọi</button>
+            <button class="btn" onclick="if(confirm('Lưu vị trí hiện tại vào góc ' + document.getElementById('ptz-preset').value + '?')) sendPtz('preset' + document.getElementById('ptz-preset').value + '_set')">Lưu</button>
           </div>
         </div>
         <div>
           <strong>🌙 Hồng ngoại & Hình ảnh</strong>
-          <div style="display:flex; gap:5px; flex-wrap:wrap; margin-top:6px;">
+          <div class="row">
             <button class="btn" onclick="sendPtz('ir_auto')">IR Tự động</button>
             <button class="btn" onclick="sendPtz('ir_on')">Bật IR</button>
             <button class="btn" onclick="sendPtz('ir_off')">Tắt IR</button>
+          </div>
+          <div class="row">
             <button class="btn" onclick="sendPtz('flip_normal')">Hình chuẩn</button>
             <button class="btn" onclick="sendPtz('flip_vh')">Lật 180°</button>
+            <button class="btn" onclick="sendPtz('flip_v')">Lật dọc</button>
+            <button class="btn" onclick="sendPtz('flip_h')">Gương</button>
           </div>
+          <label class="sl"><span>Độ sáng</span>
+            <input type="range" min="0" max="255" value="128" id="sl-brightness" onchange="sendPtz('brightness', {value: this.value})">
+          </label>
+          <label class="sl"><span>Tương phản</span>
+            <input type="range" min="0" max="255" value="128" id="sl-contrast" onchange="sendPtz('contrast', {value: this.value})">
+          </label>
+          <label class="sl"><span>Bão hoà</span>
+            <input type="range" min="0" max="255" value="128" id="sl-saturation" onchange="sendPtz('saturation', {value: this.value})">
+          </label>
+          <label class="sl"><span>Âm lượng mic</span>
+            <input type="range" min="0" max="31" value="31" id="sl-mic" onchange="sendPtz('mic_volume', {value: this.value})">
+          </label>
+          <label class="sl"><span>Âm lượng loa</span>
+            <input type="range" min="0" max="31" value="31" id="sl-speaker" onchange="sendPtz('speaker_volume', {value: this.value})">
+          </label>
+          <div class="row">
+            <button class="btn" onclick="sendPtz('osd_on')">Hiện OSD</button>
+            <button class="btn" onclick="sendPtz('osd_off')">Ẩn OSD</button>
+            <button class="btn" onclick="sendPtz('hz_50')">50Hz</button>
+            <button class="btn" onclick="sendPtz('hz_60')">60Hz</button>
+          </div>
+        </div>
+        <div>
+          <strong>🔔 Cảnh báo & Đèn</strong>
+          <label class="sl"><span>Độ nhạy CĐ</span>
+            <input type="range" min="1" max="10" value="5" id="sl-motion" onchange="sendPtz('motion_sensitivity', {value: this.value})">
+          </label>
+          <div class="row">
+            <button class="btn" onclick="sendPtz('led_mode', {value: 1})">Bật đèn báo</button>
+            <button class="btn" onclick="sendPtz('led_mode', {value: 0})">Tắt đèn báo</button>
+          </div>
+          <div class="row">
+            <button class="btn" onclick="sendPtz('track_on')">Bám theo người: Bật</button>
+            <button class="btn" onclick="sendPtz('track_off')">Tắt</button>
+          </div>
+          <div class="row">
+            <button class="btn" onclick="sendPtz('humanframe_on')">Khung người: Bật</button>
+            <button class="btn" onclick="sendPtz('humanframe_off')">Tắt</button>
+          </div>
+          <div style="color:var(--muted); margin-top:4px;">Bấm “Đọc từ camera” bên dưới để xem trạng thái thực sau khi đổi.</div>
         </div>
         <div>
           <strong>⚙️ Thiết Lập Camera Từ Xa (Internet/LAN)</strong>
@@ -3134,6 +3362,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
         <div id="ptz-status" style="min-height:22px; font-size:12px; margin-top:4px; padding:6px 10px; border-radius:4px; display:none;"></div>
+        <div>
+          <strong>📋 Thông số & tính năng camera</strong>
+          <div class="row">
+            <button class="btn" onclick="loadCamParams()">Đọc từ camera</button>
+            <input type="text" id="cam-params-filter" placeholder="lọc..." oninput="renderCamParams()" style="flex:1; min-width:60px;">
+          </div>
+          <div id="cam-caps" style="display:none; margin-top:6px;"></div>
+          <div class="cam-params" id="cam-params" style="display:none;"></div>
+        </div>
+        <details>
+          <summary style="cursor:pointer;"><strong>🧪 Gửi CGI thủ công (nâng cao)</strong></summary>
+          <div class="row">
+            <input type="text" id="raw-cgi" placeholder="get_misc.cgi  hoặc  camera_control.cgi?param=1&value=128" style="flex:1; min-width:120px;" onkeydown="if(event.key==='Enter')sendRawCgi()">
+            <button class="btn" onclick="sendRawCgi()">Gửi</button>
+          </div>
+          <pre id="raw-cgi-out" style="display:none; white-space:pre-wrap; word-break:break-all; font-size:11px; max-height:160px; overflow:auto; margin:6px 0 0; padding:6px; border:1px solid var(--border); border-radius:4px;"></pre>
+        </details>
         <div id="focus-info" style="color:var(--muted); line-height:1.5;"></div>
       </div>
     </div>
@@ -3651,7 +3896,13 @@ function openFocusModal(uid) {
 }
 
 function closeFocusModal() {
+  ptzHoldEnd();
   focusUid = null;
+  camParamsData = null;
+  for (const id of ['cam-params', 'cam-caps']) {
+    const cp = document.getElementById(id);
+    if (cp) { cp.style.display = 'none'; cp.innerHTML = ''; }
+  }
   document.getElementById('focus-modal').classList.remove('open');
   syncWsConfig();
 }
@@ -3671,23 +3922,180 @@ function showPtzToast(msg, isOk = true) {
   }, 2500);
 }
 
-async function sendPtz(action) {
-  if (!focusUid) return;
-  showPtzToast('⏳ Đang gửi lệnh ' + action + '...', true);
+async function sendPtz(action, extra, quiet) {
+  if (!focusUid) return null;
+  if (!quiet) showPtzToast('⏳ Đang gửi lệnh ' + action + '...', true);
   try {
     const res = await fetch(`/api/camera/${focusUid}/ptz`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action})
+      body: JSON.stringify(Object.assign({action}, extra || {}))
     });
     const d = await res.json();
     if (d.ok) {
-      showPtzToast(`✅ Lệnh "${action}" thành công (${d.connection_mode || 'P2P'})!`, true);
+      if (!quiet) showPtzToast(`✅ Camera đã nhận lệnh "${action}" (${d.connection_mode || 'P2P'})`, true);
     } else {
-      showPtzToast(`❌ Lỗi: ${d.error || 'Thao tác thất bại'}`, false);
+      showPtzToast(`❌ ${d.error || 'Thao tác thất bại'}`, false);
     }
+    return d;
   } catch (err) {
     showPtzToast(`❌ Lỗi mạng: ${err.message}`, false);
+    return null;
+  }
+}
+
+// D-pad: tap = one step, press-and-hold = continuous move until release.
+let ptzHold = null;   // {action, timer, holding, started}
+function ptzHoldStart(action) {
+  ptzHoldEnd();
+  const st = {action, holding: false, started: null, timer: null};
+  st.timer = setTimeout(() => {
+    st.holding = true;
+    st.started = sendPtz(action, {hold: true});
+  }, 280);
+  ptzHold = st;
+}
+function ptzHoldEnd() {
+  const st = ptzHold;
+  if (!st) return;
+  ptzHold = null;
+  clearTimeout(st.timer);
+  if (st.holding) {
+    // Make sure the stop is sent after the move request has gone out
+    Promise.resolve(st.started).then(() => sendPtz('stop', null, true));
+  } else {
+    sendPtz(st.action);
+  }
+}
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('.dpad [data-ptz]').forEach(btn => {
+    btn.addEventListener('pointerdown', ev => {
+      ev.preventDefault();
+      try { btn.setPointerCapture(ev.pointerId); } catch (e) {}
+      ptzHoldStart(btn.dataset.ptz);
+    });
+    ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(t =>
+      btn.addEventListener(t, () => ptzHoldEnd()));
+    btn.addEventListener('contextmenu', ev => ev.preventDefault());
+  });
+});
+window.addEventListener('blur', () => ptzHoldEnd());
+
+let camParamsData = null;   // [{cgi, title, values|null}]
+
+function escHtml(v) {
+  return String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderCamParams() {
+  const box = document.getElementById('cam-params');
+  if (!box || !camParamsData) return;
+  const filter = (document.getElementById('cam-params-filter').value || '').toLowerCase();
+  let html = '<table>';
+  const seen = new Set();
+  for (const sec of camParamsData) {
+    const vals = sec.values;
+    html += `<tr class="sec"><td colspan="2">${escHtml(sec.title)}</td></tr>`;
+    if (vals === null) {
+      html += '<tr><td colspan="2">⏳ Camera chưa trả lời mục này (đang bận) — bấm đọc lại</td></tr>';
+      continue;
+    }
+    if (vals.cgi === 'not support') {
+      html += '<tr><td colspan="2" style="color:var(--muted);">Firmware không hỗ trợ</td></tr>';
+      continue;
+    }
+    let shown = 0;
+    for (const k of Object.keys(vals).sort()) {
+      if (seen.has(k) || k === 'result' || k === 'command' || k === 'uid') continue;
+      seen.add(k);
+      if (filter && !k.toLowerCase().includes(filter) && !String(vals[k]).toLowerCase().includes(filter)) continue;
+      html += `<tr><td>${escHtml(k)}</td><td>${escHtml(vals[k])}</td></tr>`;
+      shown++;
+    }
+    if (!shown) html += '<tr><td colspan="2" style="color:var(--muted);">(không có mục khớp)</td></tr>';
+  }
+  box.innerHTML = html + '</table>';
+  box.style.display = 'block';
+}
+
+function syncCamControls() {
+  if (!camParamsData) return;
+  const all = Object.assign({}, ...camParamsData.map(s => s.values || {}));
+  const num = k => (all[k] !== undefined && all[k] !== '' && !isNaN(Number(all[k]))) ? Number(all[k]) : null;
+  const setv = (id, key) => { const el = document.getElementById(id); const v = num(key); if (el && v !== null) el.value = v; };
+  setv('sl-brightness', 'vbright');
+  setv('sl-contrast', 'vcontrast');
+  setv('sl-saturation', 'vsaturation');
+  setv('sl-mic', 'involume');
+  setv('sl-speaker', 'outvolume');
+  setv('sl-motion', 'alarm_motion_sensitivity');
+  setv('sl-ptzspeed', 'ptz_patrol_rate');
+  // Capability summary from the camera's own support_*/have* flags
+  const caps = [
+    ['haveMotor', 'Xoay PTZ'], ['haveMic', 'Micro'], ['haveHorn', 'Loa'], ['haveTf', 'Thẻ nhớ'],
+    ['support_humanDetect', 'Phát hiện người'], ['support_humanoidFrame', 'Khung người'],
+    ['support_motionArea', 'Vùng chuyển động'], ['support_cryDetect', 'Phát hiện tiếng khóc'],
+    ['support_smokeDetect', 'Báo khói'], ['support_departDetect', 'Phát hiện rời đi'],
+    ['support_pixel_shift', 'Đổi độ phân giải'], ['support_h264_h265_shift', 'Đổi H.264/H.265'],
+  ];
+  const el = document.getElementById('cam-caps');
+  if (el && all.sys_ver !== undefined) {
+    const chips = caps.filter(([k]) => all[k] !== undefined).map(([k, label]) =>
+      `<span class="badge ${all[k] === '1' ? 'ok' : ''}" style="font-size:10px; ${all[k] === '1' ? '' : 'opacity:.45; text-decoration:line-through;'}">${label}</span>`).join(' ');
+    const state = [];
+    if (all.enable !== undefined) state.push('Bám người: ' + (all.enable === '1' ? 'BẬT' : 'tắt'));
+    if (all.bHumanoidFrame !== undefined) state.push('Khung người: ' + (all.bHumanoidFrame === '1' ? 'BẬT' : 'tắt'));
+    if (all.led_mode !== undefined) state.push('Đèn báo: ' + (all.led_mode === '0' ? 'tắt' : 'BẬT'));
+    if (all.flip !== undefined) state.push('Lật: ' + ({'0':'chuẩn','1':'dọc','2':'gương','3':'180°'}[all.flip] || all.flip));
+    if (all.MainStreamWidth) state.push(`Luồng chính: ${all.MainStreamWidth}×${all.MainStreamHeight}`);
+    el.innerHTML = `<div style="color:var(--muted);">Firmware ${escHtml(all.sys_ver)}</div>`
+      + `<div style="display:flex; gap:4px; flex-wrap:wrap; margin-top:4px;">${chips}</div>`
+      + (state.length ? `<div style="margin-top:4px;">${escHtml(state.join(' · '))}</div>` : '');
+    el.style.display = 'block';
+  }
+}
+
+async function loadCamParams() {
+  if (!focusUid) return;
+  const uid = focusUid;
+  showPtzToast('⏳ Đang đọc thông số từ camera...', true);
+  try {
+    const res = await fetch(`/api/camera/${uid}/params`);
+    const d = await res.json();
+    if (uid !== focusUid) return;
+    camParamsData = d.sections || [];
+    renderCamParams();
+    if (!d.ok) { showPtzToast('❌ ' + (d.error || 'Không đọc được'), false); return; }
+    syncCamControls();
+    showPtzToast(d.partial
+      ? '⚠️ Camera mới trả lời một phần (đang bận) — bấm đọc lại sau ít giây'
+      : `✅ Đã đọc thông số (${d.connection_mode || 'P2P'})`, !d.partial);
+  } catch (err) {
+    showPtzToast('❌ Lỗi mạng: ' + err.message, false);
+  }
+}
+
+async function sendRawCgi() {
+  if (!focusUid) return;
+  const cgi = document.getElementById('raw-cgi').value.trim();
+  const out = document.getElementById('raw-cgi-out');
+  if (!cgi) return;
+  out.style.display = 'block';
+  out.textContent = '⏳ Đang gửi...';
+  try {
+    const res = await fetch(`/api/camera/${focusUid}/cgi`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cgi})
+    });
+    const d = await res.json();
+    if (!d.ok) { out.textContent = '❌ ' + (d.error || 'Thất bại'); return; }
+    const keys = Object.keys(d.values || {}).sort();
+    out.textContent = keys.length
+      ? keys.map(k => `${k} = ${d.values[k]}`).join('\n')
+      : '✅ Camera đã nhận lệnh (không có dữ liệu trả về).';
+  } catch (err) {
+    out.textContent = '❌ Lỗi mạng: ' + err.message;
   }
 }
 
@@ -4694,6 +5102,8 @@ def build_web_app(hub: CameraHubApp) -> web.Application:
     app.router.add_post("/api/camera/scan", hub.handle_scan_lan)
     app.router.add_delete("/api/camera/{uid}", hub.handle_delete_camera)
     app.router.add_post("/api/camera/{uid}/ptz", hub.handle_ptz)
+    app.router.add_get("/api/camera/{uid}/params", hub.handle_camera_params)
+    app.router.add_post("/api/camera/{uid}/cgi", hub.handle_camera_cgi)
     app.router.add_post("/api/camera/{uid}/reboot", hub.handle_camera_reboot)
     app.router.add_post("/api/camera/{uid}/password", hub.handle_change_password)
     app.router.add_post("/api/camera/{uid}/record", hub.handle_record_control)

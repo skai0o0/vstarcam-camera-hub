@@ -15,6 +15,7 @@ Dependencies: pycryptodome (pip install pycryptodome)
 
 import argparse
 import asyncio
+import collections
 import hashlib
 import logging
 import random
@@ -708,9 +709,39 @@ def parse_drw_ack(plaintext: bytes) -> Optional[dict]:
     magic, msg_type, size = struct.unpack(">BBH", plaintext[:4])
     if magic != PPPP_MAGIC or msg_type != MSG_DRW_ACK:
         return None
-    # Inner: D2 channel count16 [acked_indices...]
+    # Inner: D1 channel count16 [acked_indices...]
     channel = plaintext[5]
-    return {"channel": channel, "raw": plaintext}
+    count = struct.unpack(">H", plaintext[6:8])[0]
+    avail = (len(plaintext) - 8) // 2
+    indices = [struct.unpack_from(">H", plaintext, 8 + 2 * i)[0]
+               for i in range(min(count, avail))]
+    return {"channel": channel, "indices": indices, "raw": plaintext}
+
+
+# Matches key=value pairs in CGI responses: `var alias="Cam";`, `result=0`, `ircut=1;`
+_CGI_KV_RE = re.compile(r'([A-Za-z_][\w\.\[\]]*)\s*=\s*(?:"([^"\r\n]*)"|([^;&\r\n"]*))')
+
+# Reliable command channel tuning (PPPP DRW is an ordered, ACKed stream: the
+# camera only executes command index N after it has received every index < N)
+CMD_RTO_INITIAL = 0.25     # first retransmit after 250 ms without an ACK
+CMD_RTO_MAX = 1.5          # retransmit backoff cap
+CMD_RETX_BURST = 16        # max packets retransmitted per tick (oldest first)
+CMD_POLL_BACKLOG = 4       # skip status polls while this many commands are un-ACKed
+CMD_POLL_REPLY_WAIT = 15.0 # don't queue another status poll until the last one was answered
+
+# Reply message ids (bytes 2-3 of the 8-byte reply header), captured from live
+# VSTJ firmware 48.82.230.19. Lets a reply be matched to the CGI that asked for it
+# even when status-poll replies are interleaved.
+CGI_REPLY_IDS = {
+    "get_status.cgi": 0x6001,
+    "get_params.cgi": 0x6002,
+    "get_camera_params.cgi": 0x6003,
+    "get_misc.cgi": 0x6005,
+    "get_record.cgi": 0x6006,
+    "camera_control.cgi": 0x6012,
+    "trans_cmd_string.cgi": 0x60D1,
+}
+CGI_REPLY_UNSUPPORTED = 0x0000   # body: result= 0; cgi="not support";
 
 
 # =============================================================================
@@ -860,6 +891,21 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self._seen_drw_indices: dict[int, set[int]] = {}  # channel -> set of seen indices
         self._drw_high_water: dict[int, int] = {}  # channel -> highest seen index
         self._cmd_index = 0
+        # Reliable command channel: idx -> [packet, first_sent, last_sent, tries]
+        self._cmd_unacked: dict[int, list] = {}
+        self._cmd_ack_waiters: dict[int, asyncio.Future] = {}
+        self._cmd_retx_task: Optional[asyncio.Task] = None
+        self._cmd_ack_seen: bool = False       # camera has ACKed at least one command
+        self._cmd_retx_count: int = 0          # total retransmissions (diagnostics)
+        # Latest key=value pairs seen in CGI responses + when each was last updated
+        self.cgi_state: dict[str, str] = {}
+        self._cgi_state_ts: dict[str, float] = {}
+        self._last_cmd_rx_time: float = 0.0
+        # Reply messages: the one being reassembled + the most recent completed ones
+        self._cgi_cur: Optional[dict] = None
+        self._cgi_done: collections.deque = collections.deque(maxlen=48)
+        self._cgi_msg_seq: int = 0
+        self._poll_sent_at: float = 0.0        # outstanding status poll (0 = none)
         self._video_reassembly: Optional[VideoReassembly] = None
         self._audio_reassembly: Optional["AudioReassembly"] = None
         self._last_audio_drw_time: float = 0
@@ -917,6 +963,21 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             if psk_bytes:
                 return p2p_derive_key(psk_bytes)
         return p2p_derive_key(b"vstarcam2019")
+
+    # Real PPPP message types for an established session. The legacy
+    # build_punch_pkt()/build_punch_to() helpers produce the right *type* byte
+    # (0xE1 / 0xE0) but, being a fixed 4-byte XOR, a corrupt length field
+    # (F1 E1 25 00). Verified against live VSTJ cameras: they ignore those, so a
+    # session that goes quiet on the DRW side for ~10s is silently dropped and
+    # every later command goes un-ACKed. These are encrypted correctly instead.
+    PPPP_ALIVE = 0xE0
+    PPPP_ALIVE_ACK = 0xE1
+    PPPP_CLOSE = 0xF0
+
+    def _session_ctrl_pkt(self, real_type: int, legacy: bytes) -> bytes:
+        if self.enc_mode == ENC_P2P and self.p2p_key:
+            return p2p_proprietary_encrypt(self.p2p_key, bytes([PPPP_MAGIC, real_type, 0x00, 0x00]))
+        return legacy  # XOR-only cameras / encryption not negotiated yet: unchanged behaviour
 
     def connection_made(self, transport):
         self.transport = transport
@@ -1212,7 +1273,9 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
     def _handle_punch_to(self, ip: str, port: int):
         if self._active_camera and ip == self._active_camera.ip:
             if self.transport and not self.transport.is_closing():
-                self.transport.sendto(build_punch_pkt(), (ip, port))
+                # This is really the camera's MSG_ALIVE: answer with a valid ALIVE_ACK
+                self.transport.sendto(
+                    self._session_ctrl_pkt(self.PPPP_ALIVE_ACK, build_punch_pkt()), (ip, port))
             self._active_camera.port = port
             if not self._connected.is_set():
                 log.info("PUNCH_TO from target %s:%d — connection established!", ip, port)
@@ -1224,7 +1287,8 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             log.debug("PUNCH_TO from %s:%d (not target camera)", ip, port)
 
     def _handle_punch_pkt(self, ip: str, port: int):
-        log.info("PUNCH_PKT from %s:%d — session confirmed!", ip, port)
+        log.log(logging.DEBUG if self._connected.is_set() else logging.INFO,
+                "PUNCH_PKT from %s:%d — session confirmed!", ip, port)
         if self._active_camera and ip == self._active_camera.ip:
             self._active_camera.port = port
             self.connected = True
@@ -1373,7 +1437,10 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                     self._active_camera.port = addr[1]
                 elif addr[0] == self._active_camera.ip:
                     self._drw_port = addr[1]
-            log.info("DRW_ACK from %s:%d ch=%d", addr[0], addr[1], parsed["channel"])
+            if parsed["channel"] == CH_CMD:
+                self._on_cmd_acked(parsed["indices"])
+            log.debug("DRW_ACK from %s:%d ch=%d idx=%s", addr[0], addr[1],
+                      parsed["channel"], parsed["indices"][:8])
         else:
             log.info("DRW_ACK from %s:%d (unparsed, %d bytes)",
                       addr[0], addr[1], len(raw_data))
@@ -1397,6 +1464,8 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         )
         log.log(logging.DEBUG if is_alarm_poll else logging.INFO,
                 "CMD response (%d bytes): first16=%s", len(payload), payload[:16].hex())
+
+        self._ingest_cgi_text(payload)
 
         if text:
             # Clean up for display
@@ -1731,6 +1800,15 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                 await asyncio.sleep(self.alarm_poll_interval)
                 if self.auth_failed:
                     continue
+                if len(self._cmd_unacked) >= CMD_POLL_BACKLOG:
+                    continue  # let retransmissions drain first
+                # One poll in flight at a time. A camera serving several clients
+                # executes commands slowly (seen live: one per ~11s); stacking a
+                # poll every second in front of a PTZ command would delay it by minutes.
+                now_t = asyncio.get_event_loop().time()
+                if self._poll_sent_at and now_t - self._poll_sent_at < CMD_POLL_REPLY_WAIT:
+                    continue
+                self._poll_sent_at = now_t
                 if self.enc_mode and self.transport and not self.transport.is_closing():
                     cgi = (f"GET /get_status.cgi?"
                            f"loginuse={self.username}&loginpas={self.password}"
@@ -1803,17 +1881,25 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             self._got_any_drw.clear()
 
             # Build and send login DRW with this encryption mode
+            # NOTE: the command index is only consumed once a trial succeeds. A packet
+            # encrypted with the wrong key is garbage to the camera, so burning an index
+            # on it would leave a permanent hole in the ordered command stream.
             pkt = build_drw_packet(CH_CMD, self._cmd_index, payload,
                                    trial_key or b'\x00\x00\x00\x00', enc_mode)
-            self._cmd_index = (self._cmd_index + 1) & 0xFFFF
             log.info("  Sending DRW (%d bytes) to %s:%d, first16=%s",
                      len(pkt), addr[0], addr[1], pkt[:16].hex())
-            self.transport.sendto(pkt, addr)
 
-            # Wait briefly for any DRW/ACK response
-            try:
-                await asyncio.wait_for(self._got_any_drw.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
+            # Send, and re-send a few times (WAN/relay paths drop packets)
+            got = False
+            for _try in range(4):
+                self.transport.sendto(pkt, addr)
+                try:
+                    await asyncio.wait_for(self._got_any_drw.wait(), timeout=0.5)
+                    got = True
+                    break
+                except asyncio.TimeoutError:
+                    continue
+            if not got:
                 log.info("  No DRW response with enc=%s PSK=%r", enc_mode, psk_label)
                 continue
 
@@ -1836,6 +1922,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                                  enc_mode, psk_label, plaintext[1])
                         self.enc_mode = enc_mode
                         self.p2p_key = trial_key or b'\x00\x00\x00\x00'
+                        self._cmd_index = (self._cmd_index + 1) & 0xFFFF
                         found = True
                         break
 
@@ -1913,8 +2000,26 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                 await self._alarm_poll_task
             except asyncio.CancelledError:
                 pass
+        self._reset_cmd_channel()
+        self._send_session_close()
         if self.transport:
             self.transport.close()
+
+    def _send_session_close(self):
+        """Send MSG_CLOSE so the camera releases this session right away. A session
+        that just vanishes lingers on the camera until its own timeout, and while
+        it lingers the camera serves every other client's commands far slower."""
+        addr = self._get_drw_addr()
+        if not addr or not self.transport or self.transport.is_closing():
+            return
+        if self.enc_mode != ENC_P2P or not self.p2p_key:
+            return
+        pkt = self._session_ctrl_pkt(self.PPPP_CLOSE, b"")
+        try:
+            for _ in range(3):
+                self.transport.sendto(pkt, addr)
+        except OSError:
+            pass
 
     async def _handle_session_close(self):
         """Handle camera session close — create a fresh UDP socket and reconnect.
@@ -1935,6 +2040,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self._seen_drw_indices.clear()
         self._drw_high_water.clear()
         self._cmd_index = 0
+        self._reset_cmd_channel()
         self._drw_packets_received = 0
         self._drw_bytes_received = 0
         self._last_video_drw_time = 0
@@ -1946,6 +2052,8 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self._got_any_drw.clear()
 
         # Close old transport and create new one
+        self._send_session_close()
+        self._drw_addr = None
         old_transport = self.transport
         loop = asyncio.get_event_loop()
         new_transport, _ = await loop.create_datagram_endpoint(
@@ -1994,8 +2102,9 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                 ports.add(cam.port)
             if self._drw_port:
                 ports.add(self._drw_port)
+            alive = self._session_ctrl_pkt(self.PPPP_ALIVE, build_punch_pkt())
             for port in ports:
-                self.transport.sendto(build_punch_pkt(), (cam.ip, port))
+                self.transport.sendto(alive, (cam.ip, port))
 
     async def _video_keepalive_loop(self):
         """Periodically re-request video stream to keep it flowing.
@@ -2069,19 +2178,20 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             await self._send_cmd(cgi)
             await asyncio.sleep(0.15)
 
-    async def send_ptz_command(self, command: int, onestep: int = 1):
-        """Send PTZ motor control command via decoder_control.cgi."""
+    async def send_ptz_command(self, command: int, onestep: int = 1, wait_ack: float = 0.0) -> bool:
+        """Send PTZ motor control command via decoder_control.cgi.
+        Returns True when queued (or, with wait_ack, when the camera ACKed it)."""
         cgi = (f"GET /decoder_control.cgi?command={int(command)}&onestep={int(onestep)}"
                f"&loginuse={self.username}&loginpas={self.password}"
                f"&user={self.username}&pwd={self.password}&")
-        await self._send_cmd(cgi)
+        return await self._send_cmd(cgi, wait_ack=wait_ack)
 
-    async def send_camera_param(self, param: int, value: int):
+    async def send_camera_param(self, param: int, value: int, wait_ack: float = 0.0) -> bool:
         """Send camera parameter via camera_control.cgi (e.g. param=5 flip/mirror, param=14 ircut, param=18 osd)."""
         cgi = (f"GET /camera_control.cgi?param={int(param)}&value={int(value)}"
                f"&loginuse={self.username}&loginpas={self.password}"
                f"&user={self.username}&pwd={self.password}&")
-        await self._send_cmd(cgi)
+        return await self._send_cmd(cgi, wait_ack=wait_ack)
 
     async def send_set_alias(self, alias: str):
         """Update hardware OSD camera alias name via set_alias.cgi."""
@@ -2113,17 +2223,21 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             f"&loginuse={self.username}&loginpas={self.password}"
             f"&user={self.username}&pwd={self.password}&"
         )
-        await self._send_cmd(cgi)
+        # Wait for the ACK before switching: retransmissions of this packet are
+        # byte-identical, but every later command must carry the new password.
+        ok = await self._send_cmd(cgi, wait_ack=6.0)
+        if not ok:
+            raise RuntimeError("Camera did not acknowledge set_user.cgi — password NOT changed in hub")
         self.password = new_password
 
-    async def send_reboot(self):
+    async def send_reboot(self, wait_ack: float = 0.0) -> bool:
         """Reboot camera via reboot.cgi over PPPP."""
         cgi = (
             f"GET /reboot.cgi?"
             f"loginuse={self.username}&loginpas={self.password}"
             f"&user={self.username}&pwd={self.password}&"
         )
-        await self._send_cmd(cgi)
+        return await self._send_cmd(cgi, wait_ack=wait_ack)
 
     async def _send_start_video(self):
         # Camera restarts video DRW indices from 0 on each fresh request, so
@@ -2223,15 +2337,11 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             log.error("Cannot send DRW: encryption mode not set!")
             return
 
-        pkt = build_drw_packet(CH_CMD, self._cmd_index, combined,
-                               self.p2p_key, self.enc_mode)
-        self._cmd_index = (self._cmd_index + 1) & 0xFFFF
-
         addr = self._get_drw_addr()
-        if addr and self.transport and not self.transport.is_closing():
+        if addr:
             log.info("Sending combined CGI DRW (%d bytes, %d commands) to %s:%d",
                      len(combined), len(cgis), addr[0], addr[1])
-            self.transport.sendto(pkt, addr)
+        self._send_cmd_payload(combined)
 
     def _get_drw_addr(self) -> Optional[tuple[str, int]]:
         """Get the address to send DRW packets to.
@@ -2247,40 +2357,230 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             return None
         return (self._active_camera.ip, port)
 
-    async def _send_cmd(self, cgi_text: str):
-        """Send a CGI command to the camera via DRW on the command channel."""
+    # --- Reliable command channel -------------------------------------------
+    #
+    # PPPP DRW is an ordered, acknowledged stream per channel. The camera only
+    # hands command index N to its CGI handler after it has received every
+    # index below N, and it expects the sender to retransmit until ACKed.
+    # On a LAN nothing is ever lost so fire-and-forget happened to work; over
+    # WAN P2P / Cloud Relay a single dropped packet (typically one of the 1 Hz
+    # get_status polls) left a permanent hole, after which every later command
+    # (PTZ, IR, flip, settings) was silently parked by the camera forever
+    # while video (camera -> us) kept flowing.
+
+    def _send_cmd_payload(self, payload: bytes) -> Optional[int]:
+        """Queue + send one command-channel DRW. Returns its index, or None."""
         if not self.enc_mode:
             log.error("Cannot send DRW: encryption mode not set!")
-            return
-
-        payload = build_cgi_command(cgi_text)
-        pkt = build_drw_packet(CH_CMD, self._cmd_index, payload,
-                               self.p2p_key, self.enc_mode)
+            return None
+        idx = self._cmd_index
+        pkt = build_drw_packet(CH_CMD, idx, payload, self.p2p_key, self.enc_mode)
         self._cmd_index = (self._cmd_index + 1) & 0xFFFF
-
+        now = asyncio.get_event_loop().time()
+        self._cmd_unacked[idx] = [pkt, now, now, 0]
         addr = self._get_drw_addr()
         if addr and self.transport and not self.transport.is_closing():
-            lvl = logging.DEBUG if "get_status.cgi" in cgi_text else logging.INFO
-            log.log(lvl, "Sending DRW CMD (%s) to %s:%d idx=%d cgi=%s",
-                    self.enc_mode, addr[0], addr[1],
-                    self._cmd_index - 1, redact_credentials(cgi_text)[:80])
             self.transport.sendto(pkt, addr)
+        if self._cmd_retx_task is None or self._cmd_retx_task.done():
+            self._cmd_retx_task = asyncio.get_event_loop().create_task(self._cmd_retx_loop())
+        return idx
 
-            # Redundancy over WAN/Internet:
-            is_poll = "get_status.cgi" in cgi_text
-            is_wan = (
-                (self._active_camera and self._active_camera.connection_mode in ("WAN_P2P", "WAN_RELAY"))
-                or self._used_wan_p2p
-                or bool(self._wan_relay_session)
-                or (addr[0] not in ("127.0.0.1", "localhost") and not addr[0].startswith("192.168."))
-            )
-            if not is_poll and is_wan:
-                try:
-                    await asyncio.sleep(0.035)
-                    if self.transport and not self.transport.is_closing():
-                        self.transport.sendto(pkt, addr)
-                except Exception:
-                    pass
+    def _on_cmd_acked(self, indices):
+        for idx in indices:
+            if self._cmd_unacked.pop(idx, None) is not None:
+                self._cmd_ack_seen = True
+            fut = self._cmd_ack_waiters.pop(idx, None)
+            if fut and not fut.done():
+                fut.set_result(True)
+
+    def _reset_cmd_channel(self):
+        """Drop all pending command state (session closed / restarted)."""
+        self._cmd_unacked.clear()
+        for fut in self._cmd_ack_waiters.values():
+            if not fut.done():
+                fut.set_result(False)
+        self._cmd_ack_waiters.clear()
+        task = self._cmd_retx_task
+        self._cmd_retx_task = None
+        if task and not task.done():
+            task.cancel()
+
+    async def _cmd_retx_loop(self):
+        """Retransmit un-ACKed command packets (oldest first) until the camera ACKs them."""
+        loop = asyncio.get_event_loop()
+        try:
+            while self._cmd_unacked:
+                await asyncio.sleep(0.05)
+                if not self.transport or self.transport.is_closing():
+                    return
+                addr = self._get_drw_addr()
+                if not addr:
+                    continue
+                now = loop.time()
+                sent = 0
+                for idx, ent in list(self._cmd_unacked.items()):
+                    rto = min(CMD_RTO_INITIAL * (1.5 ** ent[3]), CMD_RTO_MAX)
+                    if now - ent[2] < rto:
+                        continue
+                    ent[2] = now
+                    ent[3] += 1
+                    self._cmd_retx_count += 1
+                    self.transport.sendto(ent[0], addr)
+                    if ent[3] in (4, 12):
+                        log.info("CMD idx=%d still un-ACKed after %d retransmits (%.1fs)",
+                                 idx, ent[3], now - ent[1])
+                    sent += 1
+                    if sent >= CMD_RETX_BURST:
+                        break
+        except asyncio.CancelledError:
+            pass
+
+    def cmd_stalled_seconds(self) -> float:
+        """How long the oldest command has been waiting for an ACK. Only meaningful
+        once the camera has proven it ACKs commands at all (else returns 0)."""
+        if not self._cmd_ack_seen or not self._cmd_unacked:
+            return 0.0
+        oldest = next(iter(self._cmd_unacked.values()))
+        return max(0.0, asyncio.get_event_loop().time() - oldest[1])
+
+    async def _wait_cmd_ack(self, idx: Optional[int], timeout: float) -> bool:
+        if idx is None:
+            return False
+        if idx not in self._cmd_unacked:
+            return True
+        fut = asyncio.get_event_loop().create_future()
+        self._cmd_ack_waiters[idx] = fut
+        try:
+            return bool(await asyncio.wait_for(fut, timeout=timeout))
+        except asyncio.TimeoutError:
+            self._cmd_ack_waiters.pop(idx, None)
+            return False
+
+    async def _send_cmd(self, cgi_text: str, wait_ack: float = 0.0) -> bool:
+        """Send a CGI command to the camera via DRW on the command channel.
+        The packet is retransmitted in the background until the camera ACKs it.
+        With wait_ack > 0, waits up to that many seconds and returns whether the
+        camera acknowledged receipt; otherwise returns True once queued."""
+        idx = self._send_cmd_payload(build_cgi_command(cgi_text))
+        if idx is None:
+            return False
+        addr = self._get_drw_addr()
+        lvl = logging.DEBUG if "get_status.cgi" in cgi_text else logging.INFO
+        log.log(lvl, "Sending DRW CMD (%s) to %s idx=%d cgi=%s",
+                self.enc_mode, "%s:%d" % addr if addr else "(no addr yet)",
+                idx, redact_credentials(cgi_text)[:80])
+        if wait_ack > 0:
+            return await self._wait_cmd_ack(idx, wait_ack)
+        return True
+
+    def _auth_suffix(self) -> str:
+        return (f"loginuse={self.username}&loginpas={self.password}"
+                f"&user={self.username}&pwd={self.password}&")
+
+    async def send_cgi(self, cgi: str, wait_ack: float = 4.0) -> bool:
+        """Send an arbitrary CGI ('name.cgi?a=1&b=2' or just 'name.cgi') with the
+        login parameters appended. Returns True when the camera ACKed the packet."""
+        cgi = cgi.strip().lstrip("/")
+        if cgi.upper().startswith("GET "):
+            cgi = cgi[4:].strip().lstrip("/")
+        if "?" not in cgi:
+            cgi += "?"
+        elif not cgi.endswith(("?", "&")):
+            cgi += "&"
+        return await self._send_cmd(f"GET /{cgi}{self._auth_suffix()}", wait_ack=wait_ack)
+
+    def _find_cgi_reply(self, cgi: str, after_seq: int) -> Optional[dict]:
+        """First completed reply message newer than `after_seq` that answers `cgi`."""
+        name = cgi.strip().lstrip("/").split("?", 1)[0]
+        want = CGI_REPLY_IDS.get(name)
+        for msg in self._cgi_done:
+            if msg["seq"] <= after_seq:
+                continue
+            if msg["id"] == CGI_REPLY_UNSUPPORTED and "not support" in msg["values"].get("cgi", ""):
+                # Firmware answers unknown CGIs with id 0; only ours if nothing else is pending
+                if want is None:
+                    return msg
+                continue
+            if want is not None:
+                if msg["id"] != want:
+                    continue
+                if name == "trans_cmd_string.cgi":
+                    m = re.search(r"[?&]cmd=(\d+)", cgi)
+                    if m and msg["values"].get("cmd") != m.group(1):
+                        continue
+                return msg
+            if msg["id"] not in CGI_REPLY_IDS.values():
+                return msg          # unknown CGI: first reply that isn't a known other one
+        return None
+
+    async def query_cgis(self, cgis: list, timeout: float = 12.0) -> dict:
+        """Send several query CGIs back-to-back and collect each one's reply.
+        Returns {cgi: values-dict}. A value of None means that reply did not
+        arrive in time (camera busy / command channel down); {"cgi": "not support"}
+        style dicts are returned as-is for CGIs the firmware lacks."""
+        loop = asyncio.get_event_loop()
+        seq0 = self._cgi_msg_seq
+        pending = []
+        for cgi in cgis:
+            await self.send_cgi(cgi, wait_ack=0.0)
+            pending.append(cgi)
+        out = {cgi: None for cgi in cgis}
+        deadline = loop.time() + timeout
+        while pending and loop.time() < deadline:
+            for cgi in list(pending):
+                msg = self._find_cgi_reply(cgi, seq0)
+                if msg is not None:
+                    out[cgi] = dict(msg["values"])
+                    pending.remove(cgi)
+            if pending:
+                await asyncio.sleep(0.05)
+        return out
+
+    async def query_cgi(self, cgi: str, timeout: float = 6.0) -> Optional[dict]:
+        """Send one CGI and return the key=value pairs of its reply, or None if
+        no reply arrived within `timeout`."""
+        return (await self.query_cgis([cgi], timeout=timeout))[cgi]
+
+    def _finish_cgi_msg(self, msg: dict, now: float):
+        if msg.get("done"):
+            return
+        msg["done"] = True
+        msg["ts"] = now
+        text = bytes(msg.pop("buf")).decode("latin-1").replace("\x00", "")
+        values = {}
+        for m in _CGI_KV_RE.finditer(text):
+            val = m.group(2) if m.group(2) is not None else (m.group(3) or "").strip()
+            values[m.group(1)] = val
+        msg["values"] = values
+        self._cgi_done.append(msg)
+        if msg["id"] == CGI_REPLY_IDS["get_status.cgi"]:
+            self._poll_sent_at = 0.0          # status poll answered: next one may go out
+        if msg["id"] != CGI_REPLY_UNSUPPORTED:
+            self.cgi_state.update(values)
+            for k in values:
+                self._cgi_state_ts[k] = now
+
+    def _ingest_cgi_text(self, payload: bytes):
+        """Reassemble command-channel reply messages and fold their key=value
+        pairs into cgi_state. A reply is `01 0A <id16 LE> <len16 LE> 00 01` + text,
+        continued across DRW packets until `len` bytes have arrived."""
+        now = asyncio.get_event_loop().time()
+        self._last_cmd_rx_time = now
+        cur = self._cgi_cur
+        if len(payload) >= 8 and payload[:2] == b'\x01\x0a':
+            if cur is not None:
+                self._finish_cgi_msg(cur, now)      # previous one never reached its length
+            msg_id, length = struct.unpack("<HH", payload[2:6])
+            self._cgi_msg_seq += 1
+            cur = self._cgi_cur = {"id": msg_id, "len": length, "seq": self._cgi_msg_seq,
+                                   "buf": bytearray(payload[8:]), "ts": now}
+        elif cur is not None and not cur.get("done"):
+            cur["buf"] += payload
+        else:
+            return
+        if len(cur["buf"]) >= cur["len"]:
+            self._finish_cgi_msg(cur, now)
+            self._cgi_cur = None
 
     # --- PSK auto-detection ---
 
@@ -2964,6 +3264,14 @@ class CameraSession:
                 if self.protocol and getattr(self.protocol, "auth_failed", False):
                     # Keep WAN P2P / LAN UDP session alive and in CONNECTED state while waiting for password update
                     self._last_drw_time = now
+                elif self.protocol and self.protocol.cmd_stalled_seconds() > 30:
+                    # Video may still be flowing, but the camera stopped ACKing our
+                    # commands: PTZ/settings are dead on this session. Start a fresh one.
+                    log.warning("[%s] Command channel stalled for %.0fs (%d un-ACKed) — reconnecting",
+                                self.camera.label, self.protocol.cmd_stalled_seconds(),
+                                len(self.protocol._cmd_unacked))
+                    self.state = STATE_OFFLINE
+                    stale_logged = False
                 elif gap > 30:
                     log.warning("[%s] No data for %.0fs — camera OFFLINE", self.camera.label, gap)
                     self.state = STATE_OFFLINE
