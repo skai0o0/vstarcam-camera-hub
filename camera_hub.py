@@ -34,7 +34,7 @@ log = logging.getLogger("eye4.hub")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-STATIC_ASSET_VER = "v10"
+STATIC_ASSET_VER = "v11"
 
 
 
@@ -1283,10 +1283,30 @@ class CameraHubApp:
 
     async def _fps_guard_loop(self):
         """Periodically ensure connected cameras match target FPS/GOP and AI/motion sensitivity."""
+        low_since: Dict[str, float] = {}
+        last_recheck: Dict[str, float] = {}
         while self._running:
             await asyncio.sleep(6)
             for uid, sess in list(self.sessions.items()):
                 try:
+                    # Firmware 48.82.230.12 falls back to its 15 FPS default whenever the
+                    # stream restarts (e.g. livestream.cgi re-requests after a relay hiccup),
+                    # long after the one-per-session sync. Watch the delivered FPS and
+                    # re-run the sync when it stays low (at most once a minute).
+                    rec = self.recorders.get(uid)
+                    cam_cfg = (self.config.get("cameras") or {}).get(uid)
+                    explicit = cam_cfg.get("target_fps") if isinstance(cam_cfg, dict) else None
+                    wants_25 = (explicit is None and self.auto_25fps) or (explicit is not None and int(explicit) >= 20)
+                    now = time.monotonic()
+                    if wants_25 and rec and sess.state == proxy.STATE_CONNECTED and 0 < rec.current_fps < 20:
+                        low_since.setdefault(uid, now)
+                        if now - low_since[uid] >= 10 and now - last_recheck.get(uid, 0.0) >= 60:
+                            last_recheck[uid] = now
+                            self._fps_checked_protos.pop(uid, None)
+                            log.info("[%s] Delivered FPS %.1f < 20 for %.0fs — re-checking camera encoder FPS",
+                                     uid[:8], rec.current_fps, now - low_since[uid])
+                    else:
+                        low_since.pop(uid, None)
                     await self._sync_camera_fps_once(uid, sess)
                     await self._sync_camera_ai_once(uid, sess)
                 except asyncio.CancelledError:
