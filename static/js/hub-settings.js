@@ -30,6 +30,7 @@ export function syncSettingsForm(settings = store.settings) {
   setVal('set-pframe-cd', settings.pframe_cooldown_sec ?? 20);
   setChk('set-pframe-en', settings.enable_pframe_trigger);
   setChk('set-auto-25fps', settings.auto_25fps);
+  setChk('set-auto-fw-ai', settings.auto_firmware_ai ?? true);
   setVal('set-maxgb', settings.max_storage_gb);
   setVal('set-freegb', settings.min_free_gb);
 }
@@ -42,6 +43,7 @@ async function saveHubSettings() {
     pframe_cooldown_sec: Number(document.getElementById('set-pframe-cd')?.value ?? 20),
     enable_pframe_trigger: Boolean(document.getElementById('set-pframe-en')?.checked),
     auto_25fps: Boolean(document.getElementById('set-auto-25fps')?.checked),
+    auto_firmware_ai: Boolean(document.getElementById('set-auto-fw-ai')?.checked),
     max_storage_gb: Number(document.getElementById('set-maxgb')?.value || 50),
     min_free_gb: Number(document.getElementById('set-freegb')?.value || 5),
   };

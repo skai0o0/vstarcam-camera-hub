@@ -7,9 +7,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/v4/css/tokens.css">
-  <link rel="stylesheet" href="/static/v4/css/layout.css">
-  <link rel="stylesheet" href="/static/v4/css/components.css">
+  <link rel="stylesheet" href="/static/v6/css/tokens.css">
+  <link rel="stylesheet" href="/static/v6/css/layout.css">
+  <link rel="stylesheet" href="/static/v6/css/components.css">
 </head>
 <body>
   <div class="app-shell">
@@ -103,8 +103,10 @@
             <label class="toolbar-label" for="ev-trigger-filter">Loại:</label>
             <select id="ev-trigger-filter">
               <option value="ALL">Tất cả kích hoạt</option>
-              <option value="PFRAME">Chuyển động AI</option>
-              <option value="HW_ALARM">Cảnh báo Camera</option>
+              <option value="PFRAME">Chuyển động Hub (P-Frame)</option>
+              <option value="HW_ALARM">Tất cả Cảnh báo Camera</option>
+              <option value="HW_ALARM_AI">AI Bám người (Camera)</option>
+              <option value="HW_ALARM_MD">Chuyển động (Camera)</option>
               <option value="MANUAL">Ghi thủ công</option>
               <option value="TEST">Ghi nhanh</option>
             </select>
@@ -169,6 +171,13 @@
                 <div class="form-hint">Tự gửi <code>set_media.cgi</code> lên camera đang chạy 15fps sau khi handshake.</div>
               </div>
               <input id="set-auto-25fps" type="checkbox">
+            </div>
+            <div class="form-row">
+              <div>
+                <label for="set-auto-fw-ai">Tự động tối ưu AI &amp; CĐ Firmware (0% CPU)</label>
+                <div class="form-hint">Tự bật bám người (<code>2127=1</code>), nâng nhạy người tối đa (<code>2126=3</code>) &amp; nhạy CĐ (<code>10</code>) khi kết nối (giữ camera đã chỉnh tay).</div>
+              </div>
+              <input id="set-auto-fw-ai" type="checkbox">
             </div>
             <div class="form-row">
               <label for="set-maxgb">Dung lượng clip tối đa (GB)</label>
@@ -618,6 +627,6 @@
     </div>
   </div>
 
-  <script type="module" src="/static/v4/js/app.js"></script>
+  <script type="module" src="/static/v6/js/app.js"></script>
 </body>
 </html>

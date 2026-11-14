@@ -429,6 +429,13 @@ export function openFocusModal(uid) {
   const focusImg = document.getElementById('focus-img');
   const gridImg = document.getElementById(`img-${uid}`);
   if (focusImg) {
+    if (!focusImg.dataset.errWired) {
+      focusImg.dataset.errWired = '1';
+      focusImg.addEventListener('error', () => {
+        if (!store.focusUid || !focusImg.src.startsWith('blob:')) return;
+        focusImg.src = `/api/camera/${encodeURIComponent(store.focusUid)}/snapshot.jpg?t=${Date.now()}`;
+      });
+    }
     if (store.prevBlobUrls[uid]) {
       focusImg.src = store.prevBlobUrls[uid];
     } else if (gridImg && gridImg.src) {

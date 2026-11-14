@@ -1,10 +1,63 @@
 /**
  * Multiplexed Real-Time 25 FPS Binary WebSocket video receiver.
  */
-import { store } from './api.js';
+import { store, getCameraByUid } from './api.js';
 
 let ws = null;
 let reconnectTimer = null;
+let watchdogTimer = null;
+const lastFrameTs = Object.create(null);
+
+function revokeUrlLater(url) {
+  if (!url) return;
+  setTimeout(() => {
+    try {
+      URL.revokeObjectURL(url);
+    } catch (_) {}
+  }, 1500);
+}
+
+function getDesiredGridFps() {
+  const gridFpsEl = document.getElementById('grid-fps');
+  return parseFloat(gridFpsEl ? gridFpsEl.value : '25') || 0;
+}
+
+function ensureWatchdog() {
+  if (watchdogTimer) return;
+  watchdogTimer = setInterval(() => {
+    if (document.hidden || (store.currentTab !== 'live' && !store.focusUid)) return;
+    if (!ws || ws.readyState === WebSocket.CLOSED) {
+      connectStreamWs();
+    }
+    const gridFps = getDesiredGridFps();
+    if (gridFps <= 0 && !store.focusUid) return;
+
+    const now = performance.now();
+    const targets = store.focusUid
+      ? [getCameraByUid(store.focusUid)].filter(Boolean)
+      : store.cameras;
+    let kickedSync = false;
+
+    for (const c of targets) {
+      if (!c || c.state !== 'CONNECTED' || c.auth_failed) continue;
+      if ((now - (lastFrameTs[c.uid] || 0)) < 4500) continue;
+
+      if (!kickedSync) {
+        syncWsConfig();
+        kickedSync = true;
+      }
+      const snapUrl = `/api/camera/${encodeURIComponent(c.uid)}/snapshot.jpg?t=${Date.now()}`;
+      if (store.focusUid === c.uid) {
+        const focusImg = document.getElementById('focus-img');
+        if (focusImg) focusImg.src = snapUrl;
+      }
+      if (store.currentTab === 'live' && gridFps > 0) {
+        const gridImg = document.getElementById(`img-${c.uid}`);
+        if (gridImg) gridImg.src = snapUrl;
+      }
+    }
+  }, 3000);
+}
 
 function setWsBadge(connected) {
   const badge = document.getElementById('hdr-ws-status');
@@ -40,6 +93,7 @@ export function connectStreamWs() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws/streams`);
   ws.binaryType = 'arraybuffer';
+  ensureWatchdog();
 
   ws.onopen = () => {
     setWsBadge(true);
@@ -75,10 +129,11 @@ export function connectStreamWs() {
       }
     }
 
-    if (store.prevBlobUrls[uid]) URL.revokeObjectURL(store.prevBlobUrls[uid]);
+    if (store.prevBlobUrls[uid]) revokeUrlLater(store.prevBlobUrls[uid]);
     store.prevBlobUrls[uid] = url;
 
     const now = performance.now();
+    lastFrameTs[uid] = now;
     if (!store.fpsCounters[uid]) store.fpsCounters[uid] = { count: 0, lastTs: now, fps: 0 };
     const fc = store.fpsCounters[uid];
     fc.count++;
@@ -97,9 +152,13 @@ export function connectStreamWs() {
     }
   };
 
+  ws.onerror = () => {
+    try { ws?.close(); } catch (_) {}
+  };
+
   ws.onclose = () => {
     setWsBadge(false);
-    reconnectTimer = setTimeout(connectStreamWs, 1000);
+    if (!reconnectTimer) reconnectTimer = setTimeout(connectStreamWs, 1000);
   };
 }
 

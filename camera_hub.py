@@ -33,7 +33,7 @@ log = logging.getLogger("eye4.hub")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-STATIC_ASSET_VER = "v4"
+STATIC_ASSET_VER = "v6"
 
 
 
@@ -810,6 +810,7 @@ class CameraHubApp:
         self.pframe_cooldown_sec: float = float(hub_cfg.get("pframe_cooldown_sec", 20.0))
         self.enable_pframe_trigger: bool = bool(hub_cfg.get("enable_pframe_trigger", True))
         self.auto_25fps: bool = bool(hub_cfg.get("auto_25fps", True))
+        self.auto_firmware_ai: bool = bool(hub_cfg.get("auto_firmware_ai", True))
         self.max_storage_gb: float = float(hub_cfg.get("max_storage_gb", 50.0))
         self.min_free_gb: float = float(hub_cfg.get("min_free_gb", 10.0))
 
@@ -823,9 +824,11 @@ class CameraHubApp:
         self._quota_task: Optional[asyncio.Task] = None
         self._fps_guard_task: Optional[asyncio.Task] = None
         self._fps_checked_protos: Dict[str, int] = {}
+        self._ai_checked_protos: Dict[str, int] = {}
         self._ptz_stop_tasks: Dict[str, asyncio.Task] = {}
         self._ptz_last_move: Dict[str, tuple] = {}   # uid -> (decoder_control code, started_at)
         self._thumb_cache: collections.OrderedDict = collections.OrderedDict()
+        self._h264_locks: Dict[str, asyncio.Lock] = {}
 
     def _save_hub_config(self):
         self.config["hub"] = {
@@ -835,6 +838,7 @@ class CameraHubApp:
             "pframe_cooldown_sec": self.pframe_cooldown_sec,
             "enable_pframe_trigger": self.enable_pframe_trigger,
             "auto_25fps": self.auto_25fps,
+            "auto_firmware_ai": self.auto_firmware_ai,
             "max_storage_gb": self.max_storage_gb,
             "min_free_gb": self.min_free_gb,
         }
@@ -846,6 +850,26 @@ class CameraHubApp:
                 yaml.dump(self.config, f, default_flow_style=False, allow_unicode=True)
         except Exception as e:
             log.warning("Could not save hub config: %s", e)
+
+    def _set_camera_cfg_field(self, uid: str, **fields):
+        """Persist per-camera override fields into YAML config."""
+        cams_cfg = self.config.setdefault("cameras", {})
+        cur_cfg = cams_cfg.get(uid)
+        if not isinstance(cur_cfg, dict):
+            cur_cfg = {"port": int(cur_cfg)} if isinstance(cur_cfg, int) else {}
+            cams_cfg[uid] = cur_cfg
+        cur_cfg.update(fields)
+        self._save_hub_config()
+
+    def _effective_camera_ai_targets(self, uid: str):
+        """Return (track_enable, human_sensitive, motion_sensitivity) per camera override or Hub auto policy."""
+        cam_cfg = (self.config.get("cameras") or {}).get(uid)
+        if not isinstance(cam_cfg, dict):
+            cam_cfg = {}
+        track_en = int(cam_cfg["track_enable"]) if "track_enable" in cam_cfg else (1 if self.auto_firmware_ai else None)
+        human_sens = int(cam_cfg["human_sensitive"]) if "human_sensitive" in cam_cfg else (3 if self.auto_firmware_ai else None)
+        motion_sens = int(cam_cfg["motion_sensitivity"]) if "motion_sensitivity" in cam_cfg else (10 if self.auto_firmware_ai else None)
+        return track_en, human_sens, motion_sens
 
     def _get_room_name(self, cam: proxy.CameraInfo) -> str:
         cam_cfg = self.config.get("cameras", {}).get(cam.uid)
@@ -927,6 +951,7 @@ class CameraHubApp:
         cam.label = f"{cam.uid[:8]} ({room_name})"
         self._save_hub_config()
 
+        want_track, want_hsens, want_msens = self._effective_camera_ai_targets(cam.uid)
         session = proxy.CameraSession(
             camera=cam,
             rtsp_port=port_val,
@@ -939,6 +964,9 @@ class CameraHubApp:
             motion_cooldown=motion_cooldown,
             motion_poll_interval=motion_poll_interval,
             bind_addr=self.config.get("bind_addr", "127.0.0.1"),
+            auto_track=want_track,
+            human_sensitive=want_hsens,
+            motion_sensitivity=(want_msens if want_msens is not None else 5),
         )
 
         async def get_snap():
@@ -1152,17 +1180,114 @@ class CameraHubApp:
 
         self._fps_checked_protos[uid] = proto_id
 
+    @staticmethod
+    def _cgi_reply_ok(reply: Optional[dict]) -> bool:
+        if not reply or reply.get("cgi") == "not support":
+            return False
+        return str(reply.get("result", "")).lower() not in ("-1", "-2", "erro", "error")
+
+    async def _sync_camera_ai_once(self, uid: str, sess):
+        """Ensure connected camera has target AI tracking (2127), humanoid sensitivity (2126),
+        and motion alarm sensitivity (set_alarm.cgi) applied."""
+        proto = getattr(sess, "protocol", None)
+        if (not proto or not proto.enc_mode
+                or sess.state != proxy.STATE_CONNECTED
+                or getattr(proto, "auth_failed", False)
+                or not getattr(proto, "_auto_provision_done", False)):
+            return
+        proto_id = id(proto)
+        if self._ai_checked_protos.get(uid) == proto_id:
+            return
+
+        want_track, want_hsens, want_msens = self._effective_camera_ai_targets(uid)
+        proto.auto_track = want_track
+        proto.human_sensitive = want_hsens
+        if want_msens is not None:
+            proto.motion_sensitivity = max(1, min(10, int(want_msens)))
+        if want_track is None and want_hsens is None and want_msens is None:
+            self._ai_checked_protos[uid] = proto_id
+            return
+
+        queries = []
+        if want_track is not None:
+            queries.append("trans_cmd_string.cgi?cmd=2127&command=1")
+        if want_hsens is not None:
+            queries.append("trans_cmd_string.cgi?cmd=2126&command=1")
+        if want_msens is not None:
+            queries.append("get_params.cgi")
+        replies = await proto.query_cgis(queries, timeout=8.0)
+
+        any_answered = False
+        all_synced = True
+        changes = []
+
+        if want_msens is not None:
+            pm = replies.get("get_params.cgi")
+            if pm is None:
+                all_synced = False
+            elif pm.get("alarm_motion_sensitivity") is not None:
+                any_answered = True
+                want_ms_str = str(max(1, min(10, int(want_msens))))
+                if (pm.get("alarm_motion_sensitivity") != want_ms_str
+                        or pm.get("alarm_motion_armed") != "1"
+                        or pm.get("alarm_schedule_enable") != "1"
+                        or pm.get("alarm_record") != "1"):
+                    res = await proto.query_cgi(
+                        f"set_alarm.cgi?motion_armed=1&motion_sensitivity={want_ms_str}"
+                        "&input_armed=0&iolinkage=0&mail=0&upload_interval=0&record=1&snapshot=1&schedule_enable=1",
+                        timeout=6.0,
+                    )
+                    if self._cgi_reply_ok(res):
+                        changes.append(f"motion_sens={pm.get('alarm_motion_sensitivity')}->{want_ms_str}")
+                    else:
+                        all_synced = False
+
+        if want_track is not None:
+            c2127 = replies.get("trans_cmd_string.cgi?cmd=2127&command=1")
+            if c2127 is None:
+                all_synced = False
+            elif "enable" in c2127:
+                any_answered = True
+                want_tr_str = "1" if want_track else "0"
+                if c2127.get("enable") != want_tr_str:
+                    res = await proto.query_cgi(f"trans_cmd_string.cgi?cmd=2127&command=0&enable={want_tr_str}", timeout=6.0)
+                    if self._cgi_reply_ok(res):
+                        changes.append(f"track_2127={c2127.get('enable')}->{want_tr_str}")
+                    else:
+                        all_synced = False
+
+        if want_hsens is not None:
+            c2126 = replies.get("trans_cmd_string.cgi?cmd=2126&command=1")
+            if c2126 is None:
+                all_synced = False
+            elif "sensitive" in c2126:
+                any_answered = True
+                want_hs_str = str(max(0, min(3, int(want_hsens))))
+                if c2126.get("sensitive") != want_hs_str:
+                    res = await proto.query_cgi(f"trans_cmd_string.cgi?cmd=2126&command=0&sensitive={want_hs_str}", timeout=6.0)
+                    if self._cgi_reply_ok(res):
+                        changes.append(f"human_sens_2126={c2126.get('sensitive')}->{want_hs_str}")
+                    else:
+                        all_synced = False
+
+        if changes:
+            log.info("[%s] Synced camera firmware AI/motion: %s", uid[:8], ", ".join(changes))
+        if all_synced or any_answered:
+            if all_synced:
+                self._ai_checked_protos[uid] = proto_id
+
     async def _fps_guard_loop(self):
-        """Check newly connected camera sessions once to keep main-stream FPS in sync."""
+        """Periodically ensure connected cameras match target FPS/GOP and AI/motion sensitivity."""
         while self._running:
             await asyncio.sleep(6)
             for uid, sess in list(self.sessions.items()):
                 try:
                     await self._sync_camera_fps_once(uid, sess)
+                    await self._sync_camera_ai_once(uid, sess)
                 except asyncio.CancelledError:
                     return
                 except Exception as e:
-                    log.debug("[%s] FPS guard check failed: %s", uid[:8], e)
+                    log.debug("[%s] Camera sync guard check failed: %s", uid[:8], e)
 
     # =========================================================================
     # HTTP & WebSocket API Handlers
@@ -1295,6 +1420,7 @@ class CameraHubApp:
                 "pframe_cooldown_sec": self.pframe_cooldown_sec,
                 "enable_pframe_trigger": self.enable_pframe_trigger,
                 "auto_25fps": self.auto_25fps,
+                "auto_firmware_ai": self.auto_firmware_ai,
                 "max_storage_gb": self.max_storage_gb,
                 "min_free_gb": self.min_free_gb,
             },
@@ -1695,7 +1821,21 @@ class CameraHubApp:
                     sens = int_arg("sensitive", 0, 3)
                     cgi = f"{cgi}&sensitive={sens}"
                     extra["sensitive"] = sens
-                return await send_setting_cgi(cgi, **extra)
+                resp = await send_setting_cgi(cgi, **extra)
+                if resp.status == 200:
+                    if action == "track_on":
+                        self._set_camera_cfg_field(uid, track_enable=1)
+                        proto.auto_track = 1
+                        self._ai_checked_protos[uid] = id(proto)
+                    elif action == "track_off":
+                        self._set_camera_cfg_field(uid, track_enable=0)
+                        proto.auto_track = 0
+                        self._ai_checked_protos[uid] = id(proto)
+                    elif action == "humanframe_on" and "sensitive" in extra:
+                        self._set_camera_cfg_field(uid, human_sensitive=extra["sensitive"])
+                        proto.human_sensitive = extra["sensitive"]
+                        self._ai_checked_protos[uid] = id(proto)
+                return resp
 
             if action == "rtsp_enable":
                 val = int_arg("value", 0, 1)
@@ -1712,20 +1852,24 @@ class CameraHubApp:
                     enc_keyframe=kf,
                 )
                 if resp.status == 200:
-                    cams_cfg = self.config.setdefault("cameras", {})
-                    cur_cfg = cams_cfg.get(uid)
-                    if not isinstance(cur_cfg, dict):
-                        cur_cfg = {"port": int(cur_cfg)} if isinstance(cur_cfg, int) else {}
-                        cams_cfg[uid] = cur_cfg
-                    cur_cfg["target_fps"] = val
+                    self._set_camera_cfg_field(uid, target_fps=val)
                     self._fps_checked_protos[uid] = id(proto)
-                    self._save_hub_config()
                 return resp
 
             if action in self.CGI_VALUE_ACTIONS:
                 tmpl, lo, hi = self.CGI_VALUE_ACTIONS[action]
                 val = int_arg("value", lo, hi)
-                return await send_setting_cgi(tmpl.format(v=val), value=val)
+                resp = await send_setting_cgi(tmpl.format(v=val), value=val)
+                if resp.status == 200:
+                    if action == "human_sensitive":
+                        self._set_camera_cfg_field(uid, human_sensitive=val)
+                        proto.human_sensitive = val
+                        self._ai_checked_protos[uid] = id(proto)
+                    elif action == "motion_sensitivity":
+                        self._set_camera_cfg_field(uid, motion_sensitivity=val)
+                        proto.motion_sensitivity = val
+                        self._ai_checked_protos[uid] = id(proto)
+                return resp
         except (TypeError, ValueError):
             return web.json_response({"ok": False, "error": "Giá trị không hợp lệ"}, status=400)
 
@@ -2713,6 +2857,108 @@ class CameraHubApp:
             headers={"Cache-Control": "public, max-age=604800, immutable"},
         )
 
+    def _resolve_recording_mp4(self, rel: str) -> Optional[str]:
+        if not rel or ".." in rel or rel.startswith(".h264_cache") or not rel.lower().endswith(".mp4"):
+            return None
+        rec_root = os.path.realpath(self.recordings_dir)
+        fpath = os.path.realpath(os.path.join(rec_root, rel))
+        if not fpath.startswith(rec_root + os.sep) or not os.path.isfile(fpath):
+            return None
+        return fpath
+
+    @staticmethod
+    def _prune_h264_cache(cache_root: str, max_files: int = 40):
+        entries = []
+        now = time.time()
+        for root, _dirs, files in os.walk(cache_root):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                try:
+                    st = os.stat(fpath)
+                    if fname.endswith(".tmp.mp4"):
+                        if (now - st.st_mtime) > 600:
+                            os.remove(fpath)
+                        continue
+                    if fname.endswith(".mp4"):
+                        entries.append((st.st_mtime, fpath))
+                except OSError:
+                    pass
+        if len(entries) <= max_files:
+            return
+        entries.sort(key=lambda item: item[0])
+        for _mtime, old_path in entries[: len(entries) - max_files]:
+            try:
+                os.remove(old_path)
+            except OSError:
+                pass
+
+    async def _ensure_h264_mp4(self, rel: str, src: str) -> Optional[str]:
+        lock = self._h264_locks.get(rel)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._h264_locks[rel] = lock
+        async with lock:
+            cache_root = os.path.realpath(os.path.join(self.recordings_dir, ".h264_cache"))
+            dst = os.path.realpath(os.path.join(cache_root, rel))
+            if not dst.startswith(cache_root + os.sep):
+                return None
+            src_mtime = os.path.getmtime(src)
+            if os.path.isfile(dst) and os.path.getsize(dst) > 0 and os.path.getmtime(dst) >= src_mtime:
+                return dst
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            tmp_dst = dst + ".tmp.mp4"
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-threads", "4", "-i", src,
+                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "fastdecode",
+                "-crf", "26", "-pix_fmt", "yuv420p",
+                "-vf", "scale='min(1280,iw)':-2",
+                "-an", "-movflags", "+faststart",
+                tmp_dst,
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=180.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise RuntimeError("H.264 transcode timed out")
+            if proc.returncode != 0 or not os.path.isfile(tmp_dst) or os.path.getsize(tmp_dst) == 0:
+                err_msg = (stderr or b"").decode("utf-8", "replace").strip()
+                try:
+                    if os.path.exists(tmp_dst):
+                        os.remove(tmp_dst)
+                except OSError:
+                    pass
+                raise RuntimeError(err_msg or f"ffmpeg exited {proc.returncode}")
+            os.replace(tmp_dst, dst)
+            self._prune_h264_cache(cache_root)
+            return dst
+
+    async def handle_event_video(self, request: web.Request) -> web.StreamResponse:
+        """Serve browser-compatible H.264 (yuv420p) transcoded on-demand for non-HEVC browsers."""
+        rel = (request.query.get("rel") or "").replace("\\", "/").strip().lstrip("/")
+        src = self._resolve_recording_mp4(rel)
+        if not src:
+            return web.Response(status=404, text="Recording not found")
+        if os.path.getsize(src) < 512:
+            return web.Response(status=422, text="Recording file is incomplete or empty")
+        try:
+            dst = await self._ensure_h264_mp4(rel, src)
+        except Exception as e:
+            log.warning("On-demand H.264 transcode failed for %s: %s", rel, e)
+            return web.Response(status=500, text=f"Transcode failed: {e}")
+        if not dst or not os.path.isfile(dst):
+            return web.Response(status=404, text="Transcoded video unavailable")
+        return web.FileResponse(
+            dst,
+            headers={"Cache-Control": "public, max-age=604800, immutable"},
+        )
+
     async def handle_delete_event(self, request: web.Request) -> web.Response:
         data = await request.json()
         video_rel = data.get("video_rel", "")
@@ -2735,6 +2981,10 @@ class CameraHubApp:
             self.auto_25fps = bool(data["auto_25fps"])
             if self.auto_25fps:
                 self._fps_checked_protos.clear()
+        if "auto_firmware_ai" in data:
+            self.auto_firmware_ai = bool(data["auto_firmware_ai"])
+            if self.auto_firmware_ai:
+                self._ai_checked_protos.clear()
         if "max_storage_gb" in data:
             self.max_storage_gb = max(1.0, float(data["max_storage_gb"]))
             self.storage.max_storage_gb = self.max_storage_gb
@@ -2794,7 +3044,9 @@ def build_web_app(hub: CameraHubApp) -> web.Application:
     app.router.add_post("/api/camera/{uid}/rename", hub.handle_rename)
     app.router.add_get("/api/events", hub.handle_list_events)
     app.router.add_get("/api/event-thumb", hub.handle_event_thumb)
+    app.router.add_get("/api/event-video", hub.handle_event_video)
     app.router.add_delete("/api/events", hub.handle_delete_event)
+    app.router.add_get("/favicon.ico", lambda _req: web.Response(status=204))
     app.router.add_post("/api/settings", hub.handle_update_settings)
 
     os.makedirs(STATIC_DIR, exist_ok=True)

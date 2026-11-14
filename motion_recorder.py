@@ -162,6 +162,8 @@ class CameraMotionRecorder:
         self.room_name = name.strip() or self.uid[:12]
 
     def sync_codec_params(self, codec: str, vps: Optional[bytes], sps: Optional[bytes], pps: Optional[bytes]):
+        prev_codec = self.codec
+        prev_params = (self.vps, self.sps, self.pps)
         if codec:
             self.codec = codec
         if vps:
@@ -170,6 +172,15 @@ class CameraMotionRecorder:
             self.sps = sps
         if pps:
             self.pps = pps
+        new_params = (self.vps, self.sps, self.pps)
+        if self._live_proc is not None and (prev_codec != self.codec or prev_params != new_params):
+            self._live_need_keyframe = True
+            self._drain_live_queue()
+            if prev_codec != self.codec:
+                try:
+                    self._live_proc.kill()
+                except ProcessLookupError:
+                    pass
 
     @property
     def ram_buffer_kb(self) -> float:
@@ -221,11 +232,10 @@ class CameraMotionRecorder:
         if self.latest_live_jpeg and (now - self.latest_live_mono) < 1.0:
             return self.latest_live_jpeg
 
-        if self.latest_live_jpeg is None:
-            try:
-                await asyncio.wait_for(self._live_frame_event.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                pass
+        try:
+            await asyncio.wait_for(self._live_frame_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
         return self.latest_live_jpeg
 
     def _drain_live_queue(self) -> int:
@@ -256,6 +266,7 @@ class CameraMotionRecorder:
         if stderr is None:
             return
         last_warn = 0.0
+        last_poc_reset = 0.0
         try:
             while True:
                 line = await stderr.readline()
@@ -264,10 +275,13 @@ class CameraMotionRecorder:
                 msg = line.decode("utf-8", errors="replace").strip()
                 if not msg:
                     continue
-                if "Could not find ref with POC" in msg or "co located POCs" in msg:
-                    self._live_need_keyframe = True
-                    self._drain_live_queue()
                 now = time.monotonic()
+                if "Could not find ref with POC" in msg or "co located POCs" in msg:
+                    recent_idr = (now - getattr(self, "_last_live_idr_mono", 0.0)) < 0.25
+                    if not recent_idr and (now - last_poc_reset) >= 2.0:
+                        last_poc_reset = now
+                        self._live_need_keyframe = True
+                        self._drain_live_queue()
                 if (now - last_warn) >= 5.0:
                     last_warn = now
                     log.warning("[%s] Live FFmpeg stderr: %s", self.room_name, msg[:200])
@@ -278,12 +292,13 @@ class CameraMotionRecorder:
 
     def _get_prime_bitstream(self) -> bytes:
         """
-        Grab the latest 1-2 unbroken GOPs from the RAM Ring Buffer (starting on an I-Frame
+        Grab the latest unbroken GOP from the RAM Ring Buffer (starting on an I-Frame
         after the last packet gap and ending at the latest P-Frame) so FFmpeg
         completes stream probing quickly on a clean reference frame.
         """
         frames = list(self._ring_buffer)
         if not frames:
+            self._live_primed_mono = 0.0
             self._live_need_keyframe = True
             return b""
 
@@ -292,17 +307,19 @@ class CameraMotionRecorder:
             if f.is_iframe and f.mono_ts > self._last_gap_mono
         ]
         if not iframe_indices:
+            self._live_primed_mono = 0.0
             self._live_need_keyframe = True
             return b""
 
-        # Prefer the latest I-frame; if that slice is < 125KB and an earlier clean I-frame exists,
-        # include the earlier GOP so FFmpeg's stream probe (~115KB) completes immediately.
+        # Prefer the latest I-frame; only include the preceding clean GOP if the tail slice
+        # is < 48KB so FFmpeg's 48KB stream probe finishes without buffering a 4s extra GOP.
         chosen_idx = iframe_indices[-1]
         tail_bytes = sum(len(f.data) for f in frames[chosen_idx:])
-        if tail_bytes < 125000 and len(iframe_indices) >= 2:
+        if tail_bytes < 49152 and len(iframe_indices) >= 2:
             chosen_idx = iframe_indices[-2]
 
         self._live_primed_mono = time.monotonic()
+        self._last_live_idr_mono = frames[chosen_idx].mono_ts
         header = self._build_header_prefix()
         chunks = []
         for f in frames[chosen_idx:]:
@@ -317,14 +334,6 @@ class CameraMotionRecorder:
 
         self._live_starting = True
         try:
-            # Clear stale queue items before priming
-            while not self._live_in_queue.empty():
-                try:
-                    self._live_in_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-
-            prime_bytes = self._get_prime_bitstream()
             is_hevc = (self.codec == "h265")
             fmt = "hevc" if is_hevc else "h264"
 
@@ -334,9 +343,9 @@ class CameraMotionRecorder:
                 "-loglevel",
                 "error",
                 "-probesize",
-                "262144",
+                "49152",
                 "-analyzeduration",
-                "100000",
+                "50000",
                 "-flags",
                 "low_delay",
                 "-f",
@@ -364,9 +373,19 @@ class CameraMotionRecorder:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            # Atomic prime-to-live handoff (zero awaits between reading ring buffer and arming
+            # _live_proc) so no P-frame is dropped while FFmpeg spawns.
+            while not self._live_in_queue.empty():
+                try:
+                    self._live_in_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+            prime_bytes = self._get_prime_bitstream()
             self._live_proc = proc
             self._live_need_keyframe = (
-                getattr(self, "_live_primed_mono", 0.0) <= getattr(self, "_last_gap_mono", 0.0)
+                (not prime_bytes)
+                or (getattr(self, "_live_primed_mono", 0.0) <= getattr(self, "_last_gap_mono", 0.0))
             )
             self._live_stderr_task = asyncio.create_task(self._drain_live_stderr(proc))
             log.info(
@@ -460,14 +479,44 @@ class CameraMotionRecorder:
         except Exception:
             pass
 
+    async def close(self):
+        """Shut down live decoder subprocess cleanly when recorder is removed."""
+        proc = self._live_proc
+        self._drain_live_queue()
+        if proc is not None:
+            await self._stop_live_proc(proc)
+
     # =========================================================================
     # Motion Detection & Pre-Roll / Post-Roll Recording
     # =========================================================================
 
-    def on_hardware_alarm(self, status: int):
-        """Called when camera reports AI track_status > 0."""
+    _TRIGGER_PRIORITY = (
+        ("MANUAL", 5),
+        ("HW_ALARM_AI", 4),
+        ("HW_ALARM_MD", 3),
+        ("HW_ALARM", 3),
+        ("MANUAL_TEST", 2),
+        ("PFRAME_SPIKE", 1),
+    )
+
+    @classmethod
+    def _reason_priority(cls, reason: str) -> int:
+        base = (reason or "").split("(", 1)[0].upper()
+        for prefix, prio in cls._TRIGGER_PRIORITY:
+            if base == prefix:
+                return prio
+        return 0
+
+    def on_hardware_alarm(self, status: int, source: str = "HW_ALARM"):
+        """Called when camera reports AI track_status > 0 or hardware alarm_status > 0."""
         if status > 0:
-            self.trigger_motion(reason=f"HW_ALARM({status})")
+            if source == "AI_TRACK":
+                prefix = "HW_ALARM_AI"
+            elif source == "HW_MOTION":
+                prefix = "HW_ALARM_MD"
+            else:
+                prefix = "HW_ALARM"
+            self.trigger_motion(reason=f"{prefix}({status})")
 
     def set_manual_recording(self, enabled: bool):
         """Toggle manual recording override from UI."""
@@ -493,11 +542,13 @@ class CameraMotionRecorder:
         now_wall = time.time()
         self.last_motion_mono = now_mono
         self.last_motion_wall = now_wall
-        self.last_trigger_reason = reason
         self.record_until_mono = now_mono + self.post_roll_sec
 
         if not self.is_recording:
+            self.last_trigger_reason = reason
             self._start_recording_from_preroll(now_mono, now_wall, reason)
+        elif self._reason_priority(reason) >= self._reason_priority(self.last_trigger_reason):
+            self.last_trigger_reason = reason
 
     def on_video_frame(self, frame_type: int, cam_ts: int, data: bytes):
         """Feed every incoming reassembled H.265/H.264 frame into RAM Ring Buffer, Live Pipe & Detector."""
@@ -528,6 +579,7 @@ class CameraMotionRecorder:
             else:
                 if item.is_iframe:
                     self._live_need_keyframe = False
+                    self._last_live_idr_mono = now_mono
                 header = self._build_header_prefix() if item.is_iframe else b""
                 annexb = self._wrap_annexb(data, header)
                 if self._live_in_queue.full():
@@ -872,7 +924,8 @@ class StorageManager:
             return events, []
 
         trig_upper = str(trigger_filter or "ALL").upper()
-        for root, _dirs, files in os.walk(self.recordings_dir):
+        for root, dirs, files in os.walk(self.recordings_dir):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
             for fname in files:
                 if not fname.endswith(".json"):
                     continue
@@ -991,4 +1044,13 @@ class StorageManager:
                     removed = True
                 except OSError:
                     pass
+        cache_root = os.path.realpath(os.path.join(self.recordings_dir, ".h264_cache"))
+        cache_mp4 = os.path.realpath(os.path.join(cache_root, video_rel.lstrip("/\\")))
+        if cache_mp4.startswith(cache_root + os.sep):
+            for p in (cache_mp4, cache_mp4 + ".tmp.mp4"):
+                if os.path.isfile(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
         return removed

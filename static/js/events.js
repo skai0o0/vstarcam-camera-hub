@@ -41,10 +41,12 @@ function formatDateGroupLabel(dateOrTs) {
 
 function getReasonMeta(reason) {
   const r = String(reason || '').toUpperCase();
+  if (r.includes('HW_ALARM_AI')) return { cls: 'badge danger', label: 'AI Bám người' };
+  if (r.includes('HW_ALARM_MD')) return { cls: 'badge warn', label: 'CĐ Camera' };
   if (r.includes('HW_ALARM')) return { cls: 'badge danger', label: 'Cảnh báo Camera' };
   if (r.includes('MANUAL')) return { cls: 'badge info', label: 'Ghi thủ công' };
   if (r.includes('TEST') || r.includes('TRIGGER')) return { cls: 'badge warn', label: 'Ghi nhanh' };
-  if (r.includes('PFRAME')) return { cls: 'badge ok', label: 'Chuyển động AI' };
+  if (r.includes('PFRAME')) return { cls: 'badge ok', label: 'Chuyển động Hub' };
   return { cls: 'badge', label: reason || 'Sự kiện' };
 }
 
@@ -241,24 +243,46 @@ export async function loadEvents({ force = false, append = false } = {}) {
   }
 }
 
+function canBrowserDecodeHevc(video) {
+  try {
+    return Boolean(
+      video.canPlayType('video/mp4; codecs="hvc1.1.6.L120.90"') ||
+      video.canPlayType('video/mp4; codecs="hev1.1.6.L120.90"')
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
 export function playEvent(rel, title) {
   const modal = document.getElementById('play-modal');
   const video = document.getElementById('play-video');
   const dl = document.getElementById('play-dl');
   const titleEl = document.getElementById('play-title');
   const loadingEl = document.getElementById('play-loading');
-  if (!modal || !video) return;
+  if (!modal || !video || !rel) return;
 
-  const url = `/recordings/${encodeURI(rel)}`;
+  const rawUrl = `/recordings/${encodeURI(rel)}`;
+  const compatUrl = `/api/event-video?rel=${encodeURIComponent(rel)}`;
+  const useCompat = !canBrowserDecodeHevc(video);
+
   if (titleEl) titleEl.textContent = title || 'Xem lại sự kiện';
-  if (dl) dl.href = url;
-  if (loadingEl) loadingEl.style.display = 'block';
-  video.src = url;
+  if (dl) dl.href = rawUrl;
+  video.dataset.rel = rel;
+  video.dataset.compatTried = useCompat ? '1' : '0';
+  if (loadingEl) {
+    loadingEl.textContent = useCompat
+      ? 'Đang chuyển chuẩn H.264 tương thích trình duyệt...'
+      : 'Đang nạp video...';
+    loadingEl.style.display = 'block';
+  }
+  video.src = useCompat ? compatUrl : rawUrl;
   video.playbackRate = 1;
   document.querySelectorAll('.play-speed-btn').forEach((b) => {
     b.classList.toggle('active', b.dataset.speed === '1');
   });
   modal.classList.add('open');
+  video.load();
   video.play().catch(() => {});
 }
 
@@ -266,8 +290,13 @@ export function closePlayModal() {
   const modal = document.getElementById('play-modal');
   const video = document.getElementById('play-video');
   const loadingEl = document.getElementById('play-loading');
-  if (loadingEl) loadingEl.style.display = 'none';
+  if (loadingEl) {
+    loadingEl.textContent = 'Đang nạp video...';
+    loadingEl.style.display = 'none';
+  }
   if (video) {
+    delete video.dataset.rel;
+    delete video.dataset.compatTried;
     video.pause();
     video.removeAttribute('src');
     video.load();
@@ -375,14 +404,34 @@ export function initEventsTab({ onRefreshStatus } = {}) {
   const video = document.getElementById('play-video');
   const loadingEl = document.getElementById('play-loading');
   if (video && loadingEl) {
-    const showL = () => { loadingEl.style.display = 'block'; };
-    const hideL = () => { loadingEl.style.display = 'none'; };
+    const showL = () => {
+      if (!video.dataset.rel) return;
+      loadingEl.style.display = 'block';
+    };
+    const hideL = () => {
+      loadingEl.textContent = 'Đang nạp video...';
+      loadingEl.style.display = 'none';
+    };
     video.addEventListener('loadstart', showL);
     video.addEventListener('waiting', showL);
     video.addEventListener('loadeddata', hideL);
     video.addEventListener('canplay', hideL);
     video.addEventListener('playing', hideL);
-    video.addEventListener('error', hideL);
+    video.addEventListener('error', () => {
+      const rel = video.dataset.rel;
+      if (!rel || !video.getAttribute('src') || !playModal?.classList.contains('open')) return;
+      if (video.dataset.compatTried !== '1') {
+        video.dataset.compatTried = '1';
+        loadingEl.textContent = 'Trình duyệt không giải mã H.265 — đang chuyển sang H.264...';
+        loadingEl.style.display = 'block';
+        video.src = `/api/event-video?rel=${encodeURIComponent(rel)}`;
+        video.load();
+        video.play().catch(() => {});
+        return;
+      }
+      loadingEl.textContent = 'Không phát được video trên trình duyệt này. Vui lòng bấm "Tải MP4".';
+      loadingEl.style.display = 'block';
+    });
   }
 
   if (playModal) {

@@ -894,7 +894,10 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                  psk_list: Optional[list[str]] = None,
                  enc_mode: Optional[str] = None,
                  alarm_server_addr: Optional[str] = None,
-                 camera: Optional[CameraInfo] = None):
+                 camera: Optional[CameraInfo] = None,
+                 auto_track: Optional[int] = None,
+                 human_sensitive: Optional[int] = None,
+                 motion_sensitivity: int = 5):
         self.username = username
         self.password = password
         self.video_callback = video_callback
@@ -903,7 +906,12 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self.enc_mode = enc_mode  # ENC_P2P, ENC_XOR_ONLY, or None = auto-detect
         self.psk_list = psk_list or KNOWN_PSKS  # PSKs to try for auto-detection
         self.alarm_server_addr = alarm_server_addr
+        self.auto_track = auto_track
+        self.human_sensitive = human_sensitive
+        self.motion_sensitivity = max(1, min(10, int(motion_sensitivity)))
+        self._auto_provision_done: bool = False
         self.alarm_callback = None  # Called with (alarm_status: int) on change
+        self.alarm_event_callback = None  # Called with (source: str, status: int)
         self.alarm_poll_interval: float = 1.0
         self._last_alarm_status: Optional[int] = None
         self._alarm_poll_task: Optional[asyncio.Task] = None
@@ -1581,8 +1589,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             if "cmd=2127" in text and "track_status=" in text:
                 m_trk = re.search(r'track_status=(\d+)', text)
                 if m_trk and int(m_trk.group(1)) > 0:
-                    if self.alarm_callback:
-                        self.alarm_callback(int(m_trk.group(1)))
+                    self._emit_alarm("AI_TRACK", int(m_trk.group(1)))
 
     def _handle_video_data(self, index: int, payload: bytes):
         if not payload:
@@ -1895,7 +1902,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self._video_keepalive_task = asyncio.create_task(self._video_keepalive_loop())
 
         # Start alarm status polling if callback is set
-        if self.alarm_callback:
+        if self.alarm_callback or self.alarm_event_callback:
             self._alarm_poll_task = asyncio.create_task(self._alarm_poll_loop())
 
     async def _alarm_poll_loop(self):
@@ -2274,18 +2281,28 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         await self._send_cmd(cgi)
 
     async def _send_auto_provision(self):
-        """Enable hardware OSD timestamp + camera name overlay and arm motion detection."""
-        await asyncio.sleep(1.5)
-        for cmd in (
-            "camera_control.cgi?param=18&value=1",
-            "set_misc.cgi?osdenable=1",
-            "set_alarm.cgi?motion_armed=1&motion_sensitivity=5&input_armed=0&iolinkage=0&mail=0&upload_interval=0&record=1&snapshot=1&schedule_enable=1",
-        ):
-            cgi = (f"GET /{cmd}"
-                   f"&loginuse={self.username}&loginpas={self.password}"
-                   f"&user={self.username}&pwd={self.password}&")
-            await self._send_cmd(cgi)
-            await asyncio.sleep(0.15)
+        """Enable hardware OSD, arm motion detection, and sync firmware AI tracking settings."""
+        try:
+            await asyncio.sleep(1.5)
+            msens = max(1, min(10, int(self.motion_sensitivity)))
+            cmds = [
+                "camera_control.cgi?param=18&value=1",
+                "set_misc.cgi?osdenable=1",
+                (
+                    f"set_alarm.cgi?motion_armed=1&motion_sensitivity={msens}"
+                    "&input_armed=0&iolinkage=0&mail=0&upload_interval=0&record=1&snapshot=1&schedule_enable=1"
+                ),
+            ]
+            if self.auto_track is not None:
+                cmds.append(f"trans_cmd_string.cgi?cmd=2127&command=0&enable={1 if self.auto_track else 0}")
+            if self.human_sensitive is not None:
+                hsens = max(0, min(3, int(self.human_sensitive)))
+                cmds.append(f"trans_cmd_string.cgi?cmd=2126&command=0&sensitive={hsens}")
+            for cmd in cmds:
+                await self.send_cgi(cmd, wait_ack=2.0)
+                await asyncio.sleep(0.15)
+        finally:
+            self._auto_provision_done = True
 
     async def send_ptz_command(self, command: int, onestep: int = 1, wait_ack: float = 0.0) -> bool:
         """Send PTZ motor control command via decoder_control.cgi.
@@ -2666,6 +2683,13 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         no reply arrived within `timeout`."""
         return (await self.query_cgis([cgi], timeout=timeout))[cgi]
 
+    def _emit_alarm(self, source: str, status: int):
+        """Route hardware alarm/tracking events to event or legacy status callbacks."""
+        if self.alarm_event_callback:
+            self.alarm_event_callback(source, status)
+        elif self.alarm_callback:
+            self.alarm_callback(status)
+
     def _finish_cgi_msg(self, msg: dict, now: float):
         if msg.get("done"):
             return
@@ -2680,6 +2704,30 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self._cgi_done.append(msg)
         if msg["id"] == CGI_REPLY_IDS["get_status.cgi"]:
             self._poll_sent_at = 0.0          # status poll answered: next one may go out
+            if "alarm_status" in values:
+                try:
+                    alarm_val = int(values["alarm_status"])
+                except (TypeError, ValueError):
+                    alarm_val = None
+                if alarm_val is not None:
+                    prev_val = self._last_alarm_status
+                    self._last_alarm_status = alarm_val
+                    if alarm_val > 0:
+                        if prev_val != alarm_val:
+                            log.info(
+                                "[%s] Camera hardware alarm_status: %s -> %d",
+                                self._active_camera.label if self._active_camera else "cam",
+                                prev_val,
+                                alarm_val,
+                            )
+                        self._emit_alarm("HW_MOTION", alarm_val)
+                    elif prev_val is not None and prev_val > 0:
+                        log.info(
+                            "[%s] Camera hardware alarm_status: %s -> 0",
+                            self._active_camera.label if self._active_camera else "cam",
+                            prev_val,
+                        )
+                        self._emit_alarm("HW_MOTION", 0)
         if msg["id"] != CGI_REPLY_UNSUPPORTED:
             self.cgi_state.update(values)
             for k in values:
@@ -3114,7 +3162,10 @@ class CameraSession:
                  motion_cooldown: float = 30.0,
                  motion_poll_interval: float = 1.0,
                  bind_addr: str = "127.0.0.1",
-                 recorder=None):
+                 recorder=None,
+                 auto_track: Optional[int] = None,
+                 human_sensitive: Optional[int] = None,
+                 motion_sensitivity: int = 5):
         self.camera = camera
         self.rtsp_port = rtsp_port
         self.username = username
@@ -3129,6 +3180,9 @@ class CameraSession:
         self.bind_addr = bind_addr
         self.motion_handler: Optional[MotionHandler] = None
         self.recorder = recorder
+        self.auto_track = auto_track
+        self.human_sensitive = human_sensitive
+        self.motion_sensitivity = max(1, min(10, int(motion_sensitivity)))
 
         self.protocol: Optional[PPPPUnifiedProtocol] = None
         self.rtsp: Optional["RTSPServer"] = None
@@ -3245,6 +3299,9 @@ class CameraSession:
                 psk_list=self.psk_list, enc_mode=self.enc_mode,
                 alarm_server_addr=self.alarm_server_addr,
                 camera=self.camera,
+                auto_track=self.auto_track,
+                human_sensitive=self.human_sensitive,
+                motion_sensitivity=self.motion_sensitivity,
             )
             def on_gap():
                 if self.rtsp:
@@ -3260,12 +3317,15 @@ class CameraSession:
                     self.motion_handler = MotionHandler(
                         uid=self.camera.label, webhook=self.motion_webhook,
                         cooldown=self.motion_cooldown)
-                def _combined_alarm_cb(status: int):
+                def _combined_alarm_event_cb(source: str, status: int):
                     if self.motion_handler:
                         self.motion_handler.on_alarm_status(status)
                     if self.recorder:
-                        self.recorder.on_hardware_alarm(status)
+                        self.recorder.on_hardware_alarm(status, source=source)
+                def _combined_alarm_cb(status: int):
+                    _combined_alarm_event_cb("HW_ALARM", status)
                 self.protocol.alarm_callback = _combined_alarm_cb
+                self.protocol.alarm_event_callback = _combined_alarm_event_cb
                 self.protocol.alarm_poll_interval = self.motion_poll_interval
 
             loop = asyncio.get_event_loop()
