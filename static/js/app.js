@@ -18,6 +18,7 @@ import { initQrModal, openQrModal } from './qr-modal.js';
 import { initSettingsModal, openSettingsModal } from './settings-modal.js';
 import { showToast } from './ui-feedback.js';
 import { connectStreamWs, syncWsConfig } from './ws-stream.js';
+import { syncLiveVideo } from './live-video.js';
 
 let statusTimer = null;
 let statusInFlight = null;
@@ -114,6 +115,7 @@ export async function refreshStatus() {
       if (store.currentTab === 'live' || (grid && !grid.children.length)) {
         renderCameraCards();
       }
+      syncLiveVideo();   // cameras may have (re)connected or cards been re-rendered
 
       if (store.focusUid) {
         updateFocusStageTelemetry();

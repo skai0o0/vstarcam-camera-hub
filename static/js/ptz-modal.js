@@ -15,6 +15,7 @@ import {
 import { escHtml, svgIcon } from './icons.js';
 import { syncWsConfig } from './ws-stream.js';
 import { liveAudioUid, startLiveAudio, stopLiveAudio } from './live-audio.js';
+import { focusLiveCanvas } from './live-video.js';
 import { confirmDialog, registerModalEsc, showToast } from './ui-feedback.js';
 
 export const PTZ_STATE_PATCH = {
@@ -498,14 +499,15 @@ export function closeFocusModal() {
 
 function captureSnapshot() {
   const img = document.getElementById('focus-img');
-  if (!img || !img.naturalWidth) {
+  const live = focusLiveCanvas();
+  if (!live && (!img || !img.naturalWidth)) {
     showToast('Chưa có khung hình nào để chụp ảnh', 'warn');
     return;
   }
   const canvas = document.createElement('canvas');
-  canvas.width = img.naturalWidth;
-  canvas.height = img.naturalHeight;
-  canvas.getContext('2d').drawImage(img, 0, 0);
+  canvas.width = live ? live.width : img.naturalWidth;
+  canvas.height = live ? live.height : img.naturalHeight;
+  canvas.getContext('2d').drawImage(live || img, 0, 0);
   const c = getCameraByUid(store.focusUid);
   const safeName = (c?.room_name || store.focusUid || 'camera').replace(/[^a-zA-Z0-9_-]/g, '_');
   const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);

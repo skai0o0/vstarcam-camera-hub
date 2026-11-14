@@ -26,6 +26,7 @@ from typing import Dict, Optional, Set
 from aiohttp import WSMsgType, web
 
 import eye4_rtsp_proxy as proxy
+import live_video
 from motion_recorder import CameraMotionRecorder, StorageManager, make_compact_jpeg_thumb
 
 log = logging.getLogger("eye4.hub")
@@ -33,7 +34,7 @@ log = logging.getLogger("eye4.hub")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-STATIC_ASSET_VER = "v9"
+STATIC_ASSET_VER = "v10"
 
 
 
@@ -801,6 +802,7 @@ class CameraHubApp:
         self.sessions: Dict[str, proxy.CameraSession] = {}
         self.recorders: Dict[str, CameraMotionRecorder] = {}
         self.wifi_jobs: Dict[str, dict] = {}   # uid -> verified Wi-Fi switch progress
+        self.live_video: Dict[str, "live_video.CameraLiveVideo"] = {}  # uid -> WebCodecs fan-out
         self.ws_clients: Set[web.WebSocketResponse] = set()
 
         # Hub NVR settings (persisted in YAML config under 'hub')
@@ -1429,6 +1431,35 @@ class CameraHubApp:
             },
             "server_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
+
+    async def handle_ws_video(self, request: web.Request) -> web.WebSocketResponse:
+        """Live compressed video for WebCodecs players: `/ws/video/{uid}?codec=hevc|h264`.
+        hevc = camera frames passed through; h264 = shared iGPU transcode (needs VAAPI)."""
+        uid = request.match_info.get("uid", "")
+        codec = request.query.get("codec", "hevc")
+        if uid not in self.sessions or codec not in live_video.CODEC_STRINGS:
+            return web.json_response({"ok": False, "error": "camera/codec không hợp lệ"}, status=404)
+        if codec == "h264" and not self.vaapi_device():
+            return web.json_response({"ok": False, "error": "iGPU H.264 không khả dụng"}, status=503)
+        live = self.live_video.get(uid)
+        if live is None:
+            live = live_video.CameraLiveVideo(
+                uid,
+                get_session=lambda u=uid: self.sessions.get(u),
+                get_recorder=lambda u=uid: self.recorders.get(u),
+                get_vaapi_device=self.vaapi_device,
+            )
+            self.live_video[uid] = live
+        ws = web.WebSocketResponse(heartbeat=20.0)
+        await ws.prepare(request)
+        log.info("Live video %s client +1 for %s", codec, uid[:10])
+        try:
+            await live_video.serve_ws(ws, live, codec)
+        finally:
+            if not ws.closed:
+                await ws.close()
+            log.info("Live video %s client -1 for %s", codec, uid[:10])
+        return ws
 
     AUDIO_WS_CODECS = {"pcmu": 0, "pcma": 1, "pcm": 2}
     WS_WINDOW_MIN = 3     # unacknowledged JPEG frames allowed in flight per /ws/streams client...
@@ -3284,6 +3315,16 @@ class CameraHubApp:
             except OSError:
                 pass
 
+    def vaapi_device(self) -> Optional[str]:
+        """Render node for Intel iGPU (VAAPI) work, or None when disabled/unavailable.
+        Config: hw_accel: auto|off (default auto), vaapi_device: /dev/dri/renderD128."""
+        if str(self.config.get("hw_accel", "auto")).lower() in ("off", "false", "0", "none", "cpu"):
+            return None
+        if getattr(self, "_vaapi_failed", False):
+            return None
+        dev = str(self.config.get("vaapi_device") or "/dev/dri/renderD128")
+        return dev if os.path.exists(dev) else None
+
     async def _ensure_h264_mp4(self, rel: str, src: str) -> Optional[str]:
         lock = self._h264_locks.get(rel)
         if lock is None:
@@ -3299,35 +3340,50 @@ class CameraHubApp:
                 return dst
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             tmp_dst = dst + ".tmp.mp4"
-            cmd = [
+            tail = ["-map", "0:v:0", "-map", "0:a:0?", "-c:a", "copy", "-movflags", "+faststart", tmp_dst]
+            attempts = []
+            dev = self.vaapi_device()
+            if dev:
+                # iGPU: HEVC decode + H.264 encode on the GPU (~13x less CPU than libx264).
+                # No scaling: VPP (scale_vaapi) is unavailable on this driver stack.
+                attempts.append(("vaapi", [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-hwaccel", "vaapi", "-hwaccel_device", dev, "-hwaccel_output_format", "vaapi",
+                    "-i", src, "-c:v", "h264_vaapi", "-profile:v", "main", "-qp", "25", *tail]))
+            attempts.append(("libx264", [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                 "-threads", "4", "-i", src,
                 "-c:v", "libx264", "-preset", "ultrafast", "-tune", "fastdecode",
                 "-crf", "26", "-pix_fmt", "yuv420p",
-                "-vf", "scale='min(1280,iw)':-2",
-                "-map", "0:v:0", "-map", "0:a:0?", "-c:a", "copy",
-                "-movflags", "+faststart",
-                tmp_dst,
-            ]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=180.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                raise RuntimeError("H.264 transcode timed out")
-            if proc.returncode != 0 or not os.path.isfile(tmp_dst) or os.path.getsize(tmp_dst) == 0:
-                err_msg = (stderr or b"").decode("utf-8", "replace").strip()
+                "-vf", "scale='min(1280,iw)':-2", *tail]))
+            err_msg = ""
+            for name, cmd in attempts:
+                t0 = time.monotonic()
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=180.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    stderr = b"timed out"
+                if proc.returncode == 0 and os.path.isfile(tmp_dst) and os.path.getsize(tmp_dst) > 0:
+                    log.info("H.264 transcode (%s) %s in %.1fs", name, rel, time.monotonic() - t0)
+                    break
+                err_msg = (stderr or b"").decode("utf-8", "replace").strip()[:300]
+                log.warning("H.264 transcode (%s) failed for %s: %s", name, rel, err_msg)
+                if name == "vaapi":
+                    self._vaapi_failed = True   # stop retrying the GPU path this run
                 try:
                     if os.path.exists(tmp_dst):
                         os.remove(tmp_dst)
                 except OSError:
                     pass
-                raise RuntimeError(err_msg or f"ffmpeg exited {proc.returncode}")
+            else:
+                raise RuntimeError(err_msg or "ffmpeg failed")
             os.replace(tmp_dst, dst)
             self._prune_h264_cache(cache_root)
             return dst
@@ -3410,6 +3466,7 @@ def build_web_app(hub: CameraHubApp) -> web.Application:
     app.router.add_get("/", hub.handle_index)
     app.router.add_get("/ws/streams", hub.handle_ws_streams)
     app.router.add_get("/ws/audio/{uid}", hub.handle_ws_audio)
+    app.router.add_get("/ws/video/{uid}", hub.handle_ws_video)
     app.router.add_get("/api/status", hub.handle_status)
     app.router.add_get("/api/camera/{uid}/snapshot.jpg", hub.handle_snapshot)
     app.router.add_get("/api/camera/{uid}/mjpeg", hub.handle_mjpeg)

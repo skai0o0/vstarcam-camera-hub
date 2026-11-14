@@ -243,18 +243,53 @@ export async function loadEvents({ force = false, append = false } = {}) {
   }
 }
 
+// HEVC clips play natively wherever the browser can decode H.265 (Safari on macOS/iOS,
+// Chrome/Edge on Windows/macOS/Android with hardware HEVC). Only other browsers ask the
+// hub for an H.264 copy (transcoded on the server's iGPU).
+let hevcSupport = null;
 function canBrowserDecodeHevc(video) {
-  try {
-    return Boolean(
-      video.canPlayType('video/mp4; codecs="hvc1.1.6.L120.90"') ||
-      video.canPlayType('video/mp4; codecs="hev1.1.6.L120.90"')
-    );
-  } catch (_) {
+  if (hevcSupport) return hevcSupport;
+  hevcSupport = (async () => {
+    let byCanPlay = false;
+    try {
+      byCanPlay = Boolean(
+        video.canPlayType('video/mp4; codecs="hvc1.1.6.L120.90"') ||
+        video.canPlayType('video/mp4; codecs="hev1.1.6.L120.90"')
+      );
+    } catch (_) { /* ignore */ }
+    if (byCanPlay) return true;
+    try {
+      if (navigator.mediaCapabilities?.decodingInfo) {
+        const info = await navigator.mediaCapabilities.decodingInfo({
+          type: 'file',
+          video: {
+            contentType: 'video/mp4; codecs="hvc1.1.6.L120.90"',
+            width: 1920, height: 1080, bitrate: 1500000, framerate: 25,
+          },
+        });
+        return Boolean(info && info.supported);
+      }
+    } catch (_) { /* ignore */ }
     return false;
-  }
+  })();
+  return hevcSupport;
 }
 
-export function playEvent(rel, title) {
+function switchToCompat(video, loadingEl, why) {
+  const rel = video.dataset.rel;
+  if (!rel || video.dataset.compatTried === '1') return false;
+  video.dataset.compatTried = '1';
+  if (loadingEl) {
+    loadingEl.textContent = why;
+    loadingEl.style.display = 'block';
+  }
+  video.src = `/api/event-video?rel=${encodeURIComponent(rel)}`;
+  video.load();
+  video.play().catch(() => {});
+  return true;
+}
+
+export async function playEvent(rel, title) {
   const modal = document.getElementById('play-modal');
   const video = document.getElementById('play-video');
   const dl = document.getElementById('play-dl');
@@ -264,7 +299,7 @@ export function playEvent(rel, title) {
 
   const rawUrl = `/recordings/${encodeURI(rel)}`;
   const compatUrl = `/api/event-video?rel=${encodeURIComponent(rel)}`;
-  const useCompat = !canBrowserDecodeHevc(video);
+  const useCompat = !(await canBrowserDecodeHevc(video));
 
   if (titleEl) titleEl.textContent = title || 'Xem lại sự kiện';
   if (dl) dl.href = rawUrl;
@@ -417,16 +452,16 @@ export function initEventsTab({ onRefreshStatus } = {}) {
     video.addEventListener('loadeddata', hideL);
     video.addEventListener('canplay', hideL);
     video.addEventListener('playing', hideL);
+    // Some browsers accept an HEVC MP4 but only decode its audio: no picture -> use H.264.
+    video.addEventListener('loadeddata', () => {
+      if (video.dataset.rel && video.videoWidth === 0) {
+        switchToCompat(video, loadingEl, 'Trình duyệt không hiện được hình H.265 — đang chuyển sang H.264...');
+      }
+    });
     video.addEventListener('error', () => {
       const rel = video.dataset.rel;
       if (!rel || !video.getAttribute('src') || !playModal?.classList.contains('open')) return;
-      if (video.dataset.compatTried !== '1') {
-        video.dataset.compatTried = '1';
-        loadingEl.textContent = 'Trình duyệt không giải mã H.265 — đang chuyển sang H.264...';
-        loadingEl.style.display = 'block';
-        video.src = `/api/event-video?rel=${encodeURIComponent(rel)}`;
-        video.load();
-        video.play().catch(() => {});
+      if (switchToCompat(video, loadingEl, 'Trình duyệt không giải mã H.265 — đang chuyển sang H.264...')) {
         return;
       }
       loadingEl.textContent = 'Không phát được video trên trình duyệt này. Vui lòng bấm "Tải MP4".';

@@ -768,6 +768,25 @@ input[type="checkbox"] {
   object-fit: cover;
 }
 
+/* WebCodecs live video, laid over the snapshot <img> once the first frame is decoded */
+.live-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: none;
+  background: #04060b;
+}
+
+.live-canvas.on {
+  display: block;
+}
+
+.focus-stage.fit-cover .live-canvas {
+  object-fit: cover;
+}
+
 .focus-stage-hud {
   display: flex;
   align-items: center;

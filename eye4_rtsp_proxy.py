@@ -3361,6 +3361,8 @@ class CameraSession:
         self.playout.label = camera.label
         # Extra consumers of decoded camera audio (data, codec), e.g. live WebSocket listeners
         self.audio_listeners: set = set()
+        # Extra consumers of reassembled video frames (frame_type, cam_ts_ms, data), after playout
+        self.video_listeners: set = set()
         self.rtsp_port = rtsp_port
         self.username = username
         self.password = password
@@ -3488,6 +3490,11 @@ class CameraSession:
                         )
                 if self.recorder:
                     self.recorder.on_video_frame(frame_type, timestamp, data)
+                for listener in list(self.video_listeners):
+                    try:
+                        listener(frame_type, timestamp, data)
+                    except Exception:
+                        log.debug("video listener failed", exc_info=True)
 
             def emit_audio(data, codec):
                 if self.rtsp:

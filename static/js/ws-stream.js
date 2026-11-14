@@ -2,6 +2,7 @@
  * Multiplexed Real-Time 25 FPS Binary WebSocket video receiver.
  */
 import { store, getCameraByUid } from './api.js';
+import { liveVideoActive, onLiveVideoFallback, probeLiveCodec, syncLiveVideo } from './live-video.js';
 
 let ws = null;
 let reconnectTimer = null;
@@ -26,6 +27,7 @@ function ensureWatchdog() {
   if (watchdogTimer) return;
   watchdogTimer = setInterval(() => {
     if (document.hidden || (store.currentTab !== 'live' && !store.focusUid)) return;
+    if (liveVideoActive()) return;   // WebCodecs players handle their own reconnects
     if (!ws || ws.readyState === WebSocket.CLOSED) {
       connectStreamWs();
     }
@@ -72,16 +74,21 @@ function setWsBadge(connected) {
 }
 
 export function syncWsConfig() {
+  syncLiveVideo();
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const gridFpsEl = document.getElementById('grid-fps');
   const gridFps = parseFloat(gridFpsEl ? gridFpsEl.value : '25') || 0;
-  const paused = document.hidden || (store.currentTab !== 'live' && !store.focusUid);
+  // With WebCodecs live video the hub's MJPEG path stays idle (its decoders stop)
+  const paused = document.hidden || liveVideoActive() || (store.currentTab !== 'live' && !store.focusUid);
   ws.send(JSON.stringify({
     grid_fps: gridFps,
     focus_uid: store.focusUid,
     paused,
   }));
 }
+
+onLiveVideoFallback(() => syncWsConfig());
+probeLiveCodec().then(() => syncWsConfig());
 
 export function connectStreamWs() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
