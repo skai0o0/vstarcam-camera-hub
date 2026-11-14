@@ -365,7 +365,7 @@ class CameraMotionRecorder:
                 "-vcodec",
                 "mjpeg",
                 "-q:v",
-                "5",
+                "8",          # ~39 KB/frame at 960x540 (q5 was ~54 KB) — still sharp, ~30% less bandwidth
                 "-flush_packets",
                 "1",
                 "pipe:1",

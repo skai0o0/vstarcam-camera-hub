@@ -102,6 +102,10 @@ export function connectStreamWs() {
 
   ws.onmessage = (ev) => {
     if (!(ev.data instanceof ArrayBuffer)) return;
+    // Flow control: tell the hub this frame arrived so it may send the next one.
+    // The hub keeps only a few frames in flight, so a slow link lowers FPS
+    // instead of piling up seconds of stale video.
+    try { if (ws && ws.readyState === WebSocket.OPEN) ws.send('a'); } catch (_) {}
     const u8 = new Uint8Array(ev.data);
     if (u8.length < 4) return;
     const ulen = u8[0];

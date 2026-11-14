@@ -33,7 +33,7 @@ log = logging.getLogger("eye4.hub")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-STATIC_ASSET_VER = "v8"
+STATIC_ASSET_VER = "v9"
 
 
 
@@ -1431,6 +1431,10 @@ class CameraHubApp:
         })
 
     AUDIO_WS_CODECS = {"pcmu": 0, "pcma": 1, "pcm": 2}
+    WS_WINDOW_MIN = 3     # unacknowledged JPEG frames allowed in flight per /ws/streams client...
+    WS_WINDOW_MAX = 30    # ...sized from the measured ack RTT (see handle_ws_streams)
+    WS_STREAM_FPS = 50.0  # frames/s the window must sustain (2 cameras x 25)
+    WS_LATENCY_BUDGET = 0.4  # s of frames allowed in flight: bounds live lag on a saturated link
 
     async def handle_ws_audio(self, request: web.Request) -> web.WebSocketResponse:
         """Live camera audio (`/ws/audio/{uid}`): binary messages `[1B codec][payload]`,
@@ -1496,10 +1500,34 @@ class CameraHubApp:
         }
         last_sent_seq: Dict[str, int] = {}
         last_sent_mono: Dict[str, float] = {}
+        # Flow control: clients ack every frame ("a"). Keeping only WS_WINDOW frames
+        # unacknowledged bounds latency to ~window x frame size / bandwidth; a link
+        # slower than the stream (e.g. Cloudflare ~14 Mbps vs ~20 Mbps of JPEG) then
+        # drops FPS instead of buffering seconds of stale frames. Clients that never
+        # ack (old cached JS) are served unthrottled as before.
+        flow = {"inflight": 0, "acks": 0, "last_ack": time.monotonic(),
+                "sent": collections.deque(maxlen=64), "rtts": collections.deque(maxlen=120),
+                "window": self.WS_WINDOW_MIN, "log_at": time.monotonic() + 15.0}
+        rr = {"i": 0}
 
         async def rx_loop():
             try:
                 async for msg in ws:
+                    if msg.type == WSMsgType.TEXT and msg.data == "a":
+                        now_a = time.monotonic()
+                        flow["inflight"] = max(0, flow["inflight"] - 1)
+                        flow["acks"] += 1
+                        flow["last_ack"] = now_a
+                        if flow["sent"]:
+                            flow["rtts"].append(now_a - flow["sent"].popleft())
+                            # Window = enough frames to keep the pipe full for one base RTT
+                            # (x1.5), but at least WS_LATENCY_BUDGET worth: Cloudflare's RTT
+                            # jitters 90-250ms, and a too-tight window starves throughput.
+                            base_rtt = min(flow["rtts"])
+                            span = max(base_rtt * 1.5, self.WS_LATENCY_BUDGET)
+                            flow["window"] = int(max(self.WS_WINDOW_MIN, min(
+                                self.WS_WINDOW_MAX, self.WS_STREAM_FPS * span + 1)))
+                        continue
                     if msg.type == WSMsgType.TEXT:
                         try:
                             cfg = json.loads(msg.data)
@@ -1527,8 +1555,30 @@ class CameraHubApp:
                 sent_any = False
                 focus_uid = state["focus_uid"]
                 grid_fps = state["grid_fps"]
+                if flow["acks"] and now >= flow["log_at"] and flow["rtts"]:
+                    flow["log_at"] = now + 30.0
+                    r = sorted(flow["rtts"])
+                    log.info("WS stream client: ack RTT min/p50=%.0f/%.0fms window=%d frames",
+                             r[0] * 1000, r[len(r) // 2] * 1000, flow["window"])
+                if flow["acks"] and flow["inflight"] >= flow["window"]:
+                    if now - flow["last_ack"] > 5.0:
+                        flow["inflight"] = 0          # lost acks: don't stall forever
+                        flow["sent"].clear()
+                    await asyncio.sleep(0.005)
+                    continue
 
-                for uid, rec in list(self.recorders.items()):
+                # Rotate the starting camera so a tight window is shared fairly
+                items = list(self.recorders.items())
+                if items:
+                    k = rr["i"] % len(items)
+                    rr["i"] += 1
+                    items = items[k:] + items[:k]
+                # The focused camera first: it is what the user is looking at
+                items.sort(key=lambda kv: kv[0] != focus_uid)
+
+                for uid, rec in items:
+                    if flow["acks"] and flow["inflight"] >= flow["window"]:
+                        break
                     # If Focus Modal is open and grid_fps <= 0, only decode focused camera
                     if grid_fps <= 0 and uid != focus_uid:
                         continue
@@ -1548,6 +1598,8 @@ class CameraHubApp:
                     uid_bytes = uid.encode("ascii")
                     packet = bytes([len(uid_bytes)]) + uid_bytes + jpg
                     await ws.send_bytes(packet)
+                    flow["inflight"] += 1
+                    flow["sent"].append(time.monotonic())
                     last_sent_seq[uid] = seq
                     last_sent_mono[uid] = now
                     sent_any = True
