@@ -1100,6 +1100,11 @@ input[type="checkbox"] {
   overflow: hidden;
 }
 
+.set-workspace.no-rail {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
 .set-rail {
   border-right: 1px solid var(--border-subtle);
   background: var(--bg-inset);

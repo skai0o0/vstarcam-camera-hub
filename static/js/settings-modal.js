@@ -202,6 +202,8 @@ function renderSettingsRail() {
   const rail = document.getElementById('settings-cat-rail');
   if (!rail) return;
   rail.style.display = settingsPayload ? 'flex' : 'none';
+  // With the rail hidden the grid must collapse to one column, or the body lands in the 230px rail column
+  rail.parentElement?.classList.toggle('no-rail', !settingsPayload);
   if (!settingsPayload) return;
   rail.innerHTML = SETTINGS_CATEGORIES.map(([id, label, icon]) =>
     `<button type="button" class="set-cat-btn ${settingsCat === id ? 'active' : ''}" data-set-cat="${id}">${svgIcon(icon, 'icon-sm')}<span>${escHtml(label)}</span></button>`
@@ -498,7 +500,9 @@ export function openSettingsModal(uid) {
 
   document.getElementById('settings-filter').value = '';
   document.getElementById('btn-copy-settings').disabled = true;
-  document.getElementById('settings-cat-rail').style.display = 'none';
+  const catRail = document.getElementById('settings-cat-rail');
+  catRail.style.display = 'none';
+  catRail.parentElement?.classList.add('no-rail');
   document.getElementById('settings-fw-badge').style.display = 'none';
 
   const name = cam ? cam.room_name : uid;
