@@ -108,6 +108,10 @@ class CameraMotionRecorder:
         # Circular RAM buffer holding (pre_roll_sec + 4s) of frames
         self._ring_buffer: Deque[VideoFrameItem] = collections.deque()
         self._ring_bytes: int = 0
+        # Matching audio ring: (arrival_mono, payload, codec) chunks of 8kHz mono G.711/PCM
+        self._audio_ring: Deque[tuple] = collections.deque()
+        self._active_audio: List[tuple] = []
+        self.audio_codec: Optional[str] = None
 
         # Codec parameter sets (extracted by RTSPServer or directly)
         self.codec: str = "h265"
@@ -550,6 +554,67 @@ class CameraMotionRecorder:
         elif self._reason_priority(reason) >= self._reason_priority(self.last_trigger_reason):
             self.last_trigger_reason = reason
 
+    # 8kHz mono; bytes per second for each payload codec the camera delivers
+    _AUDIO_BPS = {"pcmu": 8000, "pcma": 8000, "pcm": 16000}
+    _AUDIO_SILENCE = {"pcmu": b"\xff", "pcma": b"\xd5", "pcm": b"\x00"}
+    _AUDIO_FFMPEG_FMT = {"pcmu": "mulaw", "pcma": "alaw", "pcm": "s16le"}
+
+    def on_audio_frame(self, data: bytes, codec: str):
+        """Keep camera audio next to the video ring so clips can carry sound."""
+        if not data or codec not in self._AUDIO_BPS:
+            return
+        now_mono = time.monotonic()
+        if codec != self.audio_codec:
+            # Codec switch: older chunks cannot be muxed into the same stream
+            self._audio_ring.clear()
+            self._active_audio = []
+            self.audio_codec = codec
+        chunk = (now_mono, data, codec)
+        self._audio_ring.append(chunk)
+        cutoff = now_mono - (self.pre_roll_sec + 4.0)
+        while self._audio_ring and self._audio_ring[0][0] < cutoff:
+            self._audio_ring.popleft()
+        if self.is_recording:
+            self._active_audio.append(chunk)
+
+    @classmethod
+    def _build_clip_audio(cls, chunks: List[tuple], start_mono: float, duration_sec: float):
+        """Lay audio chunks on the clip timeline (t=0 at the first video frame).
+
+        Each chunk is stamped with its arrival time, i.e. its END. Gaps (lost
+        chunks) are filled with silence so sound stays in sync with the picture.
+        Returns (codec, bytes) or None when there is too little audio."""
+        if not chunks:
+            return None
+        codec = chunks[-1][2]
+        bps = cls._AUDIO_BPS[codec]
+        align = 2 if codec == "pcm" else 1
+        silence = cls._AUDIO_SILENCE[codec]
+        total = int(duration_sec * bps) // align * align
+        out = bytearray()
+        real = 0
+        for ts, data, c in chunks:
+            if c != codec:
+                continue
+            pos = int((ts - len(data) / bps - start_mono) * bps) // align * align
+            if pos + len(data) <= 0:
+                continue
+            if pos < 0:
+                data = data[-pos:]
+                pos = 0
+            if pos > len(out) + bps // 20:          # >50ms hole: pad with silence
+                out.extend(silence * (pos - len(out)))
+            out.extend(data)
+            real += len(data)
+            if len(out) >= total:
+                break
+        if real < bps:                               # under 1s of real audio: skip track
+            return None
+        del out[total:]
+        if len(out) < total:
+            out.extend(silence * (total - len(out)))
+        return codec, bytes(out)
+
     def on_video_frame(self, frame_type: int, cam_ts: int, data: bytes):
         """Feed every incoming reassembled H.265/H.264 frame into RAM Ring Buffer, Live Pipe & Detector."""
         if not data:
@@ -684,6 +749,8 @@ class CameraMotionRecorder:
         else:
             self.record_start_mono = now_mono
             self.record_start_wall = now_wall
+        # Pre-roll audio covering the same span (chunks are stamped at their end)
+        self._active_audio = [a for a in self._audio_ring if a[0] >= self.record_start_mono - 0.5]
 
         log.info(
             "[%s] MOTION RECORD START (%s): pre-roll=%d frames (%.1fs, %.1f KB from RAM)",
@@ -725,6 +792,8 @@ class CameraMotionRecorder:
         frames = self._active_frames
         self._active_frames = []
         self._active_bytes = 0
+        audio_chunks = self._active_audio
+        self._active_audio = []
         thumb = self._pending_thumbnail or self.latest_live_jpeg
         self._pending_thumbnail = None
 
@@ -747,6 +816,7 @@ class CameraMotionRecorder:
                     duration_sec=duration_sec,
                     reason=reason,
                     thumb_bytes=thumb,
+                    audio=self._build_clip_audio(audio_chunks, frames[0].mono_ts, duration_sec),
                 )
             )
             self._mux_tasks.add(task)
@@ -762,8 +832,10 @@ class CameraMotionRecorder:
         duration_sec: float,
         reason: str,
         thumb_bytes: Optional[bytes],
+        audio: Optional[tuple] = None,
     ):
-        """Remux raw H.265/H.264 NAL units from RAM directly into an MP4 file on disk (-c:v copy)."""
+        """Remux raw H.265/H.264 NAL units from RAM directly into an MP4 file on disk (-c:v copy),
+        plus the camera's G.711 audio encoded to AAC when `audio` = (codec, bytes) is given."""
         safe_room = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in self.room_name).strip("_") or "Camera"
         dt_start = datetime.datetime.fromtimestamp(start_wall)
         dt_end = datetime.datetime.fromtimestamp(end_wall)
@@ -801,9 +873,19 @@ class CameraMotionRecorder:
             fmt,
             "-i",
             "pipe:0",
-            "-c:v",
-            "copy",
         ]
+        audio_tmp = None
+        if audio:
+            a_codec, a_bytes = audio
+            audio_tmp = mp4_path + ".audio.tmp"
+            try:
+                with open(audio_tmp, "wb") as af:
+                    af.write(a_bytes)
+                cmd.extend(["-f", self._AUDIO_FFMPEG_FMT[a_codec], "-ar", "8000", "-ac", "1", "-i", audio_tmp,
+                            "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "32k"])
+            except OSError:
+                audio_tmp = None
+        cmd.extend(["-c:v", "copy"])
         if is_hevc:
             cmd.extend(["-tag:v", "hvc1"])
         cmd.extend(["-movflags", "+faststart", mp4_path])
@@ -818,10 +900,21 @@ class CameraMotionRecorder:
             _, stderr = await asyncio.wait_for(proc.communicate(input=raw_bitstream), timeout=15.0)
             if proc.returncode != 0:
                 log.warning("[%s] FFmpeg MP4 mux error: %s", self.room_name, stderr.decode(errors="replace")[:200])
+                if audio:
+                    # Never lose the clip over its sound: retry video-only
+                    log.warning("[%s] Retrying clip without audio", self.room_name)
+                    return await self._mux_frames_to_mp4(frames, start_wall, end_wall, duration_sec,
+                                                          reason, thumb_bytes, audio=None)
                 return
         except Exception as e:
             log.warning("[%s] Failed to mux MP4 clip: %s", self.room_name, e)
             return
+        finally:
+            if audio_tmp:
+                try:
+                    os.remove(audio_tmp)
+                except OSError:
+                    pass
 
         if not os.path.exists(mp4_path) or os.path.getsize(mp4_path) < 8192:
             log.warning("[%s] Discarding corrupt/empty MP4 clip (< 8 KB): %s", self.room_name, os.path.basename(mp4_path))
@@ -878,6 +971,7 @@ class CameraMotionRecorder:
             "frames": len(frames),
             "fps": round(actual_fps, 1),
             "codec": self.codec,
+            "audio": bool(audio_tmp),
             "size_bytes": file_size,
             "size_mb": round(file_size / (1024.0 * 1024.0), 2),
             "reason": reason,
@@ -893,12 +987,13 @@ class CameraMotionRecorder:
         self.clips_saved_count += 1
         self.last_clip_path = mp4_path
         log.info(
-            "[%s] Saved motion clip: %s (%.1fs, %.2f MB, %d frames, reason=%s)",
+            "[%s] Saved motion clip: %s (%.1fs, %.2f MB, %d frames, audio=%s, reason=%s)",
             self.room_name,
             os.path.basename(mp4_path),
             duration_sec,
             meta["size_mb"],
             len(frames),
+            "yes" if meta["audio"] else "no",
             reason,
         )
 

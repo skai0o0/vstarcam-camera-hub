@@ -3359,6 +3359,8 @@ class CameraSession:
         self.playout_mode = str(playout_mode or "relay").lower()
         self.playout = PlayoutBuffer(max(0, int(playout_delay_ms)) / 1000.0)
         self.playout.label = camera.label
+        # Extra consumers of decoded camera audio (data, codec), e.g. live WebSocket listeners
+        self.audio_listeners: set = set()
         self.rtsp_port = rtsp_port
         self.username = username
         self.password = password
@@ -3490,6 +3492,13 @@ class CameraSession:
             def emit_audio(data, codec):
                 if self.rtsp:
                     self.rtsp.push_audio_frame(data, codec)
+                if self.recorder and hasattr(self.recorder, "on_audio_frame"):
+                    self.recorder.on_audio_frame(data, codec)
+                for listener in list(self.audio_listeners):
+                    try:
+                        listener(data, codec)
+                    except Exception:
+                        log.debug("audio listener failed", exc_info=True)
 
             def emit_gap():
                 if self.rtsp:

@@ -14,6 +14,7 @@ import {
 } from './cam-actions.js';
 import { escHtml, svgIcon } from './icons.js';
 import { syncWsConfig } from './ws-stream.js';
+import { liveAudioUid, startLiveAudio, stopLiveAudio } from './live-audio.js';
 import { confirmDialog, registerModalEsc, showToast } from './ui-feedback.js';
 
 export const PTZ_STATE_PATCH = {
@@ -413,9 +414,25 @@ function switchPtzSubtab(tabId) {
   resetFocusScroll();
 }
 
+const AUDIO_BTN_LABEL = {
+  connecting: 'Đang mở tiếng...',
+  playing: 'Tắt tiếng',
+  stopped: 'Nghe',
+  error: 'Nghe',
+};
+
+function renderAudioBtn(state) {
+  const btn = document.getElementById('focus-audio-btn');
+  if (!btn) return;
+  btn.innerHTML = `${svgIcon('volume', 'icon-sm')}<span>${escHtml(AUDIO_BTN_LABEL[state] || 'Nghe')}</span>`;
+  btn.classList.toggle('active', state === 'playing' || state === 'connecting');
+}
+
 export function openFocusModal(uid) {
   const c = getCameraByUid(uid);
   if (!c) return;
+  if (liveAudioUid() && liveAudioUid() !== uid) stopLiveAudio();
+  renderAudioBtn(liveAudioUid() === uid ? 'playing' : 'stopped');
   store.focusUid = uid;
   camParamsSections = null;
   wasFocusOffline = Boolean(getFocusOfflineReason(c));
@@ -472,6 +489,7 @@ export function closeFocusModal() {
     keyHeldDir = null;
   }
   store.focusUid = null;
+  stopLiveAudio();
   const focusImg = document.getElementById('focus-img');
   if (focusImg) focusImg.src = '';
   document.getElementById('focus-modal')?.classList.remove('open');
@@ -511,6 +529,18 @@ export function initFocusModal(opts = {}) {
     if (store.focusUid) triggerMotionManual(store.focusUid, 'trigger', callbacks.onRefreshStatus);
   });
   document.getElementById('focus-snap-btn')?.addEventListener('click', captureSnapshot);
+  document.getElementById('focus-audio-btn')?.addEventListener('click', () => {
+    if (!store.focusUid) return;
+    if (liveAudioUid() === store.focusUid) {
+      stopLiveAudio();
+    } else {
+      startLiveAudio(store.focusUid, (uid, state) => {
+        if (uid !== store.focusUid) return;
+        renderAudioBtn(state);
+        if (state === 'error') showToast('Không mở được kênh âm thanh', 'error');
+      });
+    }
+  });
   document.getElementById('focus-fit-btn')?.addEventListener('click', () => {
     const stage = document.getElementById('focus-stage');
     const btn = document.getElementById('focus-fit-btn');

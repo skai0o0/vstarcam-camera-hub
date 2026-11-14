@@ -33,7 +33,7 @@ log = logging.getLogger("eye4.hub")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-STATIC_ASSET_VER = "v7"
+STATIC_ASSET_VER = "v8"
 
 
 
@@ -1429,6 +1429,55 @@ class CameraHubApp:
             },
             "server_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
+
+    AUDIO_WS_CODECS = {"pcmu": 0, "pcma": 1, "pcm": 2}
+
+    async def handle_ws_audio(self, request: web.Request) -> web.WebSocketResponse:
+        """Live camera audio (`/ws/audio/{uid}`): binary messages `[1B codec][payload]`,
+        codec 0=G.711 u-law, 1=G.711 a-law, 2=PCM s16le; always 8kHz mono."""
+        uid = request.match_info.get("uid", "")
+        sess = self.sessions.get(uid)
+        if not sess:
+            return web.json_response({"ok": False, "error": "Không tìm thấy camera"}, status=404)
+        ws = web.WebSocketResponse(heartbeat=20.0)
+        await ws.prepare(request)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=40)   # ~4s; drop oldest when the client lags
+
+        def listener(data: bytes, codec: str):
+            code = self.AUDIO_WS_CODECS.get(codec)
+            if code is None:
+                return
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            queue.put_nowait(bytes([code]) + data)
+
+        sess.audio_listeners.add(listener)
+        log.info("Live audio listener +1 for %s (%d)", uid[:10], len(sess.audio_listeners))
+
+        async def drain_client():
+            async for _msg in ws:   # the client sends nothing; this just notices the close
+                pass
+
+        reader = asyncio.create_task(drain_client())
+        try:
+            while not ws.closed and not reader.done():
+                try:
+                    pkt = await asyncio.wait_for(queue.get(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    continue
+                await ws.send_bytes(pkt)
+        except (ConnectionError, RuntimeError):
+            pass
+        finally:
+            sess.audio_listeners.discard(listener)
+            reader.cancel()
+            if not ws.closed:
+                await ws.close()
+            log.info("Live audio listener -1 for %s (%d)", uid[:10], len(sess.audio_listeners))
+        return ws
 
     async def handle_ws_streams(self, request: web.Request) -> web.WebSocketResponse:
         """
@@ -3204,7 +3253,8 @@ class CameraHubApp:
                 "-c:v", "libx264", "-preset", "ultrafast", "-tune", "fastdecode",
                 "-crf", "26", "-pix_fmt", "yuv420p",
                 "-vf", "scale='min(1280,iw)':-2",
-                "-an", "-movflags", "+faststart",
+                "-map", "0:v:0", "-map", "0:a:0?", "-c:a", "copy",
+                "-movflags", "+faststart",
                 tmp_dst,
             ]
             proc = await asyncio.create_subprocess_exec(
@@ -3307,6 +3357,7 @@ def build_web_app(hub: CameraHubApp) -> web.Application:
 
     app.router.add_get("/", hub.handle_index)
     app.router.add_get("/ws/streams", hub.handle_ws_streams)
+    app.router.add_get("/ws/audio/{uid}", hub.handle_ws_audio)
     app.router.add_get("/api/status", hub.handle_status)
     app.router.add_get("/api/camera/{uid}/snapshot.jpg", hub.handle_snapshot)
     app.router.add_get("/api/camera/{uid}/mjpeg", hub.handle_mjpeg)
