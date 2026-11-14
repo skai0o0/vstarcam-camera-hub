@@ -206,7 +206,7 @@ def save_config(path: str, config: dict):
         log.warning("Error saving config to %s: %s", path, e)
 
 
-_CRED_PARAM_RE = re.compile(r'(loginpas|pwd[123]?)=[^&\s]*')
+_CRED_PARAM_RE = re.compile(r'(loginpas|pwd[123]?|wpa_psk|key[1-4])=[^&\s]*')
 
 
 def redact_credentials(text: str) -> str:
@@ -2352,18 +2352,21 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                f"&user={self.username}&pwd={self.password}&")
         await self._send_cmd(cgi)
 
-    async def send_set_wifi(self, ssid: str, wifi_password: str, authtype: int = 4, encrypt: int = 4):
-        """Configure the camera's Wi-Fi network credentials via set_wifi.cgi over PPPP."""
+    @staticmethod
+    def build_set_wifi_cgi(ssid: str, wifi_password: str, authtype: int = 4, encrypt: int = 4) -> str:
+        """set_wifi.cgi query (without login params) for an infrastructure network."""
         safe_ssid = urllib.parse.quote(ssid.strip())
         safe_psk = urllib.parse.quote(wifi_password)
-        cgi = (
-            f"GET /set_wifi.cgi?enable=1&ssid={safe_ssid}&channel=0&mode=0"
+        return (
+            f"set_wifi.cgi?enable=1&ssid={safe_ssid}&channel=0&mode=0"
             f"&authtype={authtype}&encryp={encrypt}&encrypt={encrypt}"
             f"&keytype=0&defkey=0&wpa_psk={safe_psk}"
-            f"&loginuse={self.username}&loginpas={self.password}"
-            f"&user={self.username}&pwd={self.password}&"
         )
-        await self._send_cmd(cgi)
+
+    async def send_set_wifi(self, ssid: str, wifi_password: str, authtype: int = 4, encrypt: int = 4):
+        """Configure the camera's Wi-Fi network credentials via set_wifi.cgi over PPPP."""
+        await self.send_cgi(self.build_set_wifi_cgi(ssid, wifi_password, authtype, encrypt),
+                            wait_ack=0.0)
 
     async def send_set_password(self, new_password: str):
         """Update camera password via set_user.cgi over PPPP and update self.password."""

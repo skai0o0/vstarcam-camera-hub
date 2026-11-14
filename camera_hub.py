@@ -33,7 +33,7 @@ log = logging.getLogger("eye4.hub")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-STATIC_ASSET_VER = "v6"
+STATIC_ASSET_VER = "v7"
 
 
 
@@ -800,6 +800,7 @@ class CameraHubApp:
 
         self.sessions: Dict[str, proxy.CameraSession] = {}
         self.recorders: Dict[str, CameraMotionRecorder] = {}
+        self.wifi_jobs: Dict[str, dict] = {}   # uid -> verified Wi-Fi switch progress
         self.ws_clients: Set[web.WebSocketResponse] = set()
 
         # Hub NVR settings (persisted in YAML config under 'hub')
@@ -2702,6 +2703,280 @@ class CameraHubApp:
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=400)
 
+    # ------------------------------------------------------------------
+    # Verified remote Wi-Fi switch (camera already online through the hub)
+    # ------------------------------------------------------------------
+    WIFI_SWITCH_DROP_WAIT = 25.0     # s to wait for the camera to leave the old network
+    WIFI_SWITCH_BACK_WAIT = 240.0    # s to wait for it to come back (boot + join + P2P register)
+    WIFI_SWITCH_LATE_WATCH = 900.0   # keep watching this long after a timeout
+
+    @staticmethod
+    def _parse_wifi_scan(values: Optional[dict]) -> list:
+        aps = []
+        if not values:
+            return aps
+        try:
+            n = int(values.get("ap_number") or 0)
+        except ValueError:
+            n = 0
+        for i in range(min(n, 64)):
+            ssid = values.get(f"ap_ssid[{i}]")
+            if ssid is None:
+                continue
+            try:
+                signal = int(values.get(f"ap_dbm0[{i}]") or 0)
+            except ValueError:
+                signal = 0
+            try:
+                security = int(values.get(f"ap_security[{i}]") or 0)
+            except ValueError:
+                security = 0
+            aps.append({"ssid": ssid, "signal": signal, "security": security})
+        aps.sort(key=lambda a: -a["signal"])
+        return aps
+
+    @staticmethod
+    def _net_fingerprint(params: Optional[dict]) -> Optional[tuple]:
+        """(gateway, /24 of ip) identifying the network the camera is actually on."""
+        if not params:
+            return None
+        ip, gw = params.get("ip") or "", params.get("gateway") or ""
+        if not ip or ip == "0.0.0.0":
+            return None
+        return (gw, ".".join(ip.split(".")[:3]))
+
+    async def _restore_old_wifi(self, uid: str, job: dict, new_ssid: str, step) -> bool:
+        """Camera came back on its old network: re-save the old credentials so a later
+        reboot does not strand it trying the unreachable new network."""
+        old_ssid, old_psk, old_auth, old_enc = job.get("_old_creds") or (None, None, None, None)
+        if not old_ssid or old_ssid == new_ssid or old_psk is None:
+            step("rollback", "warn", "Không có cấu hình mạng cũ để khôi phục (camera chỉ lưu mạng mới)")
+            return False
+        sess = self.sessions.get(uid)
+        proto = sess.protocol if sess else None
+        if not proto or not proto.enc_mode:
+            step("rollback", "error", "Camera mất kết nối, chưa khôi phục được cấu hình cũ")
+            return False
+        try:
+            auth = int(old_auth) if old_auth not in (None, "") else 4
+            enc = int(old_enc) if old_enc not in (None, "") else 4
+        except ValueError:
+            auth, enc = 4, 4
+        step("rollback", "running", f"Khôi phục cấu hình Wi-Fi cũ '{old_ssid}'...")
+        reply = await proto.query_cgi(proto.build_set_wifi_cgi(old_ssid, old_psk, auth, enc), timeout=12.0)
+        ok = bool(reply) and str(reply.get("result", "")).strip().lower() in ("0", "ok")
+        step("rollback", "ok" if ok else "error",
+             f"Đã lưu lại cấu hình '{old_ssid}'" if ok else "Camera không xác nhận khôi phục")
+        return ok
+
+    def _wifi_job_public(self, job: Optional[dict]) -> Optional[dict]:
+        if not job:
+            return None
+        out = {k: v for k, v in job.items() if not k.startswith("_")}
+        out["elapsed"] = round(time.monotonic() - job["_t0"], 1)
+        return out
+
+    async def _run_wifi_switch(self, uid: str, ssid: str, password: str, force: bool):
+        job = self.wifi_jobs[uid]
+        cam_name = job["camera"]
+
+        def step(stage: str, status: str, message: str, **extra):
+            entry = {"stage": stage, "status": status, "message": message,
+                     "t": round(time.monotonic() - job["_t0"], 1), **extra}
+            # A stage reports progress then a verdict: replace its running entry.
+            if job["steps"] and job["steps"][-1]["stage"] == stage and job["steps"][-1]["status"] == "running":
+                job["steps"][-1] = entry
+            else:
+                job["steps"].append(entry)
+            job["stage"] = stage
+            log.info("[Wi-Fi switch %s] %s %s: %s", cam_name, stage, status, message)
+
+        def finish(result: str, message: str, advice: str = ""):
+            job["state"] = "done"
+            job["result"] = result          # success | fallback | failed | timeout
+            job["message"] = message
+            job["advice"] = advice
+            job["finished_at"] = time.time()
+
+        def live_proto():
+            sess = self.sessions.get(uid)
+            if sess and sess.protocol and sess.protocol.enc_mode and sess.state == "CONNECTED":
+                return sess, sess.protocol
+            return sess, None
+
+        try:
+            # 1. Current network
+            step("precheck", "running", "Đọc cấu hình Wi-Fi hiện tại của camera...")
+            sess, proto = live_proto()
+            if not proto:
+                step("precheck", "error", "Camera không còn online")
+                return finish("failed", "Camera mất kết nối trước khi đổi Wi-Fi.",
+                              "Đợi camera online lại rồi thử lại.")
+            params = await proto.query_cgi("get_params.cgi", timeout=12.0) or {}
+            # wifi_ssid is the SAVED config, not necessarily the network in use: the camera
+            # keeps running on its current network until it reboots. ip/gateway identify
+            # the network it is actually on.
+            old_ssid = params.get("wifi_ssid")
+            old_net = self._net_fingerprint(params)
+            job["old_ssid"] = old_ssid
+            job["old_net"] = f"{params.get('ip', '?')} / GW {params.get('gateway', '?')}"
+            job["_old_creds"] = (old_ssid, params.get("wifi_wpa_psk"),
+                                 params.get("wifi_authtype"), params.get("wifi_encrypt"))
+            if old_ssid is None:
+                step("precheck", "warn", "Không đọc được cấu hình Wi-Fi (camera bận) — tiếp tục")
+            elif old_ssid == ssid:
+                step("precheck", "warn",
+                     f"Camera đã LƯU sẵn '{ssid}' nhưng vẫn chạy ở mạng {job['old_net']} "
+                     "(chưa áp dụng) — gửi lại và áp dụng")
+            else:
+                step("precheck", "ok",
+                     f"Cấu hình hiện tại '{old_ssid}' (IP {job['old_net']}) qua {sess.camera.display_mode}")
+
+            # 2. Can the camera even see the target network?
+            step("scan", "running", "Camera đang quét các mạng Wi-Fi xung quanh...")
+            await proto.query_cgi("wifi_scan.cgi", timeout=10.0)
+            await asyncio.sleep(3.0)
+            sess, proto = live_proto()
+            if not proto:
+                step("scan", "error", "Camera mất kết nối khi đang quét")
+                return finish("failed", "Camera mất kết nối khi đang quét Wi-Fi.")
+            aps = self._parse_wifi_scan(await proto.query_cgi("get_wifi_scan_result.cgi", timeout=12.0))
+            job["visible"] = [a["ssid"] for a in aps[:15]]
+            target = next((a for a in aps if a["ssid"] == ssid), None)
+            if target is None:
+                near = next((a["ssid"] for a in aps if a["ssid"].lower() == ssid.lower()), None)
+                hint = f" Có mạng '{near}' — tên phải khớp cả hoa/thường." if near else ""
+                if not aps:
+                    step("scan", "warn", "Camera không trả về danh sách quét — không kiểm tra được")
+                elif not force:
+                    step("scan", "error", f"Camera KHÔNG thấy mạng '{ssid}' trong {len(aps)} mạng quét được.{hint}")
+                    return finish(
+                        "failed",
+                        f"Đã hủy trước khi đổi: camera không nhìn thấy Wi-Fi '{ssid}', camera vẫn ở mạng cũ.",
+                        "Hotspot điện thoại phải phát băng tần 2.4GHz (tắt 'Ưu tiên 5GHz' / bật "
+                        "'Tăng khả năng tương thích'), đặt gần camera, rồi thử lại. "
+                        "Có thể chọn 'Vẫn gửi' nếu chắc chắn mạng tồn tại.")
+                else:
+                    step("scan", "warn", f"Không thấy '{ssid}' nhưng vẫn gửi theo yêu cầu")
+            else:
+                step("scan", "ok", f"Thấy '{ssid}' (sóng {target['signal']}%, bảo mật {target['security']})")
+                if target["signal"] < 30:
+                    step("scan", "warn", "Sóng yếu — camera có thể không giữ được kết nối")
+
+            # 3. Push the credentials and require the camera's answer
+            authtype = 0 if not password else (target["security"] if target and target["security"] else 4)
+            encrypt = 0 if not password else 4
+            step("apply", "running", f"Gửi cấu hình Wi-Fi '{ssid}' xuống camera...")
+            reply = await proto.query_cgi(
+                proto.build_set_wifi_cgi(ssid, password, authtype, encrypt), timeout=12.0)
+            if reply is None:
+                step("apply", "error", "Camera không phản hồi lệnh set_wifi")
+                return finish("failed", "Lệnh đổi Wi-Fi không tới được camera (kênh lệnh bận/mất gói).",
+                              "Camera vẫn ở mạng cũ. Thử lại sau vài giây.")
+            res_val = str(reply.get("result", "")).strip().lower()
+            if res_val not in ("0", "ok"):
+                step("apply", "error", f"Camera từ chối cấu hình (result={res_val or '?'})")
+                return finish("failed", f"Camera từ chối cấu hình Wi-Fi (result={res_val}).",
+                              "Kiểm tra lại tên/mật khẩu Wi-Fi (WPA2, tối thiểu 8 ký tự).")
+            step("apply", "ok", "Camera đã nhận cấu hình")
+
+            # 4. Make it take effect: wait for the camera to leave the old network, reboot if it doesn't
+            sess = self.sessions.get(uid)
+            if sess:
+                sess.activate_onboarding(self.WIFI_SWITCH_BACK_WAIT + 60)
+            step("switch", "running", "Chờ camera rời mạng cũ để vào mạng mới...")
+            left = False
+            t_end = time.monotonic() + self.WIFI_SWITCH_DROP_WAIT
+            loop = asyncio.get_event_loop()
+            while time.monotonic() < t_end:
+                await asyncio.sleep(1.0)
+                sess = self.sessions.get(uid)
+                if not sess or sess.state != "CONNECTED" or (loop.time() - sess._last_drw_time) > 6.0:
+                    left = True
+                    break
+            if not left:
+                step("switch", "warn", "Camera chưa tự chuyển mạng — khởi động lại để áp dụng")
+                sess, proto = live_proto()
+                if proto:
+                    await proto.send_reboot(wait_ack=5.0)
+            else:
+                step("switch", "ok", "Camera đã ngắt khỏi mạng cũ")
+
+            # 5. Wait for it to come back (on the new network, or the old one as fallback)
+            step("reconnect", "running", "Chờ camera vào mạng mới và kết nối lại Hub...")
+            saw_down = left
+            t_end = time.monotonic() + self.WIFI_SWITCH_BACK_WAIT
+            late = False
+            while True:
+                await asyncio.sleep(2.0)
+                sess, proto = live_proto()
+                if not proto:
+                    saw_down = True
+                elif saw_down and (loop.time() - sess._last_drw_time) < 5.0:
+                    break
+                if time.monotonic() > t_end and not late:
+                    late = True
+                    job["state"] = "watching"
+                    step("reconnect", "error",
+                         f"Camera chưa quay lại sau {int(self.WIFI_SWITCH_BACK_WAIT)}s — Hub vẫn tiếp tục chờ")
+                    finish("timeout",
+                           f"Camera chưa kết nối lại sau {int(self.WIFI_SWITCH_BACK_WAIT // 60)} phút.",
+                           f"Có thể camera không vào được '{ssid}' (sai mật khẩu / hotspot 5GHz / hết sóng). "
+                           f"Giữ hotspot '{ssid}' bật đúng tên & mật khẩu, hoặc bật lại mạng cũ "
+                           f"'{old_ssid or '?'}' để camera quay về. Hub tự kết nối lại khi camera online; "
+                           "nếu vẫn không được, nhấn giữ nút Reset trên camera rồi cài lại.")
+                    job["state"] = "watching"
+                if late and time.monotonic() > t_end + self.WIFI_SWITCH_LATE_WATCH:
+                    job["state"] = "done"
+                    return
+            if not late:
+                step("reconnect", "ok", f"Camera đã kết nối lại qua {sess.camera.display_mode}")
+
+            # 6. Which network did it come back on?
+            step("confirm", "running", "Xác nhận mạng Wi-Fi camera đang dùng...")
+            now_params = {}
+            for _ in range(3):
+                sess, proto = live_proto()
+                if proto:
+                    now_params = (await proto.query_cgi("get_params.cgi", timeout=10.0)) or {}
+                    if now_params:
+                        break
+                await asyncio.sleep(3.0)
+            now_ssid = now_params.get("wifi_ssid")
+            mode = sess.camera.display_mode if sess else "?"
+            job["new_ssid"] = now_ssid
+            job["new_net"] = f"{now_params.get('ip', '?')} / GW {now_params.get('gateway', '?')}"
+            job["connection_mode"] = mode
+            prefix = "(Muộn) " if late else ""
+            new_net = self._net_fingerprint(now_params)
+            same_net = bool(old_net and new_net and old_net == new_net)
+            if same_net:
+                step("confirm", "error", f"Camera vẫn ở mạng cũ (IP {job['new_net']})")
+                restored = await self._restore_old_wifi(uid, job, ssid, step)
+                finish("fallback",
+                       f"{prefix}Camera không vào được '{ssid}' và đã quay về mạng cũ (vẫn online qua {mode})."
+                       + (" Hub đã khôi phục cấu hình Wi-Fi cũ." if restored else ""),
+                       "Kiểm tra mật khẩu và băng tần 2.4GHz của hotspot rồi thử lại."
+                       + ("" if restored else " Cấu hình đã lưu trên camera vẫn là mạng mới — nếu camera "
+                          "khởi động lại khi mạng mới không có, camera có thể mất kết nối."))
+            elif now_ssid in (ssid, None):
+                step("confirm", "ok", f"Camera đang ở mạng '{ssid}' (IP {job['new_net']}) qua {mode}")
+                finish("success", f"{prefix}Đổi Wi-Fi thành công: camera đang ở '{ssid}', kết nối qua {mode}.")
+            else:
+                step("confirm", "warn", f"Camera online ở mạng khác (SSID lưu '{now_ssid}', IP {job['new_net']})")
+                finish("success", f"{prefix}Camera đã online lại ở mạng mới (IP {job['new_net']}, qua {mode}).")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # never leave the UI spinning
+            log.exception("Wi-Fi switch job failed")
+            step(job.get("stage") or "error", "error", f"Lỗi nội bộ: {e}")
+            finish("failed", f"Lỗi khi đổi Wi-Fi: {e}")
+
+    async def handle_wifi_job(self, request: web.Request) -> web.Response:
+        uid = request.match_info.get("uid", "")
+        job = self.wifi_jobs.get(uid)
+        return web.json_response({"ok": True, "job": self._wifi_job_public(job)})
+
     async def handle_provision_wifi(self, request: web.Request) -> web.Response:
         """
         Push Wi-Fi credentials directly to a camera via PPPP set_wifi.cgi
@@ -2717,14 +2992,28 @@ class CameraHubApp:
             if not ssid:
                 return web.json_response({"ok": False, "error": "Vui lòng nhập Tên mạng Wi-Fi (SSID)"}, status=400)
 
-            # Case 1: Camera is already connected in self.sessions
-            if uid and uid in self.sessions and self.sessions[uid].protocol:
-                await self.sessions[uid].protocol.send_set_wifi(ssid, password)
-                conn_mode = getattr(self.sessions[uid].camera, "display_mode", None) or getattr(self.sessions[uid].camera, "connection_mode", "P2P")
+            # Case 1: Camera is online through the hub -> verified switch job
+            sess = self.sessions.get(uid) if uid else None
+            if sess and sess.protocol and sess.protocol.enc_mode and sess.state == "CONNECTED":
+                cur = self.wifi_jobs.get(uid)
+                if cur and cur.get("state") == "running":
+                    return web.json_response({
+                        "ok": False, "method": "job", "error": "Camera đang đổi Wi-Fi, vui lòng đợi.",
+                        "job": self._wifi_job_public(cur)}, status=409)
+                job = {
+                    "uid": uid, "camera": (self.recorders[uid].room_name if uid in self.recorders else uid[:10]),
+                    "ssid": ssid, "state": "running", "stage": "precheck", "result": None,
+                    "message": "", "advice": "", "steps": [], "old_ssid": None, "new_ssid": None,
+                    "visible": [], "started_at": time.time(), "_t0": time.monotonic(),
+                }
+                self.wifi_jobs[uid] = job
+                job["_task"] = asyncio.create_task(
+                    self._run_wifi_switch(uid, ssid, password, bool(data.get("force"))))
                 return web.json_response({
                     "ok": True,
-                    "method": "active_session",
-                    "message": f"Đã bắn lệnh nạp Wi-Fi '{ssid}' trực tiếp tới camera qua {conn_mode}!",
+                    "method": "job",
+                    "message": f"Bắt đầu đổi Wi-Fi sang '{ssid}' — đang kiểm tra từng bước...",
+                    "job": self._wifi_job_public(job),
                 })
 
             # Case 2: Probe AP hotspot gateways (192.168.169.1, 192.168.1.1, 192.168.43.1) or target_ip
@@ -3028,6 +3317,7 @@ def build_web_app(hub: CameraHubApp) -> web.Application:
     app.router.add_get("/sonic", hub.handle_mobile_sonic_page)
     app.router.add_post("/api/wifi/qr", hub.handle_wifi_qr)
     app.router.add_post("/api/camera/provision-wifi", hub.handle_provision_wifi)
+    app.router.add_get("/api/camera/{uid}/wifi-job", hub.handle_wifi_job)
     app.router.add_post("/api/camera/onboard", hub.handle_onboard_camera)
     app.router.add_post("/api/camera/decode-qr", hub.handle_decode_qr)
     app.router.add_post("/api/camera/add", hub.handle_add_camera_qr)

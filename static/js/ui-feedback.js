@@ -185,6 +185,103 @@ export function wifiCredentialsDialog({ cameraName = '', defaultSsid = '', defau
   });
 }
 
+const WIFI_STAGE_LABELS = {
+  precheck: 'Kiểm tra mạng hiện tại',
+  scan: 'Camera quét Wi-Fi',
+  apply: 'Gửi cấu hình',
+  switch: 'Rời mạng cũ',
+  reconnect: 'Kết nối lại Hub',
+  confirm: 'Xác nhận mạng mới',
+  rollback: 'Khôi phục mạng cũ',
+};
+
+const WIFI_RESULT_STYLE = {
+  success: { color: 'var(--success-text)', icon: 'check', title: 'Thành công' },
+  fallback: { color: 'var(--warning-text)', icon: 'alert', title: 'Không vào được mạng mới — đã quay về mạng cũ' },
+  failed: { color: 'var(--danger-text)', icon: 'alert', title: 'Thất bại' },
+  timeout: { color: 'var(--danger-text)', icon: 'alert', title: 'Camera chưa quay lại' },
+};
+
+/**
+ * Live progress dialog for a verified Wi-Fi switch job.
+ * Returns { update(job), isOpen() }; onForce / onRetry are called from the result buttons.
+ */
+export function wifiJobDialog({ cameraName = '', job = null, onForce = null, onRetry = null, onClose = null }) {
+  const root = ensureDialogRoot();
+  const prevFocus = document.activeElement;
+  let open = true;
+  let last = job;
+
+  const close = () => {
+    if (!open) return;
+    open = false;
+    root.classList.remove('open');
+    root.innerHTML = '';
+    if (prevFocus && typeof prevFocus.focus === 'function') prevFocus.focus();
+    if (onClose) onClose(last);
+  };
+
+  const stepIcon = (status) => {
+    if (status === 'ok') return `<span style="color:var(--success-text)">${svgIcon('check', 'icon-sm')}</span>`;
+    if (status === 'error') return `<span style="color:var(--danger-text)">${svgIcon('alert', 'icon-sm')}</span>`;
+    if (status === 'warn') return `<span style="color:var(--warning-text)">${svgIcon('alert', 'icon-sm')}</span>`;
+    return `<span style="color:var(--accent-text)">${svgIcon('circleDot', 'icon-sm icon-spin')}</span>`;
+  };
+
+  const render = (j) => {
+    if (!open) return;
+    last = j;
+    const steps = (j && j.steps) || [];
+    const done = j && j.state !== 'running';
+    const res = j && j.result ? WIFI_RESULT_STYLE[j.result] || WIFI_RESULT_STYLE.failed : null;
+    const stepsHtml = steps.map((s) => `
+      <li style="display:flex; gap:8px; align-items:flex-start; padding:4px 0;">
+        ${stepIcon(s.status)}
+        <span style="flex:1;">
+          <strong>${escHtml(WIFI_STAGE_LABELS[s.stage] || s.stage)}</strong>
+          <span style="opacity:.85;"> — ${escHtml(s.message)}</span>
+        </span>
+        <span style="opacity:.6; font-variant-numeric:tabular-nums;">${Number(s.t || 0).toFixed(0)}s</span>
+      </li>`).join('');
+    const scanFailed = j && j.result === 'failed' && j.stage === 'scan';
+    const visible = scanFailed && j.visible && j.visible.length
+      ? `<div class="dialog-message" style="margin-top:6px;">Mạng camera nhìn thấy: ${escHtml(j.visible.join(', '))}</div>` : '';
+    const resultHtml = res ? `
+      <div style="border-left:3px solid ${res.color}; padding:6px 10px; margin-top:8px;">
+        <div style="display:flex; gap:6px; align-items:center; color:${res.color}; font-weight:600;">
+          ${svgIcon(res.icon, 'icon-sm')} ${escHtml(res.title)}
+        </div>
+        <div style="margin-top:4px;">${escHtml(j.message || '')}</div>
+        ${j.advice ? `<div class="dialog-message" style="margin-top:4px;">${escHtml(j.advice)}</div>` : ''}
+        ${visible}
+        ${j.state === 'watching' ? '<div class="dialog-message" style="margin-top:4px;">Hub vẫn đang theo dõi — nếu camera quay lại, kết quả sẽ tự cập nhật.</div>' : ''}
+      </div>` : '';
+    const elapsed = j ? `${Math.round(j.elapsed || 0)}s` : '';
+    root.innerHTML = `
+      <div class="dialog-box" style="max-width:560px;">
+        <div class="dialog-title">Đổi Wi-Fi — ${escHtml(cameraName)} → ${escHtml((j && j.ssid) || '')}</div>
+        <ul style="list-style:none; margin:0; padding:0;">${stepsHtml || '<li>Đang khởi tạo...</li>'}</ul>
+        ${resultHtml}
+        <div class="dialog-actions">
+          <span style="flex:1; opacity:.6; align-self:center;">${done ? '' : `Đang chạy · ${elapsed}`}</span>
+          ${scanFailed && onForce ? '<button type="button" class="btn" id="dlg-wifi-force">Vẫn gửi</button>' : ''}
+          ${done && j.result !== 'success' && onRetry ? '<button type="button" class="btn" id="dlg-wifi-retry">Thử lại</button>' : ''}
+          <button type="button" class="btn ${done ? 'primary' : ''}" id="dlg-cancel">${done ? 'Đóng' : 'Ẩn (Hub vẫn chạy)'}</button>
+        </div>
+      </div>`;
+    root.querySelector('#dlg-cancel').addEventListener('click', close);
+    const f = root.querySelector('#dlg-wifi-force');
+    if (f) f.addEventListener('click', () => { close(); onForce(); });
+    const r = root.querySelector('#dlg-wifi-retry');
+    if (r) r.addEventListener('click', () => { close(); onRetry(); });
+  };
+
+  root.onclick = (e) => { if (e.target === root) close(); };
+  root.classList.add('open');
+  render(job);
+  return { update: render, isOpen: () => open };
+}
+
 export function registerModalEsc(isOpenFn, closeFn) {
   escCloseCallbacks.push({ isOpenFn, closeFn });
 }

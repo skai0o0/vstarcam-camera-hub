@@ -2,7 +2,7 @@
  * Shared camera lifecycle & control actions (used by grid cards, PTZ workbench, and room manager).
  */
 import { apiJson, getCameraByUid } from './api.js';
-import { confirmDialog, promptDialog, showToast, wifiCredentialsDialog } from './ui-feedback.js';
+import { confirmDialog, promptDialog, showToast, wifiCredentialsDialog, wifiJobDialog } from './ui-feedback.js';
 
 export async function triggerMotionManual(uid, action, onDone) {
   if (!uid) return;
@@ -85,24 +85,68 @@ export async function changeCameraPassword(uid, name, onDone, stageNotify) {
   }
 }
 
-export async function pushWifiToCamera(uid, name) {
+const WIFI_TOAST_LEVEL = { success: 'ok', fallback: 'warn', failed: 'error', timeout: 'error' };
+
+function followWifiJob(uid, name, creds, job) {
+  let dialog = null;
+  let lastResult = null;
+  const openDialog = (j) => {
+    dialog = wifiJobDialog({
+      cameraName: name,
+      job: j,
+      onForce: () => startWifiSwitch(uid, name, { ...creds, force: true }),
+      onRetry: () => pushWifiToCamera(uid, name, creds),
+    });
+  };
+  openDialog(job);
+  const poll = async () => {
+    let j = null;
+    try {
+      const { data } = await apiJson(`/api/camera/${uid}/wifi-job`);
+      j = data && data.job;
+    } catch (_) { /* transient: keep polling */ }
+    if (j) {
+      if (dialog && dialog.isOpen()) dialog.update(j);
+      // Toast each verdict once when the dialog was hidden (incl. a late result after a timeout).
+      if (j.result && j.result !== lastResult) {
+        lastResult = j.result;
+        if (!(dialog && dialog.isOpen())) {
+          showToast(`${name}: ${j.message}`, WIFI_TOAST_LEVEL[j.result] || 'info', 9000);
+        }
+      }
+      if (j.state === 'done') return;
+    }
+    setTimeout(poll, j && j.state === 'watching' ? 5000 : 1500);
+  };
+  setTimeout(poll, 800);
+}
+
+async function startWifiSwitch(uid, name, creds) {
+  try {
+    const { data } = await apiJson('/api/camera/provision-wifi', {
+      method: 'POST',
+      body: { ssid: creds.ssid, password: creds.password, uid, force: !!creds.force },
+    });
+    if (data.method === 'job' && data.job) {
+      followWifiJob(uid, name, creds, data.job);
+      return;
+    }
+    showToast(data.ok ? data.message : (data.error || 'Không thể nạp Wi-Fi'), data.ok ? 'ok' : 'error', 6000);
+  } catch (err) {
+    showToast(`Lỗi nạp Wi-Fi: ${err.message}`, 'error');
+  }
+}
+
+export async function pushWifiToCamera(uid, name, prev = null) {
   const ssidEl = document.getElementById('wifi-ssid-input');
   const pwdEl = document.getElementById('wifi-pwd-input');
   const creds = await wifiCredentialsDialog({
     cameraName: name,
-    defaultSsid: ssidEl ? ssidEl.value : '',
-    defaultPwd: pwdEl ? pwdEl.value : '',
+    defaultSsid: prev ? prev.ssid : (ssidEl ? ssidEl.value : ''),
+    defaultPwd: prev ? prev.password : (pwdEl ? pwdEl.value : ''),
   });
   if (!creds) return;
-  try {
-    const { data } = await apiJson('/api/camera/provision-wifi', {
-      method: 'POST',
-      body: { ssid: creds.ssid, password: creds.password, uid },
-    });
-    showToast(data.ok ? data.message : (data.error || 'Không thể nạp Wi-Fi'), data.ok ? 'ok' : 'error', 5000);
-  } catch (err) {
-    showToast(`Lỗi nạp Wi-Fi: ${err.message}`, 'error');
-  }
+  await startWifiSwitch(uid, name, creds);
 }
 
 export async function deleteCamera(uid, name, onDone) {
