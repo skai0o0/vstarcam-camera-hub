@@ -31,6 +31,15 @@ from typing import Optional
 import wan_p2p
 discover_camera_wan = wan_p2p.discover_camera_wan
 
+
+def _is_private_ipv4(ip: str) -> bool:
+    """True for RFC1918 / link-local IPv4 (not CGNAT 100.64/10, e.g. Tailscale)."""
+    try:
+        a, b = (int(x) for x in ip.split(".")[:2])
+    except ValueError:
+        return False
+    return a == 10 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or (a == 169 and b == 254)
+
 try:
     import yaml
     HAS_YAML = True
@@ -797,6 +806,7 @@ class CameraInfo:
         self.hw_deviceid: Optional[str] = None
         self.formatted_did: Optional[str] = None
         self.connection_mode: str = "LAN"
+        self.via_lan: bool = False  # WAN-signalled session whose peer is a private (LAN) address
         self.wan_cloud_status: str = "IDLE"
         self.onboarding_until: float = 0.0
         self.bin_did: Optional[bytes] = None
@@ -836,6 +846,13 @@ class CameraInfo:
         if ip == "0.0.0.0":
             cam.connection_mode = "WAN_P2P"
         return cam
+
+    @property
+    def display_mode(self) -> str:
+        """connection_mode for UI/logs: a WAN_P2P session that is really on our LAN shows as LAN."""
+        if self.via_lan and self.connection_mode == "WAN_P2P":
+            return "LAN"
+        return self.connection_mode
 
     def __repr__(self):
         return f"Camera({self.ip}:{self.port} [{self.connection_mode}] uid={self.uid} did={self.formatted_did or '?'})"
@@ -954,6 +971,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self._last_audio_drw_time: float = 0
         self._drw_bytes_received = 0
         self._drw_packets_received = 0
+        self._drw_dup_count = 0
         self._running = False
         self._alive_task: Optional[asyncio.Task] = None
         self._wan_punch_task: Optional[asyncio.Task] = None
@@ -1167,8 +1185,13 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                 self._active_camera.ip = ip
                 self._active_camera.port = port
                 self._active_camera.discovery_port = port
+                # Display-only: a WAN-signalled session whose peer answers from a private
+                # address is really running over our LAN. connection_mode stays WAN_P2P
+                # because reconnect / P2P_RDY logic depends on it.
+                self._active_camera.via_lan = _is_private_ipv4(ip)
                 if xor_type == 0x54 or addr in self._wan_relay_targets:
                     self._active_camera.connection_mode = "WAN_RELAY"
+                    self._active_camera.via_lan = False
                 elif addr in self._wan_punch_targets or self._used_wan_p2p:
                     self._active_camera.connection_mode = "WAN_P2P"
                 else:
@@ -1185,7 +1208,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                     self.transport.sendto(build_punch_pkt(), addr)
                 if not self._connected.is_set():
                     log.info("Handshake response (xor_type=0x%02X, mode=%s) from %s:%d — session ready!",
-                             xor_type, self._active_camera.connection_mode, ip, port)
+                             xor_type, self._active_camera.display_mode, ip, port)
                 self.connected = True
                 self._connected.set()
             elif xor_type == MSG_PUNCH_RSP:
@@ -1452,7 +1475,8 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             self._drw_high_water[channel] = -1
         seen = self._seen_drw_indices[channel]
         if index in seen:
-            return  # Already processed this index
+            self._drw_dup_count += 1
+            return  # Already processed this index (camera retransmit)
         # Detect wraparound: if high_water is near max and index is near 0,
         # or if the set has grown too large, prune old entries
         hw = self._drw_high_water[channel]
@@ -1481,8 +1505,8 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                      payload[:16].hex() if payload else "empty")
 
         if self._drw_packets_received % 100 == 0:
-            log.info("DRW stats: %d unique packets, %d bytes total",
-                     self._drw_packets_received, self._drw_bytes_received)
+            log.info("DRW stats: %d unique packets, %d bytes total, %d duplicates",
+                     self._drw_packets_received, self._drw_bytes_received, self._drw_dup_count)
 
         # Process by channel
         if channel == CH_CMD:
@@ -2154,6 +2178,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         self._cmd_index = 0
         self._reset_cmd_channel()
         self._drw_packets_received = 0
+        self._drw_dup_count = 0
         self._drw_bytes_received = 0
         self._last_video_drw_time = 0
         self._video_rerequests = 0
@@ -2809,6 +2834,36 @@ class VideoReassembly:
         self._gap_wait_since: float = 0.0
         self._gap_count = 0
         self._frames_dropped = 0
+        # Head-of-line stall stats: how long a missing DRW index holds back later packets
+        # before a camera retransmit fills it (or the timeout gives up on it).
+        self._hol_since: float = 0.0
+        self._hol_waits_ms: list[float] = []
+        self._hol_timeouts = 0
+        self._hol_report_at: float = time.monotonic() + self.HOL_REPORT_SEC
+
+    HOL_REPORT_SEC = 30.0
+
+    def _hol_end(self, timed_out: bool):
+        if self._hol_since:
+            self._hol_waits_ms.append((time.monotonic() - self._hol_since) * 1000.0)
+            if timed_out:
+                self._hol_timeouts += 1
+        self._hol_since = 0.0
+
+    def _hol_maybe_report(self, now: float):
+        if now < self._hol_report_at:
+            return
+        self._hol_report_at = now + self.HOL_REPORT_SEC
+        waits, timeouts = self._hol_waits_ms, self._hol_timeouts
+        self._hol_waits_ms, self._hol_timeouts = [], 0
+        if not waits:
+            return
+        waits.sort()
+        p50 = waits[len(waits) // 2]
+        p95 = waits[min(len(waits) - 1, int(len(waits) * 0.95))]
+        log.info("Video HOL stalls (%.0fs): n=%d p50=%.0fms p95=%.0fms max=%.0fms "
+                 ">100ms=%d timeouts=%d", self.HOL_REPORT_SEC, len(waits), p50, p95,
+                 waits[-1], sum(1 for w in waits if w > 100.0), timeouts)
 
     def _compact(self):
         """Compact buffer when offset gets large to avoid unbounded growth."""
@@ -2826,11 +2881,15 @@ class VideoReassembly:
             self._flush_reorder_buf()
             if not self._reorder_buf:
                 self._gap_wait_since = 0.0
+                self._hol_end(timed_out=False)
+            self._hol_maybe_report(time.monotonic())
         elif ((index - self._next_expected_idx) & 0xFFFF) < 0x8000:
             # Future packet within forward half of 16-bit range: buffer it
             now = time.monotonic()
             if not self._reorder_buf or self._gap_wait_since == 0.0:
                 self._gap_wait_since = now
+            if not self._hol_since:
+                self._hol_since = now
             self._reorder_buf[index] = data
             if (len(self._reorder_buf) >= self.REORDER_WINDOW
                     or (now - self._gap_wait_since) >= self.REORDER_TIMEOUT_SEC):
@@ -2844,6 +2903,8 @@ class VideoReassembly:
             self._next_expected_idx = (self._next_expected_idx + 1) & 0xFFFF
         if self._reorder_buf:
             self._gap_wait_since = time.monotonic()
+            if not self._hol_since:
+                self._hol_since = self._gap_wait_since
         else:
             self._gap_wait_since = 0.0
 
@@ -2868,6 +2929,7 @@ class VideoReassembly:
             self._off = 0
         self._next_expected_idx = min_idx
         self._gap_wait_since = 0.0
+        self._hol_end(timed_out=True)
         if self.gap_callback:
             self.gap_callback()
         self._flush_reorder_buf()
@@ -3149,6 +3211,127 @@ STATE_RECONNECTING = "RECONNECTING"
 STATE_STOPPED = "STOPPED"
 
 
+class PlayoutBuffer:
+    """Fixed-delay playout (jitter) buffer for one camera's media.
+
+    Over a cloud relay, a lost DRW packet holds back every later packet until the camera
+    retransmits it (measured p50 ~80-100ms, p95 ~210ms), so frames reach us in bursts.
+    This re-times video frames from the camera's STREAMHEAD clock: each frame is released
+    at cam_ts + offset + delay, where offset tracks the fastest observed transit
+    (arrival - cam_ts) and creeps up slowly to follow clock drift. Audio chunks and
+    out-of-band events (gap notifications) are queued in arrival order with the same
+    nominal delay so A/V stay aligned and a gap never overtakes the frames before it.
+    """
+
+    DRIFT_PER_FRAME = 0.00004   # s the offset may creep up per frame (~1ms/s at 25fps)
+    MAX_TS_JUMP = 2.0           # s; larger camera-clock jumps re-anchor the timeline
+    MAX_QUEUE = 300             # safety bound (~12s of 25fps video)
+
+    def __init__(self, delay_sec: float):
+        self.delay = max(0.0, float(delay_sec))
+        self._q: collections.deque = collections.deque()  # (due, fn, args)
+        self._offset: Optional[float] = None
+        self._last_cam_ts: Optional[float] = None
+        self._timer: Optional[asyncio.TimerHandle] = None
+        self.late_frames = 0
+        self.frames = 0
+        self.label = ""
+        self._ts_deltas: list[float] = []   # camera-clock spacing between frames (ms)
+        self._holds: list[float] = []       # how long each frame waited in the buffer (ms)
+        self._win_late = 0
+        self._report_at = 0.0
+
+    REPORT_SEC = 30.0
+
+    def _report(self, now: float):
+        if not self._report_at:
+            self._report_at = now + self.REPORT_SEC
+            return
+        if now < self._report_at:
+            return
+        self._report_at = now + self.REPORT_SEC
+        d, h, late = sorted(self._ts_deltas), sorted(self._holds), self._win_late
+        self._ts_deltas, self._holds, self._win_late = [], [], 0
+        if not d or not h:
+            return
+        pick = lambda a, q: a[min(len(a) - 1, int(len(a) * q))]
+        log.info("[%s] Playout %.0fms: frames=%d late=%d cam_dt p5/p50/p95=%.0f/%.0f/%.0fms "
+                 "hold p5/p50=%.0f/%.0fms", self.label, self.delay * 1000, len(d) + 1, late,
+                 pick(d, .05), pick(d, .5), pick(d, .95), pick(h, .05), pick(h, .5))
+
+    def _now(self) -> float:
+        return asyncio.get_event_loop().time()
+
+    def reset(self, flush: bool = True):
+        """Drop timing state; optionally emit everything still queued right away."""
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+        q, self._q = self._q, collections.deque()
+        self._offset = None
+        self._last_cam_ts = None
+        if flush:
+            for _due, fn, args in q:
+                fn(*args)
+
+    def push_video(self, cam_ts_ms: int, fn, *args):
+        now = self._now()
+        cam_ts = cam_ts_ms / 1000.0
+        if (self._last_cam_ts is None or self._offset is None
+                or not (0.0 <= cam_ts - self._last_cam_ts <= self.MAX_TS_JUMP)):
+            self._offset = now - cam_ts            # (re)anchor on this frame
+        else:
+            self._ts_deltas.append((cam_ts - self._last_cam_ts) * 1000.0)
+            self._offset = min(self._offset + self.DRIFT_PER_FRAME, now - cam_ts)
+        self._last_cam_ts = cam_ts
+        due = cam_ts + self._offset + self.delay
+        # Never schedule beyond one delay ahead, never before what is already queued.
+        due = min(due, now + self.delay)
+        if self._q and due < self._q[-1][0]:
+            due = self._q[-1][0]
+        if due <= now:
+            self.late_frames += 1
+            self._win_late += 1
+        self._holds.append(max(0.0, due - now) * 1000.0)
+        self.frames += 1
+        self._report(now)
+        self._enqueue(due, fn, args)
+
+    def push_other(self, fn, *args):
+        """Audio chunk / event: nominal delay, kept behind anything already queued."""
+        now = self._now()
+        due = now + self.delay
+        if self._q and due < self._q[-1][0]:
+            due = self._q[-1][0]
+        self._enqueue(due, fn, args)
+
+    def _enqueue(self, due, fn, args):
+        self._q.append((due, fn, args))
+        if len(self._q) > self.MAX_QUEUE:
+            self.reset(flush=True)
+            return
+        if self._timer is None:
+            self._arm()
+
+    def _arm(self):
+        if not self._q:
+            self._timer = None
+            return
+        loop = asyncio.get_event_loop()
+        self._timer = loop.call_at(self._q[0][0], self._drain)
+
+    def _drain(self):
+        self._timer = None
+        now = self._now()
+        while self._q and self._q[0][0] <= now + 0.001:
+            _due, fn, args = self._q.popleft()
+            try:
+                fn(*args)
+            except Exception:
+                log.exception("Playout buffer consumer failed")
+        self._arm()
+
+
 class CameraSession:
     """Manages a single camera: PPPP protocol + RTSP server + reconnection."""
 
@@ -3165,8 +3348,14 @@ class CameraSession:
                  recorder=None,
                  auto_track: Optional[int] = None,
                  human_sensitive: Optional[int] = None,
-                 motion_sensitivity: int = 5):
+                 motion_sensitivity: int = 5,
+                 playout_delay_ms: int = 250,
+                 playout_mode: str = "relay"):
         self.camera = camera
+        # Jitter buffer: "relay" (only on WAN_RELAY), "wan" (any WAN path), "always", "off".
+        self.playout_mode = str(playout_mode or "relay").lower()
+        self.playout = PlayoutBuffer(max(0, int(playout_delay_ms)) / 1000.0)
+        self.playout.label = camera.label
         self.rtsp_port = rtsp_port
         self.username = username
         self.password = password
@@ -3195,6 +3384,16 @@ class CameraSession:
         self._backoff: float = 1.0
         self._last_drw_time: float = 0
         self._last_audio_drw_time: float = 0
+
+    def _playout_active(self) -> bool:
+        if self.playout.delay <= 0 or self.playout_mode == "off":
+            return False
+        if self.playout_mode == "always":
+            return True
+        mode = getattr(self.camera, "connection_mode", "LAN")
+        if self.playout_mode == "wan":
+            return mode in ("WAN_P2P", "WAN_RELAY") and not getattr(self.camera, "via_lan", False)
+        return mode == "WAN_RELAY"
 
     @property
     def wan_cloud_status(self) -> str:
@@ -3275,9 +3474,7 @@ class CameraSession:
             if self.protocol:
                 await self._teardown_protocol()
 
-            # Video callback that also tracks last DRW time
-            def video_cb(frame_type, timestamp, data):
-                self._last_drw_time = asyncio.get_event_loop().time()
+            def emit_video(frame_type, timestamp, data):
                 if self.rtsp:
                     self.rtsp.push_video_frame(frame_type, timestamp, data)
                     if self.recorder:
@@ -3287,10 +3484,31 @@ class CameraSession:
                 if self.recorder:
                     self.recorder.on_video_frame(frame_type, timestamp, data)
 
-            def audio_cb(data, codec):
-                self._last_drw_time = asyncio.get_event_loop().time()
+            def emit_audio(data, codec):
                 if self.rtsp:
                     self.rtsp.push_audio_frame(data, codec)
+
+            def emit_gap():
+                if self.rtsp:
+                    self.rtsp.reset_gop_cache()
+                if self.recorder:
+                    self.recorder.on_video_gap()
+
+            # Video callback that also tracks last DRW time (liveness is tracked on
+            # arrival, before any playout delay).
+            def video_cb(frame_type, timestamp, data):
+                self._last_drw_time = asyncio.get_event_loop().time()
+                if self._playout_active():
+                    self.playout.push_video(timestamp, emit_video, frame_type, timestamp, data)
+                else:
+                    emit_video(frame_type, timestamp, data)
+
+            def audio_cb(data, codec):
+                self._last_drw_time = asyncio.get_event_loop().time()
+                if self._playout_active():
+                    self.playout.push_other(emit_audio, data, codec)
+                else:
+                    emit_audio(data, codec)
 
             self.protocol = PPPPUnifiedProtocol(
                 username=self.username, password=self.password,
@@ -3304,10 +3522,11 @@ class CameraSession:
                 motion_sensitivity=self.motion_sensitivity,
             )
             def on_gap():
-                if self.rtsp:
-                    self.rtsp.reset_gop_cache()
-                if self.recorder:
-                    self.recorder.on_video_gap()
+                # Queue behind the frames already buffered so the gap lands in order.
+                if self._playout_active() or self.playout._q:
+                    self.playout.push_other(emit_gap)
+                else:
+                    emit_gap()
 
             self.protocol.video_gap_callback = on_gap
 
@@ -3427,6 +3646,7 @@ class CameraSession:
 
     async def _teardown_protocol(self):
         """Tear down protocol+transport without stopping RTSP server."""
+        self.playout.reset(flush=False)  # stale frames from the old session must not leak out
         if self.recorder:
             self.recorder.on_video_gap()
         if self.protocol:
@@ -3566,6 +3786,7 @@ class CameraSession:
             self.camera.port = 32108
             self.camera.discovery_port = 0
             self.camera.connection_mode = "WAN_P2P"
+            self.camera.via_lan = False
         self.state = STATE_CONNECTING
         self._backoff = 3.0
         asyncio.create_task(self._connect())

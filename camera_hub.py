@@ -967,6 +967,8 @@ class CameraHubApp:
             auto_track=want_track,
             human_sensitive=want_hsens,
             motion_sensitivity=(want_msens if want_msens is not None else 5),
+            playout_delay_ms=int(self.config.get("playout_delay_ms", 250)),
+            playout_mode=str(self.config.get("playout_mode", "relay")),
         )
 
         async def get_snap():
@@ -1320,7 +1322,7 @@ class CameraHubApp:
 
             c_did, f_did = proxy.pppp_uid_hex_to_did(uid)
             did_str = getattr(cam, "formatted_did", None) or cam_cfg.get("did") or cam_cfg.get("formatted_did") or f_did or ""
-            conn_mode = getattr(cam, "connection_mode", None) or ("WAN_P2P" if cam.ip in ("0.0.0.0", "") else "LAN")
+            conn_mode = getattr(cam, "display_mode", None) or getattr(cam, "connection_mode", None) or ("WAN_P2P" if cam.ip in ("0.0.0.0", "") else "LAN")
             auth_failed = bool(sess.protocol and getattr(sess.protocol, "auth_failed", False))
             auth_error = getattr(sess.protocol, "auth_error", None) if sess.protocol else None
             wan_cloud_status = getattr(cam, "wan_cloud_status", "IDLE")
@@ -1726,7 +1728,7 @@ class CameraHubApp:
         except Exception:
             data = {}
         action = str(data.get("action", ""))
-        conn_mode = getattr(sess.camera, "connection_mode", "P2P")
+        conn_mode = getattr(sess.camera, "display_mode", None) or getattr(sess.camera, "connection_mode", "P2P")
 
         def done(acked: bool, **extra):
             body = {"ok": bool(acked), "action": action, "connection_mode": conn_mode, **extra}
@@ -2076,7 +2078,7 @@ class CameraHubApp:
         try:
             if not await sess.protocol.send_reboot(wait_ack=5.0):
                 return web.json_response({"ok": False, "error": self.CMD_NO_ACK_MSG}, status=504)
-            conn_mode = getattr(sess.camera, "connection_mode", "P2P")
+            conn_mode = getattr(sess.camera, "display_mode", None) or getattr(sess.camera, "connection_mode", "P2P")
             return web.json_response({
                 "ok": True,
                 "message": f"Đã gửi lệnh khởi động lại camera ({conn_mode})!",
@@ -2121,7 +2123,7 @@ class CameraHubApp:
             else:
                 self.config["cameras"][uid] = {"port": sess.rtsp_port, "password": new_pwd}
             self._save_hub_config()
-            conn_mode = getattr(sess.camera, "connection_mode", "P2P")
+            conn_mode = getattr(sess.camera, "display_mode", None) or getattr(sess.camera, "connection_mode", "P2P")
             return web.json_response({
                 "ok": True,
                 "message": f"Đã cập nhật mật khẩu camera thành công qua {conn_mode}!",
@@ -2718,7 +2720,7 @@ class CameraHubApp:
             # Case 1: Camera is already connected in self.sessions
             if uid and uid in self.sessions and self.sessions[uid].protocol:
                 await self.sessions[uid].protocol.send_set_wifi(ssid, password)
-                conn_mode = getattr(self.sessions[uid].camera, "connection_mode", "P2P")
+                conn_mode = getattr(self.sessions[uid].camera, "display_mode", None) or getattr(self.sessions[uid].camera, "connection_mode", "P2P")
                 return web.json_response({
                     "ok": True,
                     "method": "active_session",
